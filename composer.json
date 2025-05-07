@@ -1,0 +1,52 @@
+{
+  "name": "made-by-bramble/craft-bramble-search",
+  "type": "craft-plugin",
+  "license": "proprietary",
+  "support": {
+    "email": "hello@madebybramble.co.uk"
+  },
+  "require": {
+    "php": ">=8.2",
+    "ext-redis": "*",
+    "craftcms/cms": "^5.5.0"
+  },
+  "require-dev": {
+    "craftcms/ecs": "dev-main",
+    "craftcms/phpstan": "dev-main",
+    "phpunit/phpunit": "^10.5"
+  },
+  "autoload": {
+    "psr-4": {
+      "MadeByBramble\\BrambleSearch\\": "src/"
+    }
+  },
+  "autoload-dev": {
+    "psr-4": {
+      "MadeByBrambleTest\\BrambleSearch\\": "tests/",
+      "MadeByBrambleTest\\BrambleSearch\\mocks\\": "tests/mocks/"
+    }
+  },
+  "extra": {
+    "handle": "bramble-search",
+    "name": "Bramble Search",
+    "developer": "Made By Bramble",
+    "documentationUrl": "",
+    "class": "MadeByBramble\\BrambleSearch\\Plugin"
+  },
+  "scripts": {
+    "check-cs": "ecs check --ansi",
+    "fix-cs": "ecs check --ansi --fix",
+    "phpstan": "phpstan --memory-limit=1G",
+    "test": "phpunit"
+  },
+  "config": {
+    "sort-packages": true,
+    "platform": {
+      "php": "8.2"
+    },
+    "allow-plugins": {
+      "yiisoft/yii2-composer": true,
+      "craftcms/plugin-installer": true
+    }
+  }
+}

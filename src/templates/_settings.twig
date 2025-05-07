@@ -1,0 +1,124 @@
+{% import "_includes/forms" as forms %}
+
+{{ forms.lightswitchField({
+    label: "Enable Bramble Search"|t('bramble-search'),
+    instructions: "Replace Craft's search service with Bramble Search. This affects both the admin Control Panel and frontend templates."|t('bramble-search'),
+    id: 'enabled',
+    name: 'enabled',
+    on: settings.enabled,
+    errors: settings.getErrors('enabled'),
+}) }}
+
+{{ forms.selectField({
+    label: "Storage Driver"|t('bramble-search'),
+    instructions: "Choose where to store the search index."|t('bramble-search'),
+    tip: "This can be overridden using the BRAMBLE_SEARCH_DRIVER environment variable in your .env file."|t('bramble-search'),
+    id: 'storageDriver',
+    name: 'storageDriver',
+    options: [
+        { value: 'craft', label: 'Craft Cache' },
+        { value: 'redis', label: 'Redis' },
+    ],
+    value: settings.storageDriver,
+    errors: settings.getErrors('storageDriver'),
+    toggle: true,
+    targetPrefix: 'storage-'
+}) }}
+
+<div id="storage-redis" class="{% if settings.storageDriver != 'redis' %}hidden{% endif %}">
+    {{ forms.textField({
+        label: "Redis Host"|t('bramble-search'),
+        instructions: "The hostname or IP address of your Redis server."|t('bramble-search'),
+        tip: "For local development, this is typically 'localhost' or '127.0.0.1'. Can be overridden with the BRAMBLE_SEARCH_REDIS_HOST environment variable."|t('bramble-search'),
+        id: 'redisHost',
+        name: 'redisHost',
+        placeholder: 'localhost',
+        value: settings.redisHost,
+        errors: settings.getErrors('redisHost'),
+        required: true,
+    }) }}
+
+    {{ forms.textField({
+        label: "Redis Port"|t('bramble-search'),
+        instructions: "The port your Redis server is listening on."|t('bramble-search'),
+        tip: "The default Redis port is 6379. Can be overridden with the BRAMBLE_SEARCH_REDIS_PORT environment variable."|t('bramble-search'),
+        id: 'redisPort',
+        name: 'redisPort',
+        placeholder: '6379',
+        value: settings.redisPort,
+        type: 'number',
+        min: 1,
+        max: 65535,
+        errors: settings.getErrors('redisPort'),
+        required: true,
+    }) }}
+
+    {{ forms.passwordField({
+        label: "Redis Password"|t('bramble-search'),
+        instructions: "The password for your Redis server (if required)."|t('bramble-search'),
+        tip: "Leave blank if your Redis server doesn't require authentication. Can be overridden with the BRAMBLE_SEARCH_REDIS_PASSWORD environment variable."|t('bramble-search'),
+        id: 'redisPassword',
+        name: 'redisPassword',
+        placeholder: 'Password',
+        value: settings.redisPassword,
+        errors: settings.getErrors('redisPassword'),
+    }) }}
+</div>
+
+<hr>
+
+{{ forms.field({
+    label: "Rebuilding the Search Index"|t('bramble-search'),
+    instructions: "The search index is automatically maintained as content is created and updated."|t('bramble-search'),
+}, null) }}
+
+{{ forms.field({
+    id: 'rebuild-instructions',
+    fieldClass: 'first',
+}, '<p class="light">' ~ "If you need to rebuild the entire search index, you have two options:"|t('bramble-search') ~ '</p>
+    <div class="meta" style="margin-bottom:12px;">
+
+    <div class="field">
+        <div class="heading">
+            <label>' ~ "Via the Control Panel"|t('bramble-search') ~ '</label>
+        </div>
+        <div class="input">
+            <p>' ~ "Go to"|t('bramble-search') ~ ' <em>' ~ "Utilities"|t('bramble-search') ~ ' → ' ~ "Clear Caches"|t('bramble-search') ~ '</em> ' ~ "and select"|t('bramble-search') ~ ' <em>' ~ "Bramble Search"|t('bramble-search') ~ '</em>.</p>
+        </div>
+    </div>
+
+    <div class="field">
+        <div class="heading">
+            <label>' ~ "Via the Command Line"|t('bramble-search') ~ '</label>
+        </div>
+        <div class="input">
+            <p>' ~ "Run the command"|t('bramble-search') ~ ' <code>./craft clear-caches/all</code> ' ~ "or"|t('bramble-search') ~ ' <code>./craft clear-caches/bramble-search</code>.</p>
+        </div>
+    </div>
+
+    </div>
+
+    <small class="light">' ~ "Note: Rebuilding the index may take some time depending on the size of your site."|t('bramble-search') ~ '</small>') }}
+
+{% js %}
+document.addEventListener('DOMContentLoaded', function() {
+    var storageDriverSelect = document.getElementById('storageDriver');
+    var redisSettings = document.getElementById('storage-redis');
+
+    // Function to check value and toggle visibility
+    function updateVisibility() {
+        var value = storageDriverSelect.value;
+        if (value === 'redis') {
+            redisSettings.classList.remove('hidden');
+        } else {
+            redisSettings.classList.add('hidden');
+        }
+    }
+
+    // Initial check
+    updateVisibility();
+
+    // Listen for changes
+    storageDriverSelect.addEventListener('change', updateVisibility);
+});
+{% endjs %}
