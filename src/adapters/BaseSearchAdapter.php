@@ -20,6 +20,10 @@ abstract class BaseSearchAdapter extends Search
     protected float $k1 = 1.5;
     protected float $b = 0.75;
 
+    // Boost factors for title and exact match
+    protected float $titleBoostFactor = 5.0;
+    protected float $exactMatchBoostFactor = 3.0;
+
     protected array $stopWords = [];
 
     public function __construct()
@@ -44,8 +48,14 @@ abstract class BaseSearchAdapter extends Search
             return true;
         }
 
-        $text = $element->title ?? '';
+        // Process title separately
+        $title = $element->title ?? '';
+        $titleTokens = $this->tokenize($title);
+        $titleTokens = $this->filterStopWords($titleTokens);
+        $titleTerms = array_flip($titleTokens); // Convert to associative array for faster lookups
 
+        // Process all content including title
+        $text = $title;
         foreach ($fieldHandles ?? [] as $handle) {
             $fieldValue = $element->getFieldValue($handle);
             if (is_string($fieldValue)) {
@@ -64,11 +74,13 @@ abstract class BaseSearchAdapter extends Search
             $this->removeTermDocument($term, $element->siteId, $element->id);
         }
 
-        // Delete the old document
+        // Delete the old document and title terms
         $this->deleteDocument($element->siteId, $element->id);
+        $this->deleteTitleTerms($element->siteId, $element->id);
 
-        // Store new document data
+        // Store new document data and title terms
         $this->storeDocument($element->siteId, $element->id, $termFreqs, $docLen);
+        $this->storeTitleTerms($element->siteId, $element->id, $titleTerms);
 
         // Update term indices
         foreach ($termFreqs as $term => $freq) {
@@ -86,7 +98,8 @@ abstract class BaseSearchAdapter extends Search
     public function searchElements(ElementQuery $elementQuery): array
     {
         $siteId = $elementQuery->siteId ?? Craft::$app->sites->currentSite->id;
-        $tokens = $this->tokenize($elementQuery->search);
+        $searchQuery = $elementQuery->search;
+        $tokens = $this->tokenize($searchQuery);
         $tokens = $this->filterStopWords($tokens);
 
         $totalDocs = max(1, $this->getTotalDocCount());
@@ -94,6 +107,7 @@ abstract class BaseSearchAdapter extends Search
         $avgDocLength = $totalLength / $totalDocs;
 
         $docScores = [];
+        $matchedDocs = []; // Track which docs matched for exact phrase matching
 
         foreach ($tokens as $term) {
             $termDocs = $this->getTermDocuments($term);
@@ -107,9 +121,15 @@ abstract class BaseSearchAdapter extends Search
                     }
 
                     $docLen = max(1, $this->getDocumentLength($docId));
-
                     $score = $this->bm25($freq, $docFreq, $docLen, $avgDocLength);
+
+                    // Apply title boost if term is in title
+                    if ($this->isTermInTitle($term, $docId)) {
+                        $score *= $this->titleBoostFactor;
+                    }
+
                     $docScores[$docId] = ($docScores[$docId] ?? 0) + $score;
+                    $matchedDocs[$docId][$term] = true;
                 }
 
                 continue;
@@ -127,9 +147,28 @@ abstract class BaseSearchAdapter extends Search
                     }
 
                     $docLen = max(1, $this->getDocumentLength($docId));
-
                     $score = $this->bm25($freq, $docFreq, $docLen, $avgDocLength);
+
+                    // Apply title boost if term is in title
+                    if ($this->isTermInTitle($fuzzy, $docId)) {
+                        $score *= $this->titleBoostFactor;
+                    }
+
                     $docScores[$docId] = ($docScores[$docId] ?? 0) + $score;
+                    $matchedDocs[$docId][$term] = true;
+                }
+            }
+        }
+
+        // Apply exact match boosting
+        if (count($tokens) > 1) {
+            foreach ($matchedDocs as $docId => $docTerms) {
+                // If document contains all search terms, apply exact match boost
+                if (count($docTerms) === count($tokens)) {
+                    // Check if the document contains the exact phrase
+                    if ($this->containsExactPhrase($docId, $searchQuery)) {
+                        $docScores[$docId] *= $this->exactMatchBoostFactor;
+                    }
                 }
             }
         }
@@ -177,6 +216,46 @@ abstract class BaseSearchAdapter extends Search
     protected function filterStopWords(array $tokens): array
     {
         return array_filter($tokens, fn($t) => !in_array($t, $this->stopWords));
+    }
+
+    /**
+     * Check if a term is in the title of a document
+     *
+     * @param string $term The term to check
+     * @param string $docId The document ID (siteId:elementId)
+     * @return bool Whether the term is in the title
+     */
+    protected function isTermInTitle(string $term, string $docId): bool
+    {
+        $titleTerms = $this->getTitleTerms($docId);
+        return isset($titleTerms[$term]);
+    }
+
+    /**
+     * Check if a document contains the exact phrase
+     *
+     * @param string $docId The document ID (siteId:elementId)
+     * @param string $phrase The phrase to check
+     * @return bool Whether the document contains the exact phrase
+     */
+    protected function containsExactPhrase(string $docId, string $phrase): bool
+    {
+        // This is a simplified implementation
+        // For a more accurate implementation, we would need to store position information
+        // For now, we'll just check if all the terms are present
+        $tokens = $this->tokenize($phrase);
+        $tokens = $this->filterStopWords($tokens);
+
+        [$siteId, $elementId] = explode(':', $docId);
+        $docTerms = $this->getDocumentTerms((int)$siteId, (int)$elementId);
+
+        foreach ($tokens as $token) {
+            if (!isset($docTerms[$token])) {
+                return false;
+            }
+        }
+
+        return true;
     }
 
     // Abstract methods that must be implemented by storage-specific adapters
@@ -291,4 +370,31 @@ abstract class BaseSearchAdapter extends Search
      * @return array All terms
      */
     abstract protected function getAllTerms(): array;
+
+    /**
+     * Store title terms for a document
+     *
+     * @param int $siteId The site ID
+     * @param int $elementId The element ID
+     * @param array $titleTerms The title terms
+     * @return void
+     */
+    abstract protected function storeTitleTerms(int $siteId, int $elementId, array $titleTerms): void;
+
+    /**
+     * Get title terms for a document
+     *
+     * @param string $docId The document ID (siteId:elementId)
+     * @return array The title terms
+     */
+    abstract protected function getTitleTerms(string $docId): array;
+
+    /**
+     * Delete title terms for a document
+     *
+     * @param int $siteId The site ID
+     * @param int $elementId The element ID
+     * @return void
+     */
+    abstract protected function deleteTitleTerms(int $siteId, int $elementId): void;
 }

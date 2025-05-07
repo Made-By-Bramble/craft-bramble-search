@@ -157,4 +157,37 @@ class RedisSearchAdapter extends BaseSearchAdapter
 
         return $terms;
     }
+
+    protected function storeTitleTerms(int $siteId, int $elementId, array $titleTerms): void
+    {
+        $titleKey = $this->prefix . "title:{$siteId}:{$elementId}";
+
+        // Delete existing title terms
+        $this->redis->del($titleKey);
+
+        // Store new title terms
+        if (!empty($titleTerms)) {
+            foreach (array_keys($titleTerms) as $term) {
+                $this->redis->sAdd($titleKey, $term);
+            }
+        }
+    }
+
+    protected function getTitleTerms(string $docId): array
+    {
+        $titleKey = $this->prefix . "title:$docId";
+        $terms = $this->redis->sMembers($titleKey);
+
+        if ($terms === false || !is_array($terms)) {
+            return [];
+        }
+
+        return array_flip($terms); // Convert to associative array for faster lookups
+    }
+
+    protected function deleteTitleTerms(int $siteId, int $elementId): void
+    {
+        $titleKey = $this->prefix . "title:{$siteId}:{$elementId}";
+        $this->redis->del($titleKey);
+    }
 }

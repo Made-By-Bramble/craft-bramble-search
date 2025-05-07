@@ -219,4 +219,28 @@ class CraftCacheSearchAdapter extends BaseSearchAdapter
             Craft::$app->cache->set($allTermsKey, $terms);
         }
     }
+
+    protected function storeTitleTerms(int $siteId, int $elementId, array $titleTerms): void
+    {
+        $titleKey = $this->prefix . "title:{$siteId}:{$elementId}";
+        Craft::$app->cache->set($titleKey, $titleTerms);
+    }
+
+    protected function getTitleTerms(string $docId): array
+    {
+        $titleKey = $this->prefix . "title:$docId";
+        $terms = Craft::$app->cache->get($titleKey);
+
+        if ($terms === false || !is_array($terms)) {
+            return [];
+        }
+
+        return $terms;
+    }
+
+    protected function deleteTitleTerms(int $siteId, int $elementId): void
+    {
+        $titleKey = $this->prefix . "title:{$siteId}:{$elementId}";
+        Craft::$app->cache->delete($titleKey);
+    }
 }
