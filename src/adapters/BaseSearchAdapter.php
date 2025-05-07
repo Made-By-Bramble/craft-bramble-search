@@ -75,7 +75,7 @@ abstract class BaseSearchAdapter extends Search
             'fields' => []
         ];
 
-        // Process title separately
+        // Process title for special handling
         $title = $element->title ?? '';
         $titleTokens = $this->tokenize($title);
         $titleTokens = $this->filterStopWords($titleTokens);
@@ -83,15 +83,32 @@ abstract class BaseSearchAdapter extends Search
 
         $logData['titleTokens'] = $titleTokens;
 
-        // Process all content including title
-        $text = $title;
-        foreach ($fieldHandles ?? [] as $handle) {
-            $fieldValue = $element->getFieldValue($handle);
-            if (is_string($fieldValue)) {
-                $text .= ' ' . $fieldValue;
-                $logData['fields'][$handle] = $fieldValue;
-            } else {
-                $logData['fields'][$handle] = '(non-string value)';
+        // Process all content using Craft's searchable attributes
+        $text = '';
+
+        // Process element attributes
+        foreach (ElementHelper::searchableAttributes($element) as $attribute) {
+            $value = $element->getSearchKeywords($attribute);
+            if (!empty($value)) {
+                $text .= ' ' . $value;
+                $logData['fields'][$attribute] = $value;
+            }
+        }
+
+        // Process custom fields if specified
+        if ($fieldHandles !== null) {
+            foreach ($fieldHandles as $handle) {
+                $fieldValue = $element->getFieldValue($handle);
+                if ($fieldValue && $element->getFieldLayout()) {
+                    $field = $element->getFieldLayout()->getFieldByHandle($handle);
+                    if ($field && $field->searchable) {
+                        $keywords = $field->getSearchKeywords($fieldValue, $element);
+                        if (!empty($keywords)) {
+                            $text .= ' ' . $keywords;
+                            $logData['fields'][$handle] = $keywords;
+                        }
+                    }
+                }
             }
         }
 

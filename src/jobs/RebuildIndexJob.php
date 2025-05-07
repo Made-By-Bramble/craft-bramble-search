@@ -117,8 +117,13 @@ class RebuildIndexJob extends BaseJob
     protected function getIndexableFieldHandles(Entry $entry): array
     {
         $fieldHandles = [];
+        $fieldLayout = $entry->getFieldLayout();
 
-        foreach ($entry->getFieldLayout()->getCustomFields() as $field) {
+        if (!$fieldLayout) {
+            return $fieldHandles;
+        }
+
+        foreach ($fieldLayout->getCustomFields() as $field) {
             // Skip fields that shouldn't be indexed
             if (!$field->searchable) {
                 continue;
