@@ -190,4 +190,72 @@ class RedisSearchAdapter extends BaseSearchAdapter
         $titleKey = $this->prefix . "title:{$siteId}:{$elementId}";
         $this->redis->del($titleKey);
     }
+
+    /**
+     * Get all documents for a specific site
+     *
+     * @param int $siteId The site ID
+     * @return array The document IDs
+     */
+    protected function getSiteDocuments(int $siteId): array
+    {
+        $metaKey = $this->prefix . "meta";
+        $docsKey = $metaKey . ':docs';
+        $allDocs = $this->redis->sMembers($docsKey);
+
+        // Handle false return
+        if ($allDocs === false || !is_array($allDocs)) {
+            return [];
+        }
+
+        // Filter documents by site ID
+        $sitePrefix = "$siteId:";
+        $siteDocs = [];
+
+        foreach ($allDocs as $docId) {
+            if (strpos($docId, $sitePrefix) === 0) {
+                $siteDocs[] = $docId;
+            }
+        }
+
+        return $siteDocs;
+    }
+
+    /**
+     * Remove a document from the index
+     *
+     * @param int $siteId The site ID
+     * @param int $elementId The element ID
+     * @return void
+     */
+    protected function removeDocumentFromIndex(int $siteId, int $elementId): void
+    {
+        $metaKey = $this->prefix . "meta";
+        $docsKey = $metaKey . ':docs';
+        $this->redis->sRem($docsKey, "{$siteId}:{$elementId}");
+    }
+
+    /**
+     * Reset the total length counter
+     *
+     * @return void
+     */
+    protected function resetTotalLength(): void
+    {
+        $metaKey = $this->prefix . "meta";
+        $totalLengthKey = $metaKey . ':totalLength';
+        $this->redis->set($totalLengthKey, 0);
+    }
+
+    /**
+     * Remove a term from the index
+     *
+     * @param string $term The term to remove
+     * @return void
+     */
+    protected function removeTermFromIndex(string $term): void
+    {
+        $termKey = $this->prefix . "term:$term";
+        $this->redis->del($termKey);
+    }
 }

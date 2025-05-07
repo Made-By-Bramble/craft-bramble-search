@@ -243,4 +243,96 @@ class CraftCacheSearchAdapter extends BaseSearchAdapter
         $titleKey = $this->prefix . "title:{$siteId}:{$elementId}";
         Craft::$app->cache->delete($titleKey);
     }
+
+    /**
+     * Get all documents for a specific site
+     *
+     * @param int $siteId The site ID
+     * @return array The document IDs
+     */
+    protected function getSiteDocuments(int $siteId): array
+    {
+        $metaKey = $this->prefix . "meta";
+        $docsKey = $metaKey . ':docs';
+        $allDocs = Craft::$app->cache->get($docsKey);
+
+        // Handle false return from cache
+        if ($allDocs === false || !is_array($allDocs)) {
+            return [];
+        }
+
+        // Filter documents by site ID
+        $sitePrefix = "$siteId:";
+        $siteDocs = [];
+
+        foreach (array_keys($allDocs) as $docId) {
+            if (strpos($docId, $sitePrefix) === 0) {
+                $siteDocs[] = $docId;
+            }
+        }
+
+        return $siteDocs;
+    }
+
+    /**
+     * Remove a document from the index
+     *
+     * @param int $siteId The site ID
+     * @param int $elementId The element ID
+     * @return void
+     */
+    protected function removeDocumentFromIndex(int $siteId, int $elementId): void
+    {
+        $metaKey = $this->prefix . "meta";
+        $docsKey = $metaKey . ':docs';
+        $docs = Craft::$app->cache->get($docsKey);
+
+        // Handle false return from cache
+        if ($docs === false || !is_array($docs)) {
+            return;
+        }
+
+        $docId = "{$siteId}:{$elementId}";
+        if (isset($docs[$docId])) {
+            unset($docs[$docId]);
+            Craft::$app->cache->set($docsKey, $docs);
+        }
+    }
+
+    /**
+     * Reset the total length counter
+     *
+     * @return void
+     */
+    protected function resetTotalLength(): void
+    {
+        $metaKey = $this->prefix . "meta";
+        $totalLengthKey = $metaKey . ':totalLength';
+        Craft::$app->cache->set($totalLengthKey, 0);
+    }
+
+    /**
+     * Remove a term from the index
+     *
+     * @param string $term The term to remove
+     * @return void
+     */
+    protected function removeTermFromIndex(string $term): void
+    {
+        // Remove the term from the all_terms list
+        $allTermsKey = $this->prefix . 'all_terms';
+        $terms = Craft::$app->cache->get($allTermsKey);
+
+        if ($terms !== false && is_array($terms)) {
+            $key = array_search($term, $terms);
+            if ($key !== false) {
+                unset($terms[$key]);
+                Craft::$app->cache->set($allTermsKey, array_values($terms));
+            }
+        }
+
+        // Delete the term's document list
+        $termKey = $this->prefix . "term:$term";
+        Craft::$app->cache->delete($termKey);
+    }
 }

@@ -33,8 +33,20 @@ class RebuildIndexJob extends BaseJob
             throw new \Exception("Site with ID {$this->siteId} not found");
         }
 
+        // Clear the existing index for this site before rebuilding
+        Craft::info("Starting index rebuild for site ID: {$site->id}", __METHOD__);
+        $this->clearIndex($site->id);
+
         // Get the total number of entries for this site
-        $entryQuery = Entry::find()->site($site)->status(null);
+        // Exclude drafts, revisions, provisional drafts, and entries without titles
+        $entryQuery = Entry::find()
+            ->site($site)
+            ->status(null)
+            ->drafts(false)
+            ->revisions(false)
+            ->provisionalDrafts(false)
+            ->andWhere(['not', ['title' => null]])
+            ->andWhere(['not', ['title' => '']]);
         $count = $entryQuery->count();
 
         if ($count === 0) {
@@ -64,6 +76,8 @@ class RebuildIndexJob extends BaseJob
             $offset += $this->batchSize;
             $step++;
         }
+
+        Craft::info("Index rebuild completed for site ID: {$site->id}", __METHOD__);
     }
 
     /**
@@ -114,5 +128,28 @@ class RebuildIndexJob extends BaseJob
         }
 
         return $fieldHandles;
+    }
+
+    /**
+     * Clear the search index for a specific site
+     *
+     * @param int $siteId The site ID to clear the index for
+     * @return void
+     */
+    protected function clearIndex(int $siteId): void
+    {
+        Craft::info("Clearing search index for site ID: $siteId", __METHOD__);
+
+        // Get the search service
+        $searchService = Craft::$app->getSearch();
+
+        // Check if the search service is one of our adapters
+        if (method_exists($searchService, 'clearIndex')) {
+            // If our search service has a clearIndex method, use it
+            $searchService->clearIndex($siteId);
+        } else {
+            // Otherwise, log a warning
+            Craft::warning("Search service does not support clearIndex method. Index may not be fully cleared.", __METHOD__);
+        }
     }
 }

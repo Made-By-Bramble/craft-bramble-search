@@ -6,6 +6,8 @@ use Craft;
 use craft\services\Search;
 use craft\base\ElementInterface;
 use craft\elements\db\ElementQuery;
+use craft\helpers\ElementHelper;
+use yii\log\Logger;
 
 /**
  * Base Search Adapter
@@ -44,9 +46,34 @@ abstract class BaseSearchAdapter extends Search
 
     public function indexElementAttributes(ElementInterface $element, array|null $fieldHandles = null): bool
     {
+        // Skip elements without ID, site ID, or that are disabled
         if (!$element->id || !$element->siteId || !$element->enabled) {
             return true;
         }
+
+        // Skip drafts and revisions
+        if (ElementHelper::isDraftOrRevision($element)) {
+            return true;
+        }
+
+        // Skip provisional drafts
+        if (property_exists($element, 'isProvisionalDraft') && $element->isProvisionalDraft) {
+            return true;
+        }
+
+        // Skip entries without titles (likely section entries in Craft 5)
+        if (property_exists($element, 'title') && empty($element->title)) {
+            return true;
+        }
+
+        // Prepare log data
+        $logData = [
+            'elementId' => $element->id,
+            'siteId' => $element->siteId,
+            'elementType' => get_class($element),
+            'title' => $element->title ?? '(no title)',
+            'fields' => []
+        ];
 
         // Process title separately
         $title = $element->title ?? '';
@@ -54,12 +81,17 @@ abstract class BaseSearchAdapter extends Search
         $titleTokens = $this->filterStopWords($titleTokens);
         $titleTerms = array_flip($titleTokens); // Convert to associative array for faster lookups
 
+        $logData['titleTokens'] = $titleTokens;
+
         // Process all content including title
         $text = $title;
         foreach ($fieldHandles ?? [] as $handle) {
             $fieldValue = $element->getFieldValue($handle);
             if (is_string($fieldValue)) {
                 $text .= ' ' . $fieldValue;
+                $logData['fields'][$handle] = $fieldValue;
+            } else {
+                $logData['fields'][$handle] = '(non-string value)';
             }
         }
 
@@ -68,8 +100,15 @@ abstract class BaseSearchAdapter extends Search
         $termFreqs = array_count_values($tokens);
         $docLen = count($tokens);
 
+        // Add tokenization results to log data
+        $logData['allTokens'] = $tokens;
+        $logData['termFrequencies'] = $termFreqs;
+        $logData['documentLength'] = $docLen;
+
         // Get old terms to clean up
         $oldTerms = $this->getDocumentTerms($element->siteId, $element->id);
+        $logData['oldTerms'] = $oldTerms;
+
         foreach ($oldTerms as $term => $freq) {
             $this->removeTermDocument($term, $element->siteId, $element->id);
         }
@@ -91,6 +130,13 @@ abstract class BaseSearchAdapter extends Search
         $this->addDocumentToIndex($element->siteId, $element->id);
         $this->updateTotalDocCount();
         $this->updateTotalLength($docLen);
+
+        // Log the indexing operation with all collected data
+        Craft::getLogger()->log(
+            $this->formatLogMessage($logData),
+            Logger::LEVEL_TRACE,
+            'bramble-search'
+        );
 
         return true;
     }
@@ -216,6 +262,59 @@ abstract class BaseSearchAdapter extends Search
     protected function filterStopWords(array $tokens): array
     {
         return array_filter($tokens, fn($t) => !in_array($t, $this->stopWords));
+    }
+
+    /**
+     * Format log data into a readable message
+     *
+     * @param array $logData The log data to format
+     * @return string The formatted log message
+     */
+    protected function formatLogMessage(array $logData): string
+    {
+        $message = "Indexing Element: ID={$logData['elementId']}, Site={$logData['siteId']}, Type={$logData['elementType']}\n";
+        $message .= "Title: \"{$logData['title']}\"\n";
+
+        // Title tokens
+        $message .= "Title Tokens: " . (empty($logData['titleTokens']) ? '(none)' : implode(', ', $logData['titleTokens'])) . "\n";
+
+        // Fields
+        $message .= "Fields:\n";
+        if (empty($logData['fields'])) {
+            $message .= "  (no fields)\n";
+        } else {
+            foreach ($logData['fields'] as $handle => $value) {
+                // Truncate long field values for readability
+                if (is_string($value) && strlen($value) > 100) {
+                    $value = substr($value, 0, 97) . '...';
+                }
+                $message .= "  {$handle}: \"{$value}\"\n";
+            }
+        }
+
+        // Tokens and frequencies
+        $message .= "Document Length: {$logData['documentLength']} tokens\n";
+
+        $message .= "Term Frequencies:\n";
+        if (empty($logData['termFrequencies'])) {
+            $message .= "  (no terms)\n";
+        } else {
+            foreach ($logData['termFrequencies'] as $term => $freq) {
+                $message .= "  {$term}: {$freq}\n";
+            }
+        }
+
+        // Old terms (if any)
+        $message .= "Old Terms:\n";
+        if (empty($logData['oldTerms'])) {
+            $message .= "  (no previous terms)\n";
+        } else {
+            foreach ($logData['oldTerms'] as $term => $freq) {
+                $message .= "  {$term}: {$freq}\n";
+            }
+        }
+
+        return $message;
     }
 
     /**
@@ -372,6 +471,86 @@ abstract class BaseSearchAdapter extends Search
     abstract protected function getAllTerms(): array;
 
     /**
+     * Clear the search index for a specific site
+     *
+     * @param int $siteId The site ID to clear the index for
+     * @return bool Whether the operation was successful
+     */
+    public function clearIndex(int $siteId): bool
+    {
+        try {
+            // Get all documents for this site
+            $documents = $this->getSiteDocuments($siteId);
+
+            // Track the total length we're removing
+            $totalLengthToRemove = 0;
+
+            // We'll clean up orphaned terms after deleting documents
+
+            // Delete each document
+            foreach ($documents as $docId) {
+                [$docSiteId, $elementId] = explode(':', $docId);
+                $elementId = (int)$elementId;
+                $docSiteId = (int)$docSiteId;
+
+                // Get document length before deleting
+                $docLength = $this->getDocumentLength("$docSiteId:$elementId");
+                $totalLengthToRemove += $docLength;
+
+                // Delete the element from the index
+                $this->deleteElementFromIndex($elementId, $docSiteId);
+            }
+
+            // Reset the total length
+            $this->resetTotalLength();
+
+            // Clear all terms that no longer have documents
+            $this->cleanupOrphanedTerms();
+
+            // Update metadata
+            $this->updateTotalDocCount();
+
+            Craft::info("Search index cleared for site ID: $siteId", __METHOD__);
+            return true;
+        } catch (\Throwable $e) {
+            Craft::error("Error clearing search index: " . $e->getMessage(), __METHOD__);
+            return false;
+        }
+    }
+
+    /**
+     * Delete an element from the index completely
+     *
+     * @param int $elementId The element ID
+     * @param int $siteId The site ID
+     * @return bool Whether the operation was successful
+     */
+    public function deleteElementFromIndex(int $elementId, int $siteId): bool
+    {
+        try {
+            // Get all terms for this document
+            $terms = $this->getDocumentTerms($siteId, $elementId);
+
+            // Remove the document from each term's document list
+            foreach (array_keys($terms) as $term) {
+                $this->removeTermDocument($term, $siteId, $elementId);
+            }
+
+            // Delete the document and title terms
+            $this->deleteDocument($siteId, $elementId);
+            $this->deleteTitleTerms($siteId, $elementId);
+
+            // Remove from the document index
+            $this->removeDocumentFromIndex($siteId, $elementId);
+
+            return true;
+        } catch (\Throwable $e) {
+            Craft::error("Error deleting element from index: " . $e->getMessage(), __METHOD__);
+            return false;
+        }
+    }
+
+    /**
      * Store title terms for a document
      *
      * @param int $siteId The site ID
@@ -397,4 +576,54 @@ abstract class BaseSearchAdapter extends Search
      * @return void
      */
     abstract protected function deleteTitleTerms(int $siteId, int $elementId): void;
+
+    /**
+     * Get all documents for a specific site
+     *
+     * @param int $siteId The site ID
+     * @return array The document IDs
+     */
+    abstract protected function getSiteDocuments(int $siteId): array;
+
+    /**
+     * Remove a document from the index
+     *
+     * @param int $siteId The site ID
+     * @param int $elementId The element ID
+     * @return void
+     */
+    abstract protected function removeDocumentFromIndex(int $siteId, int $elementId): void;
+
+    /**
+     * Reset the total length counter
+     *
+     * @return void
+     */
+    abstract protected function resetTotalLength(): void;
+
+    /**
+     * Clean up orphaned terms (terms with no documents)
+     *
+     * @return void
+     */
+    public function cleanupOrphanedTerms(): void
+    {
+        $allTerms = $this->getAllTerms();
+
+        foreach ($allTerms as $term) {
+            $docs = $this->getTermDocuments($term);
+
+            if (empty($docs)) {
+                $this->removeTermFromIndex($term);
+            }
+        }
+    }
+
+    /**
+     * Remove a term from the index
+     *
+     * @param string $term The term to remove
+     * @return void
+     */
+    abstract protected function removeTermFromIndex(string $term): void;
 }
