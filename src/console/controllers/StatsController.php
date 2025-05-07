@@ -10,22 +10,28 @@ use MadeByBramble\BrambleSearch\adapters\BaseSearchAdapter;
 use yii\console\ExitCode;
 
 /**
- * Provides statistics about the Bramble Search index
+ * Stats Controller
+ *
+ * Console command that provides statistics about the Bramble Search index,
+ * including document count, term count, and estimated storage size.
  */
 class StatsController extends Controller
 {
     /**
-     * @var bool Whether to show detailed statistics
+     * Whether to show detailed statistics including top terms and index health
      */
     public $detailed = false;
 
     /**
-     * @var string|null The storage driver to use (craft, redis)
+     * The storage driver to use (craft, redis)
      */
     public $driver;
 
     /**
-     * @inheritdoc
+     * Define the command options
+     *
+     * @param string $actionID The ID of the action to get options for
+     * @return array The options for the command
      */
     public function options($actionID): array
     {
@@ -36,7 +42,9 @@ class StatsController extends Controller
     }
 
     /**
-     * @inheritdoc
+     * Define option aliases for the command
+     *
+     * @return array The option aliases
      */
     public function optionAliases(): array
     {
@@ -48,7 +56,7 @@ class StatsController extends Controller
     /**
      * Display statistics about the Bramble Search index
      *
-     * @return int
+     * @return int Exit code
      */
     public function actionIndex(): int
     {
@@ -98,8 +106,10 @@ class StatsController extends Controller
     /**
      * Get the total number of documents in the index
      *
-     * @param BaseSearchAdapter $searchService
-     * @return int
+     * Uses reflection to access protected method in the search adapter
+     *
+     * @param BaseSearchAdapter $searchService The search service
+     * @return int The total document count
      */
     protected function getTotalDocuments(BaseSearchAdapter $searchService): int
     {
@@ -114,8 +124,10 @@ class StatsController extends Controller
     /**
      * Get the total number of unique terms in the index
      *
-     * @param BaseSearchAdapter $searchService
-     * @return int
+     * Uses reflection to access protected method in the search adapter
+     *
+     * @param BaseSearchAdapter $searchService The search service
+     * @return int The total unique term count
      */
     protected function getTotalTerms(BaseSearchAdapter $searchService): int
     {
@@ -130,8 +142,10 @@ class StatsController extends Controller
     /**
      * Get the total length of all documents in the index
      *
-     * @param BaseSearchAdapter $searchService
-     * @return int
+     * Uses reflection to access protected method in the search adapter
+     *
+     * @param BaseSearchAdapter $searchService The search service
+     * @return int The total token length
      */
     protected function getTotalLength(BaseSearchAdapter $searchService): int
     {
@@ -146,8 +160,10 @@ class StatsController extends Controller
     /**
      * Get the estimated storage size of the index
      *
-     * @param BaseSearchAdapter $searchService
-     * @return int
+     * Calculates a rough estimate based on term, document, and token counts
+     *
+     * @param BaseSearchAdapter $searchService The search service
+     * @return int The estimated storage size in bytes
      */
     protected function getStorageSize(BaseSearchAdapter $searchService): int
     {
@@ -167,8 +183,9 @@ class StatsController extends Controller
     /**
      * Display detailed statistics about the index
      *
-     * @param BaseSearchAdapter $searchService
-     * @return void
+     * Shows top terms by document frequency and index health metrics
+     *
+     * @param BaseSearchAdapter $searchService The search service
      */
     protected function displayDetailedStats(BaseSearchAdapter $searchService): void
     {
@@ -195,9 +212,11 @@ class StatsController extends Controller
     /**
      * Get the top terms by document frequency
      *
-     * @param BaseSearchAdapter $searchService
-     * @param int $limit
-     * @return array
+     * Uses reflection to access protected methods in the search adapter
+     *
+     * @param BaseSearchAdapter $searchService The search service
+     * @param int $limit Maximum number of terms to return
+     * @return array Top terms with their document counts
      */
     protected function getTopTerms(BaseSearchAdapter $searchService, int $limit = 10): array
     {
@@ -225,8 +244,9 @@ class StatsController extends Controller
     /**
      * Display index health metrics
      *
-     * @param BaseSearchAdapter $searchService
-     * @return void
+     * Shows term-to-document ratio and other health indicators
+     *
+     * @param BaseSearchAdapter $searchService The search service
      */
     protected function displayIndexHealth(BaseSearchAdapter $searchService): void
     {
@@ -250,9 +270,11 @@ class StatsController extends Controller
     /**
      * Format bytes to human-readable format
      *
-     * @param int $bytes
-     * @param int $precision
-     * @return string
+     * Converts raw byte count to KB, MB, GB, or TB as appropriate
+     *
+     * @param int $bytes The number of bytes
+     * @param int $precision The number of decimal places
+     * @return string Formatted size with unit
      */
     protected function formatBytes(int $bytes, int $precision = 2): string
     {

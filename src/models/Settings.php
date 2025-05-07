@@ -4,14 +4,41 @@ namespace MadeByBramble\BrambleSearch\models;
 
 use craft\base\Model;
 
+/**
+ * Bramble Search Settings Model
+ *
+ * Defines the configurable settings for the Bramble Search plugin
+ */
 class Settings extends Model
 {
+  /**
+   * Whether the search plugin is enabled
+   */
   public bool $enabled = false;
+
+  /**
+   * Storage driver for the search index (craft or redis)
+   */
   public string $storageDriver = 'craft';
+
+  /**
+   * Redis server hostname or IP address
+   */
   public string $redisHost = 'localhost';
+
+  /**
+   * Redis server port
+   */
   public int $redisPort = 6379;
+
+  /**
+   * Redis server password (if required)
+   */
   public string|null $redisPassword = null;
 
+  /**
+   * Define validation rules for settings
+   */
   public function rules(): array
   {
     return [

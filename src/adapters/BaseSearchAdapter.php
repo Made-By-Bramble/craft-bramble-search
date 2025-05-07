@@ -13,37 +13,80 @@ use yii\log\Logger;
  * Base Search Adapter
  *
  * Abstract base class for all search adapters that implements common functionality
- * and defines abstract methods that must be implemented by storage-specific adapters.
+ * including BM25 scoring, fuzzy search, and title boosting. Defines abstract methods
+ * that must be implemented by storage-specific adapters.
  */
 abstract class BaseSearchAdapter extends Search
 {
+    // =========================================================================
+    // PROPERTIES
+    // =========================================================================
+
+    /**
+     * Key prefix for all stored search data
+     */
     protected string $prefix = 'bramble_search:';
 
+    /**
+     * BM25 algorithm parameter: term saturation
+     */
     protected float $k1 = 1.5;
+
+    /**
+     * BM25 algorithm parameter: document length normalization
+     */
     protected float $b = 0.75;
 
-    // Boost factors for title and exact match
+    /**
+     * Boost factor applied to terms found in title fields
+     */
     protected float $titleBoostFactor = 5.0;
+
+    /**
+     * Boost factor applied to exact phrase matches
+     */
     protected float $exactMatchBoostFactor = 3.0;
 
+    /**
+     * List of stop words to filter out during indexing and searching
+     */
     protected array $stopWords = [];
 
-    public function __construct()
-    {
-        parent::__construct();
-    }
+    // =========================================================================
+    // INITIALIZATION METHODS
+    // =========================================================================
 
+    /**
+     * Initialize the adapter
+     */
     public function init(): void
     {
         parent::init();
         $this->loadStopWords();
     }
 
+    /**
+     * Load stop words from language file
+     */
     protected function loadStopWords(): void
     {
         $this->stopWords = require Craft::getAlias('@bramble_search/stopwords/en.php');
     }
 
+    // =========================================================================
+    // PUBLIC METHODS
+    // =========================================================================
+
+    /**
+     * Index an element's attributes for searching
+     *
+     * Processes an element's content, tokenizes it, and stores it in the search index
+     * with special handling for title fields.
+     *
+     * @param ElementInterface $element The element to index
+     * @param array|null $fieldHandles Specific field handles to index, or null for all
+     * @return bool Whether the indexing was successful
+     */
     public function indexElementAttributes(ElementInterface $element, array|null $fieldHandles = null): bool
     {
         // Skip elements without ID, site ID, or that are disabled
@@ -158,6 +201,14 @@ abstract class BaseSearchAdapter extends Search
         return true;
     }
 
+    /**
+     * Search for elements matching a query
+     *
+     * Implements BM25 scoring algorithm with title boosting and exact phrase matching.
+     *
+     * @param ElementQuery $elementQuery The element query containing search parameters
+     * @return array Element IDs and their relevance scores
+     */
     public function searchElements(ElementQuery $elementQuery): array
     {
         $siteId = $elementQuery->siteId ?? Craft::$app->sites->currentSite->id;
@@ -248,6 +299,19 @@ abstract class BaseSearchAdapter extends Search
         return $results;
     }
 
+    // =========================================================================
+    // UTILITY METHODS
+    // =========================================================================
+
+    /**
+     * Calculate BM25 relevance score for a term in a document
+     *
+     * @param int $freq Term frequency in the document
+     * @param int $docFreq Number of documents containing the term
+     * @param int $docLen Document length in tokens
+     * @param float $avgDocLen Average document length across the index
+     * @return float BM25 score
+     */
     protected function bm25($freq, $docFreq, $docLen, $avgDocLen): float
     {
         $totalDocs = $this->getTotalDocCount();
@@ -255,6 +319,13 @@ abstract class BaseSearchAdapter extends Search
         return $idf * (($freq * ($this->k1 + 1)) / ($freq + $this->k1 * (1 - $this->b + $this->b * ($docLen / $avgDocLen))));
     }
 
+    /**
+     * Find terms that are similar to the given term using Levenshtein distance
+     *
+     * @param string $term The term to find matches for
+     * @param int $maxDistance Maximum Levenshtein distance for matches
+     * @return array List of matching terms
+     */
     protected function findFuzzyMatches(string $term, int $maxDistance = 2): array
     {
         $matches = [];
@@ -269,6 +340,12 @@ abstract class BaseSearchAdapter extends Search
         return $matches;
     }
 
+    /**
+     * Tokenize text into searchable terms
+     *
+     * @param string $text Text to tokenize
+     * @return array Array of tokens
+     */
     protected function tokenize(string $text): array
     {
         $text = strtolower($text);
@@ -276,13 +353,19 @@ abstract class BaseSearchAdapter extends Search
         return array_filter(explode(' ', $text));
     }
 
+    /**
+     * Remove stop words from an array of tokens
+     *
+     * @param array $tokens Array of tokens to filter
+     * @return array Filtered tokens
+     */
     protected function filterStopWords(array $tokens): array
     {
         return array_filter($tokens, fn($t) => !in_array($t, $this->stopWords));
     }
 
     /**
-     * Format log data into a readable message
+     * Format log data into a readable message for debugging
      *
      * @param array $logData The log data to format
      * @return string The formatted log message
@@ -335,7 +418,8 @@ abstract class BaseSearchAdapter extends Search
     }
 
     /**
-     * Check if a term is in the title of a document
+     * Check if a term appears in the title of a document
+     * Used for title boosting in search results
      *
      * @param string $term The term to check
      * @param string $docId The document ID (siteId:elementId)
@@ -348,7 +432,8 @@ abstract class BaseSearchAdapter extends Search
     }
 
     /**
-     * Check if a document contains the exact phrase
+     * Check if a document contains the exact search phrase
+     * Used for exact match boosting in search results
      *
      * @param string $docId The document ID (siteId:elementId)
      * @param string $phrase The phrase to check
@@ -374,10 +459,12 @@ abstract class BaseSearchAdapter extends Search
         return true;
     }
 
-    // Abstract methods that must be implemented by storage-specific adapters
+    // =========================================================================
+    // ABSTRACT METHODS - DOCUMENT OPERATIONS
+    // =========================================================================
 
     /**
-     * Get all terms for a document
+     * Get all indexed terms for a document with their frequencies
      *
      * @param int $siteId The site ID
      * @param int $elementId The element ID
@@ -435,6 +522,10 @@ abstract class BaseSearchAdapter extends Search
      */
     abstract protected function addDocumentToIndex(int $siteId, int $elementId): void;
 
+    // =========================================================================
+    // ABSTRACT METHODS - METADATA OPERATIONS
+    // =========================================================================
+
     /**
      * Update the total document count
      *
@@ -464,6 +555,10 @@ abstract class BaseSearchAdapter extends Search
      */
     abstract protected function getTotalLength(): int;
 
+    // =========================================================================
+    // ABSTRACT METHODS - TERM OPERATIONS
+    // =========================================================================
+
     /**
      * Get all documents for a term
      *
@@ -489,6 +584,8 @@ abstract class BaseSearchAdapter extends Search
 
     /**
      * Clear the search index for a specific site
+     *
+     * Removes all documents for the specified site and cleans up orphaned terms.
      *
      * @param int $siteId The site ID to clear the index for
      * @return bool Whether the operation was successful
@@ -538,6 +635,9 @@ abstract class BaseSearchAdapter extends Search
     /**
      * Delete an element from the index completely
      *
+     * Removes all references to the element from the search index,
+     * including term associations and metadata.
+     *
      * @param int $elementId The element ID
      * @param int $siteId The site ID
      * @return bool Whether the operation was successful
@@ -567,6 +667,10 @@ abstract class BaseSearchAdapter extends Search
         }
     }
 
+    // =========================================================================
+    // ABSTRACT METHODS - TITLE OPERATIONS
+    // =========================================================================
+
     /**
      * Store title terms for a document
      *
@@ -594,6 +698,10 @@ abstract class BaseSearchAdapter extends Search
      */
     abstract protected function deleteTitleTerms(int $siteId, int $elementId): void;
 
+    // =========================================================================
+    // ABSTRACT METHODS - SITE OPERATIONS
+    // =========================================================================
+
     /**
      * Get all documents for a specific site
      *
@@ -619,9 +727,10 @@ abstract class BaseSearchAdapter extends Search
     abstract protected function resetTotalLength(): void;
 
     /**
-     * Clean up orphaned terms (terms with no documents)
+     * Clean up orphaned terms (terms with no associated documents)
      *
-     * @return void
+     * Improves index efficiency by removing terms that no longer
+     * have any documents associated with them.
      */
     public function cleanupOrphanedTerms(): void
     {

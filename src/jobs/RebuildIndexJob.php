@@ -7,22 +7,27 @@ use craft\elements\Entry;
 use craft\queue\BaseJob;
 
 /**
- * Rebuild Index job
+ * Rebuild Index Job
+ *
+ * Queue job that rebuilds the search index for a specific site.
+ * Processes entries in batches to avoid memory issues.
  */
 class RebuildIndexJob extends BaseJob
 {
     /**
-     * @var int|null The site ID to rebuild the index for
+     * The site ID to rebuild the index for
      */
     public ?int $siteId = null;
 
     /**
-     * @var int The batch size for processing entries
+     * The batch size for processing entries to avoid memory issues
      */
     public int $batchSize = 100;
 
     /**
-     * @inheritdoc
+     * Execute the job
+     *
+     * @param craft\queue\QueueInterface $queue The queue the job belongs to
      */
     public function execute($queue): void
     {
@@ -81,7 +86,9 @@ class RebuildIndexJob extends BaseJob
     }
 
     /**
-     * @inheritdoc
+     * Return the default description for this job
+     *
+     * @return string The job description
      */
     protected function defaultDescription(): string
     {
@@ -89,10 +96,10 @@ class RebuildIndexJob extends BaseJob
     }
 
     /**
-     * Index an entry
+     * Index a single entry in the search index
      *
-     * @param Entry $entry
-     * @return bool
+     * @param Entry $entry The entry to index
+     * @return bool Whether the indexing was successful
      */
     protected function indexEntry(Entry $entry): bool
     {
@@ -111,8 +118,10 @@ class RebuildIndexJob extends BaseJob
     /**
      * Get the field handles that can be indexed for an entry
      *
-     * @param Entry $entry
-     * @return array
+     * Filters fields based on their searchable property
+     *
+     * @param Entry $entry The entry to get field handles for
+     * @return array List of searchable field handles
      */
     protected function getIndexableFieldHandles(Entry $entry): array
     {
@@ -138,8 +147,9 @@ class RebuildIndexJob extends BaseJob
     /**
      * Clear the search index for a specific site
      *
+     * Uses the search service's clearIndex method if available
+     *
      * @param int $siteId The site ID to clear the index for
-     * @return void
      */
     protected function clearIndex(int $siteId): void
     {

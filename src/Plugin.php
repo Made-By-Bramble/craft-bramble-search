@@ -1,14 +1,5 @@
 <?php
 
-/**
- * Bramble Search plugin for Craft CMS 5.x
- *
- * A powerful search engine with inverted index, fuzzy search, BM25 scoring and multiple storage backends
- *
- * @link      https://madebybramble.co.uk
- * @copyright Copyright (c) 2025 Made By Bramble
- */
-
 namespace MadeByBramble\BrambleSearch;
 
 use Craft;
@@ -24,32 +15,30 @@ use craft\console\Application as ConsoleApplication;
 use craft\helpers\App;
 
 /**
- * Class Plugin
+ * Bramble Search Plugin
  *
- * @author    Made By Bramble
- * @package   BrambleSearch
- * @since     1.0.0
- *
+ * A powerful search engine for Craft CMS 5.x with inverted index, fuzzy search,
+ * BM25 scoring and multiple storage backends (Craft Cache, Redis).
  */
 class Plugin extends BasePlugin
 {
     /**
-     * @var Plugin
+     * Plugin instance reference
      */
     public static $plugin;
 
     /**
-     * @var string
+     * Schema version for database migrations
      */
     public string $schemaVersion = '1.0.0';
 
     /**
-     * @var bool
+     * Indicates plugin has Control Panel settings
      */
     public bool $hasCpSettings = true;
 
     /**
-     * @inheritdoc
+     * Initialize the plugin
      */
     public function init()
     {
@@ -94,16 +83,7 @@ class Plugin extends BasePlugin
             $storageDriver = App::parseEnv('BRAMBLE_SEARCH_DRIVER') ? $settings->storageDriver : 'craft';
 
             if ($storageDriver === 'redis') {
-                // Check for environment variable overrides first, then fall back to settings
-                $redisHost = App::parseEnv('BRAMBLE_SEARCH_REDIS_HOST') ? $settings->redisHost : 'localhost';
-                $redisPort = (int)(App::parseEnv('BRAMBLE_SEARCH_REDIS_PORT') ? $settings->redisPort : 6379);
-                $redisPassword = App::parseEnv('BRAMBLE_SEARCH_REDIS_PASSWORD') ? $settings->redisPassword : null;
-
-                Craft::$app->set('search', new RedisSearchAdapter([
-                    'host' => $redisHost,
-                    'port' => $redisPort,
-                    'password' => $redisPassword
-                ]));
+                Craft::$app->set('search', new RedisSearchAdapter());
             } else {
                 Craft::$app->set('search', new CraftCacheSearchAdapter());
             }
@@ -119,13 +99,16 @@ class Plugin extends BasePlugin
         );
     }
 
+    /**
+     * Create the settings model
+     */
     public function createSettingsModel(): ?\craft\base\Model
     {
         return new Settings();
     }
 
     /**
-     * @inheritdoc
+     * Render the settings template
      */
     protected function settingsHtml(): ?string
     {
