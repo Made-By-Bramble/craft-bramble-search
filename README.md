@@ -7,7 +7,7 @@ A powerful search engine plugin for Craft CMS that replaces the default search s
 - 📊 **Inverted Index Architecture** - Fast, efficient search using modern indexing techniques
 - 🔤 **Fuzzy Search** - Find results even with typos using Levenshtein distance
 - 🧮 **BM25 Ranking Algorithm** - Industry-standard relevance scoring for better results
-- 🔄 **Multiple Storage Backends** - Choose between Craft cache or Redis
+- 🔄 **Multiple Storage Backends** - Choose between Craft cache, Redis, or MySQL
 - 📝 **Stop Word Removal** - Filter out common words to improve search relevance
 - 🔠 **Title Field Boosting** - Prioritize matches in title fields (5x boost factor)
 - 📏 **Exact Phrase Matching** - Boost results that contain the exact search phrase (3x boost factor)
@@ -24,6 +24,7 @@ A powerful search engine plugin for Craft CMS that replaces the default search s
 - 🔧 Craft CMS 5.5.0 or later
 - 💻 PHP 8.2 or later
 - 🔄 Redis 5.0+ (for Redis driver)
+- 🗄️ MySQL 5.7.8+ or MariaDB 10.2.7+ (for MySQL driver)
 
 ## 📦 Installation
 
@@ -61,7 +62,7 @@ return [
     // Whether to enable the plugin and replace Craft's search service
     'enabled' => true,
 
-    // Storage driver: 'craft' or 'redis'
+    // Storage driver: 'craft', 'redis', or 'mysql'
     'storageDriver' => 'craft',
 
     // Redis connection settings (only needed if using Redis driver)
@@ -72,7 +73,7 @@ return [
 ```
 
 All settings can be overridden using environment variables:
-- `BRAMBLE_SEARCH_DRIVER` - Storage driver ('craft' or 'redis')
+- `BRAMBLE_SEARCH_DRIVER` - Storage driver ('craft', 'redis', or 'mysql')
 - `BRAMBLE_SEARCH_REDIS_HOST` - Redis host
 - `BRAMBLE_SEARCH_REDIS_PORT` - Redis port
 - `BRAMBLE_SEARCH_REDIS_PASSWORD` - Redis password
@@ -223,6 +224,7 @@ Choose the right storage driver based on your site's needs:
 |--------|----------|------|------|
 | **Craft Cache** | Small to medium sites | Easy setup, no additional dependencies | Limited persistence, less scalable |
 | **Redis** | Medium to large sites | Fastest performance, persistent storage | Requires Redis server setup |
+| **MySQL** | Medium to large sites | Persistent storage, no additional dependencies | Slightly slower than Redis |
 
 ### Indexing Considerations
 
@@ -256,6 +258,7 @@ View detailed information about your search index:
 
 # Specify a storage driver
 ./craft bramble-search/stats --driver=redis
+./craft bramble-search/stats --driver=mysql
 ```
 
 The statistics command provides information about:

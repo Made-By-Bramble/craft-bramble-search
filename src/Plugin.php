@@ -13,6 +13,7 @@ use craft\utilities\ClearCaches;
 
 use MadeByBramble\BrambleSearch\adapters\BaseSearchAdapter;
 use MadeByBramble\BrambleSearch\adapters\CraftCacheSearchAdapter;
+use MadeByBramble\BrambleSearch\adapters\MySqlSearchAdapter;
 use MadeByBramble\BrambleSearch\adapters\RedisSearchAdapter;
 use MadeByBramble\BrambleSearch\jobs\RebuildIndexJob;
 use MadeByBramble\BrambleSearch\models\Settings;
@@ -26,7 +27,7 @@ use yii\base\Event;
  * - Inverted index for efficient search operations
  * - Fuzzy search with Levenshtein distance
  * - BM25 scoring algorithm for relevance ranking
- * - Multiple storage backends (Craft Cache, Redis)
+ * - Multiple storage backends (Craft Cache, Redis, MySQL)
  * - Seamless integration with Craft's element queries
  * - Support for multi-site search
  */
@@ -121,10 +122,16 @@ class Plugin extends BasePlugin
         // Check for environment variable overrides first, then fall back to settings
         $storageDriver = App::parseEnv('BRAMBLE_SEARCH_DRIVER') ? $settings->storageDriver : 'craft';
 
-        if ($storageDriver === 'redis') {
-            Craft::$app->set('search', new RedisSearchAdapter());
-        } else {
-            Craft::$app->set('search', new CraftCacheSearchAdapter());
+        switch ($storageDriver) {
+            case 'redis':
+                Craft::$app->set('search', new RedisSearchAdapter());
+                break;
+            case 'mysql':
+                Craft::$app->set('search', new MySqlSearchAdapter());
+                break;
+            default:
+                Craft::$app->set('search', new CraftCacheSearchAdapter());
+                break;
         }
     }
 

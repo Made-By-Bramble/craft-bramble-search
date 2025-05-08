@@ -17,7 +17,7 @@ class Settings extends Model
   public bool $enabled = false;
 
   /**
-   * Storage driver for the search index (craft or redis)
+   * Storage driver for the search index (craft, redis, or mysql)
    */
   public string $storageDriver = 'craft';
 
@@ -44,7 +44,7 @@ class Settings extends Model
     return [
       ['enabled', 'boolean'],
       ['storageDriver', 'required'],
-      ['storageDriver', 'in', 'range' => ['craft', 'redis']],
+      ['storageDriver', 'in', 'range' => ['craft', 'redis', 'mysql']],
       [['redisHost', 'redisPort'], 'required', 'when' => function ($model) {
         return $model->storageDriver === 'redis';
       }],

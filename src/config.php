@@ -9,9 +9,10 @@ return [
   'enabled' => false,
 
   /*
-  * Storage driver: 'craft', 'redis'
+  * Storage driver: 'craft', 'redis', 'mysql'
   * Craft cache is used by default and is good for testing.
-  * Redis is recommended for production sites.
+  * Redis is recommended for production sites with high performance needs.
+  * MySQL is recommended for production sites with large content volumes.
   */
   'storageDriver' => 'craft',
 
