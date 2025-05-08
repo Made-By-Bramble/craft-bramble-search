@@ -37,6 +37,16 @@ class Settings extends Model
   public string|null $redisPassword = null;
 
   /**
+   * MongoDB connection URI
+   */
+  public string $mongoDbUri = 'mongodb://localhost:27017';
+
+  /**
+   * MongoDB database name
+   */
+  public string $mongoDbDatabase = 'craft_search';
+
+  /**
    * Define validation rules for settings
    */
   public function rules(): array
@@ -44,11 +54,14 @@ class Settings extends Model
     return [
       ['enabled', 'boolean'],
       ['storageDriver', 'required'],
-      ['storageDriver', 'in', 'range' => ['craft', 'redis', 'mysql']],
+      ['storageDriver', 'in', 'range' => ['craft', 'redis', 'mysql', 'mongodb']],
       [['redisHost', 'redisPort'], 'required', 'when' => function ($model) {
         return $model->storageDriver === 'redis';
       }],
       ['redisPort', 'integer', 'min' => 1, 'max' => 65535],
+      [['mongoDbUri', 'mongoDbDatabase'], 'required', 'when' => function ($model) {
+        return $model->storageDriver === 'mongodb';
+      }],
     ];
   }
 }

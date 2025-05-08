@@ -5,6 +5,7 @@ namespace MadeByBramble\BrambleSearch\adapters;
 use MadeByBramble\BrambleSearch\Plugin;
 use Craft;
 use craft\helpers\App;
+use craft\helpers\StringHelper;
 use craft\db\Query;
 use craft\db\Table;
 
@@ -102,6 +103,8 @@ class MySqlSearchAdapter extends BaseSearchAdapter
     {
         $db = Craft::$app->getDb();
         $batch = [];
+        $now = new \DateTime();
+        $dateTime = $now->format('Y-m-d H:i:s');
 
         foreach ($termFreqs as $term => $freq) {
             $batch[] = [
@@ -109,6 +112,9 @@ class MySqlSearchAdapter extends BaseSearchAdapter
                 'elementId' => $elementId,
                 'term' => $term,
                 'frequency' => $freq,
+                'dateCreated' => $dateTime,
+                'dateUpdated' => $dateTime,
+                'uid' => StringHelper::UUID(),
             ];
         }
 
@@ -118,13 +124,16 @@ class MySqlSearchAdapter extends BaseSearchAdapter
             'elementId' => $elementId,
             'term' => '_length',
             'frequency' => $docLen,
+            'dateCreated' => $dateTime,
+            'dateUpdated' => $dateTime,
+            'uid' => StringHelper::UUID(),
         ];
 
         if (!empty($batch)) {
             $db->createCommand()
                 ->batchInsert(
                     $this->tablePrefix . 'documents}}',
-                    ['siteId', 'elementId', 'term', 'frequency'],
+                    ['siteId', 'elementId', 'term', 'frequency', 'dateCreated', 'dateUpdated', 'uid'],
                     $batch
                 )
                 ->execute();
@@ -171,10 +180,16 @@ class MySqlSearchAdapter extends BaseSearchAdapter
      */
     protected function addDocumentToIndex(int $siteId, int $elementId): void
     {
+        $now = new \DateTime();
+        $dateTime = $now->format('Y-m-d H:i:s');
+
         Craft::$app->getDb()->createCommand()
             ->insert($this->tablePrefix . 'metadata}}', [
                 'key' => 'doc',
                 'value' => "{$siteId}:{$elementId}",
+                'dateCreated' => $dateTime,
+                'dateUpdated' => $dateTime,
+                'uid' => StringHelper::UUID(),
             ])
             ->execute();
     }
@@ -190,6 +205,9 @@ class MySqlSearchAdapter extends BaseSearchAdapter
             ->where(['key' => 'doc'])
             ->count();
 
+        $now = new \DateTime();
+        $dateTime = $now->format('Y-m-d H:i:s');
+
         // Delete existing count
         $db->createCommand()
             ->delete($this->tablePrefix . 'metadata}}', [
@@ -202,6 +220,9 @@ class MySqlSearchAdapter extends BaseSearchAdapter
             ->insert($this->tablePrefix . 'metadata}}', [
                 'key' => 'totalDocs',
                 'value' => (string)$count,
+                'dateCreated' => $dateTime,
+                'dateUpdated' => $dateTime,
+                'uid' => StringHelper::UUID(),
             ])
             ->execute();
     }
@@ -217,6 +238,9 @@ class MySqlSearchAdapter extends BaseSearchAdapter
         $currentLength = $this->getTotalLength();
         $newLength = $currentLength + $docLen;
 
+        $now = new \DateTime();
+        $dateTime = $now->format('Y-m-d H:i:s');
+
         // Delete existing length
         $db->createCommand()
             ->delete($this->tablePrefix . 'metadata}}', [
@@ -229,6 +253,9 @@ class MySqlSearchAdapter extends BaseSearchAdapter
             ->insert($this->tablePrefix . 'metadata}}', [
                 'key' => 'totalLength',
                 'value' => (string)$newLength,
+                'dateCreated' => $dateTime,
+                'dateUpdated' => $dateTime,
+                'uid' => StringHelper::UUID(),
             ])
             ->execute();
     }
@@ -289,11 +316,17 @@ class MySqlSearchAdapter extends BaseSearchAdapter
      */
     protected function storeTermDocument(string $term, int $siteId, int $elementId, int $freq): void
     {
+        $now = new \DateTime();
+        $dateTime = $now->format('Y-m-d H:i:s');
+
         Craft::$app->getDb()->createCommand()
             ->insert($this->tablePrefix . 'terms}}', [
                 'term' => $term,
                 'docId' => "{$siteId}:{$elementId}",
                 'frequency' => $freq,
+                'dateCreated' => $dateTime,
+                'dateUpdated' => $dateTime,
+                'uid' => StringHelper::UUID(),
             ])
             ->execute();
     }
@@ -385,6 +418,8 @@ class MySqlSearchAdapter extends BaseSearchAdapter
     protected function storeTitleTerms(int $siteId, int $elementId, array $titleTerms): void
     {
         $db = Craft::$app->getDb();
+        $now = new \DateTime();
+        $dateTime = $now->format('Y-m-d H:i:s');
 
         // Delete existing title terms
         $db->createCommand()
@@ -402,13 +437,16 @@ class MySqlSearchAdapter extends BaseSearchAdapter
                     'siteId' => $siteId,
                     'elementId' => $elementId,
                     'term' => $term,
+                    'dateCreated' => $dateTime,
+                    'dateUpdated' => $dateTime,
+                    'uid' => StringHelper::UUID(),
                 ];
             }
 
             $db->createCommand()
                 ->batchInsert(
                     $this->tablePrefix . 'titles}}',
-                    ['siteId', 'elementId', 'term'],
+                    ['siteId', 'elementId', 'term', 'dateCreated', 'dateUpdated', 'uid'],
                     $batch
                 )
                 ->execute();
@@ -514,6 +552,8 @@ class MySqlSearchAdapter extends BaseSearchAdapter
     protected function resetTotalLength(): void
     {
         $db = Craft::$app->getDb();
+        $now = new \DateTime();
+        $dateTime = $now->format('Y-m-d H:i:s');
 
         // Delete existing length
         $db->createCommand()
@@ -527,6 +567,9 @@ class MySqlSearchAdapter extends BaseSearchAdapter
             ->insert($this->tablePrefix . 'metadata}}', [
                 'key' => 'totalLength',
                 'value' => '0',
+                'dateCreated' => $dateTime,
+                'dateUpdated' => $dateTime,
+                'uid' => StringHelper::UUID(),
             ])
             ->execute();
     }

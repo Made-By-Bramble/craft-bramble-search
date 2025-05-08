@@ -7,7 +7,7 @@ A powerful search engine plugin for Craft CMS that replaces the default search s
 - 📊 **Inverted Index Architecture** - Fast, efficient search using modern indexing techniques
 - 🔤 **Fuzzy Search** - Find results even with typos using Levenshtein distance
 - 🧮 **BM25 Ranking Algorithm** - Industry-standard relevance scoring for better results
-- 🔄 **Multiple Storage Backends** - Choose between Craft cache, Redis, or MySQL
+- 🔄 **Multiple Storage Backends** - Choose between Craft cache, Redis, MySQL, or MongoDB
 - 📝 **Stop Word Removal** - Filter out common words to improve search relevance
 - 🔠 **Title Field Boosting** - Prioritize matches in title fields (5x boost factor)
 - 📏 **Exact Phrase Matching** - Boost results that contain the exact search phrase (3x boost factor)
@@ -25,6 +25,7 @@ A powerful search engine plugin for Craft CMS that replaces the default search s
 - 💻 PHP 8.2 or later
 - 🔄 Redis 5.0+ (for Redis driver)
 - 🗄️ MySQL 5.7.8+ or MariaDB 10.2.7+ (for MySQL driver)
+- 🍃 MongoDB 4.4+ (for MongoDB driver)
 
 ## 📦 Installation
 
@@ -62,21 +63,27 @@ return [
     // Whether to enable the plugin and replace Craft's search service
     'enabled' => true,
 
-    // Storage driver: 'craft', 'redis', or 'mysql'
+    // Storage driver: 'craft', 'redis', 'mysql', or 'mongodb'
     'storageDriver' => 'craft',
 
     // Redis connection settings (only needed if using Redis driver)
     'redisHost' => 'localhost',
     'redisPort' => 6379,
     'redisPassword' => null,
+
+    // MongoDB connection settings (only needed if using MongoDB driver)
+    'mongoDbUri' => 'mongodb://localhost:27017',
+    'mongoDbDatabase' => 'craft_search',
 ];
 ```
 
 All settings can be overridden using environment variables:
-- `BRAMBLE_SEARCH_DRIVER` - Storage driver ('craft', 'redis', or 'mysql')
+- `BRAMBLE_SEARCH_DRIVER` - Storage driver ('craft', 'redis', 'mysql', or 'mongodb')
 - `BRAMBLE_SEARCH_REDIS_HOST` - Redis host
 - `BRAMBLE_SEARCH_REDIS_PORT` - Redis port
 - `BRAMBLE_SEARCH_REDIS_PASSWORD` - Redis password
+- `BRAMBLE_SEARCH_MONGODB_URI` - MongoDB connection URI
+- `BRAMBLE_SEARCH_MONGODB_DATABASE` - MongoDB database name
 
 ## 🚀 Getting Started
 
@@ -225,6 +232,7 @@ Choose the right storage driver based on your site's needs:
 | **Craft Cache** | Small to medium sites | Easy setup, no additional dependencies | Limited persistence, less scalable |
 | **Redis** | Medium to large sites | Fastest performance, persistent storage | Requires Redis server setup |
 | **MySQL** | Medium to large sites | Persistent storage, no additional dependencies | Slightly slower than Redis |
+| **MongoDB** | Complex content structures | Flexible schema, excellent scalability | Requires MongoDB server setup |
 
 ### Indexing Considerations
 
@@ -259,6 +267,7 @@ View detailed information about your search index:
 # Specify a storage driver
 ./craft bramble-search/stats --driver=redis
 ./craft bramble-search/stats --driver=mysql
+./craft bramble-search/stats --driver=mongodb
 ```
 
 The statistics command provides information about:

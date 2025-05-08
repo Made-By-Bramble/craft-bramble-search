@@ -7,8 +7,12 @@
   },
   "require": {
     "php": ">=8.2",
-    "ext-redis": "*",
-    "craftcms/cms": "^5.5.0"
+    "craftcms/cms": "^5.5.0",
+    "mongodb/mongodb": "^2.0"
+  },
+  "suggest": {
+    "ext-redis": "Required for Redis storage adapter",
+    "ext-mongodb": "Required for MongoDB storage adapter"
   },
   "require-dev": {
     "craftcms/ecs": "dev-main",

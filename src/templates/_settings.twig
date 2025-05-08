@@ -9,17 +9,33 @@
     errors: settings.getErrors('enabled'),
 }) }}
 
+{% set redisAvailable = craft.app.plugins.getPlugin('bramble-search').isRedisAvailable() %}
+{% set mongoDbAvailable = craft.app.plugins.getPlugin('bramble-search').isMongoDbAvailable() %}
+
+{% set storageOptions = [
+    { value: 'craft', label: 'Craft Cache' },
+    { value: 'mysql', label: 'MySQL' },
+] %}
+
+{% if redisAvailable %}
+    {% set storageOptions = storageOptions|merge([
+        { value: 'redis', label: 'Redis' },
+    ]) %}
+{% endif %}
+
+{% if mongoDbAvailable %}
+    {% set storageOptions = storageOptions|merge([
+        { value: 'mongodb', label: 'MongoDB' },
+    ]) %}
+{% endif %}
+
 {{ forms.selectField({
     label: "Storage Driver"|t('bramble-search'),
     instructions: "Choose where to store the search index."|t('bramble-search'),
     tip: "This can be overridden using the BRAMBLE_SEARCH_DRIVER environment variable in your .env file."|t('bramble-search'),
     id: 'storageDriver',
     name: 'storageDriver',
-    options: [
-        { value: 'craft', label: 'Craft Cache' },
-        { value: 'redis', label: 'Redis' },
-        { value: 'mysql', label: 'MySQL' },
-    ],
+    options: storageOptions,
     value: settings.storageDriver,
     errors: settings.getErrors('storageDriver'),
     toggle: true,
@@ -66,6 +82,32 @@
     }) }}
 </div>
 
+<div id="storage-mongodb" class="{% if settings.storageDriver != 'mongodb' %}hidden{% endif %}">
+    {{ forms.textField({
+        label: "MongoDB URI"|t('bramble-search'),
+        instructions: "The connection URI for your MongoDB server."|t('bramble-search'),
+        tip: "For local development, this is typically 'mongodb://localhost:27017'. Can be overridden with the BRAMBLE_SEARCH_MONGODB_URI environment variable."|t('bramble-search'),
+        id: 'mongoDbUri',
+        name: 'mongoDbUri',
+        placeholder: 'mongodb://localhost:27017',
+        value: settings.mongoDbUri,
+        errors: settings.getErrors('mongoDbUri'),
+        required: true,
+    }) }}
+
+    {{ forms.textField({
+        label: "MongoDB Database"|t('bramble-search'),
+        instructions: "The name of the MongoDB database to use."|t('bramble-search'),
+        tip: "This database will be created if it doesn't exist. Can be overridden with the BRAMBLE_SEARCH_MONGODB_DATABASE environment variable."|t('bramble-search'),
+        id: 'mongoDbDatabase',
+        name: 'mongoDbDatabase',
+        placeholder: 'bramble_search',
+        value: settings.mongoDbDatabase,
+        errors: settings.getErrors('mongoDbDatabase'),
+        required: true,
+    }) }}
+</div>
+
 <hr>
 
 {{ forms.field({
@@ -76,7 +118,7 @@
 {{ forms.field({
     id: 'rebuild-instructions',
     fieldClass: 'first',
-}, '<p class="light">' ~ "If you need to rebuild the entire search index, you have two options:"|t('bramble-search') ~ '</p>
+}, '<p class="light">' ~ "If you need to rebuild the entire search index because you cleared the cache manually or changed the storage driver, you have two options:"|t('bramble-search') ~ '</p>
     <div class="meta" style="margin-bottom:12px;">
 
     <div class="field">
@@ -105,14 +147,24 @@
 document.addEventListener('DOMContentLoaded', function() {
     var storageDriverSelect = document.getElementById('storageDriver');
     var redisSettings = document.getElementById('storage-redis');
+    var mongoDbSettings = document.getElementById('storage-mongodb');
 
     // Function to check value and toggle visibility
     function updateVisibility() {
         var value = storageDriverSelect.value;
+
+        // Redis settings
         if (value === 'redis') {
             redisSettings.classList.remove('hidden');
         } else {
             redisSettings.classList.add('hidden');
+        }
+
+        // MongoDB settings
+        if (value === 'mongodb') {
+            mongoDbSettings.classList.remove('hidden');
+        } else {
+            mongoDbSettings.classList.add('hidden');
         }
     }
 

@@ -35,9 +35,9 @@ class RedisSearchAdapter extends BaseSearchAdapter
     {
         parent::init();
         $settings = Plugin::getInstance()->getSettings();
-        $redisHost = App::parseEnv('BRAMBLE_SEARCH_REDIS_HOST') ? $settings->redisHost : 'localhost';
-        $redisPort = (int)(App::parseEnv('BRAMBLE_SEARCH_REDIS_PORT') ? $settings->redisPort : 6379);
-        $redisPassword = App::parseEnv('BRAMBLE_SEARCH_REDIS_PASSWORD') ? $settings->redisPassword : null;
+        $redisHost = App::parseEnv('$BRAMBLE_SEARCH_REDIS_HOST') ?: $settings->redisHost;
+        $redisPort = (int)(App::parseEnv('$BRAMBLE_SEARCH_REDIS_PORT') ?: $settings->redisPort);
+        $redisPassword = App::parseEnv('$BRAMBLE_SEARCH_REDIS_PASSWORD') ?: $settings->redisPassword;
 
         $this->redis = new Redis();
         $this->redis->connect($redisHost, $redisPort);

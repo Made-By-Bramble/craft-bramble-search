@@ -13,6 +13,7 @@ use craft\utilities\ClearCaches;
 
 use MadeByBramble\BrambleSearch\adapters\BaseSearchAdapter;
 use MadeByBramble\BrambleSearch\adapters\CraftCacheSearchAdapter;
+use MadeByBramble\BrambleSearch\adapters\MongoDbSearchAdapter;
 use MadeByBramble\BrambleSearch\adapters\MySqlSearchAdapter;
 use MadeByBramble\BrambleSearch\adapters\RedisSearchAdapter;
 use MadeByBramble\BrambleSearch\jobs\RebuildIndexJob;
@@ -27,7 +28,7 @@ use yii\base\Event;
  * - Inverted index for efficient search operations
  * - Fuzzy search with Levenshtein distance
  * - BM25 scoring algorithm for relevance ranking
- * - Multiple storage backends (Craft Cache, Redis, MySQL)
+ * - Multiple storage backends (Craft Cache, Redis, MySQL, MongoDB)
  * - Seamless integration with Craft's element queries
  * - Support for multi-site search
  */
@@ -120,19 +121,58 @@ class Plugin extends BasePlugin
         $settings = $this->getSettings();
 
         // Check for environment variable overrides first, then fall back to settings
-        $storageDriver = App::parseEnv('BRAMBLE_SEARCH_DRIVER') ? $settings->storageDriver : 'craft';
+        $storageDriver = App::parseEnv('$BRAMBLE_SEARCH_DRIVER') ?: $settings->storageDriver;
 
-        switch ($storageDriver) {
-            case 'redis':
-                Craft::$app->set('search', new RedisSearchAdapter());
-                break;
-            case 'mysql':
-                Craft::$app->set('search', new MySqlSearchAdapter());
-                break;
-            default:
-                Craft::$app->set('search', new CraftCacheSearchAdapter());
-                break;
+        try {
+            switch ($storageDriver) {
+                case 'redis':
+                    if (!$this->isRedisAvailable()) {
+                        throw new \Exception('Redis extension is not installed. Please install the PHP Redis extension to use the Redis storage adapter.');
+                    }
+                    Craft::$app->set('search', new RedisSearchAdapter());
+                    break;
+                case 'mysql':
+                    Craft::$app->set('search', new MySqlSearchAdapter());
+                    break;
+                case 'mongodb':
+                    if (!$this->isMongoDbAvailable()) {
+                        throw new \Exception('MongoDB extension is not installed. Please install the PHP MongoDB extension to use the MongoDB storage adapter.');
+                    }
+                    if (!class_exists('\\MongoDB\\Client')) {
+                        throw new \Exception('MongoDB PHP library is not installed. Please run "composer require mongodb/mongodb:^1.15.0" to use the MongoDB storage adapter.');
+                    }
+                    Craft::$app->set('search', new MongoDbSearchAdapter());
+                    break;
+                default:
+                    Craft::$app->set('search', new CraftCacheSearchAdapter());
+                    break;
+            }
+        } catch (\Exception $e) {
+            // Log the error
+            Craft::error(
+                'Failed to initialize search adapter: ' . $e->getMessage(),
+                'bramble-search'
+            );
+
+            // Show a flash message in the CP
+            if (Craft::$app->getRequest()->getIsCpRequest()) {
+                Craft::$app->getSession()->setError('Bramble Search: ' . $e->getMessage());
+            }
+
+            // Fall back to Craft's default search service
+            Craft::warning(
+                'Falling back to Craft\'s default search service due to adapter initialization failure.',
+                'bramble-search'
+            );
+
+            // Don't replace Craft's search service
+            return;
         }
+
+        Craft::info(
+            "Initialized search adapter: $storageDriver",
+            'bramble-search'
+        );
     }
 
     /**
@@ -446,5 +486,25 @@ class Plugin extends BasePlugin
             'settings' => $settings,
             'overrides' => array_keys($overrides),
         ]);
+    }
+
+    /**
+     * Checks if the Redis extension is available.
+     *
+     * @return bool Whether the Redis extension is available
+     */
+    public function isRedisAvailable(): bool
+    {
+        return extension_loaded('redis');
+    }
+
+    /**
+     * Checks if the MongoDB extension and library are available.
+     *
+     * @return bool Whether the MongoDB extension and library are available
+     */
+    public function isMongoDbAvailable(): bool
+    {
+        return extension_loaded('mongodb') && class_exists('\\MongoDB\\Client');
     }
 }
