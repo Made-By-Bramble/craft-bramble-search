@@ -9,11 +9,12 @@ return [
   'enabled' => false,
 
   /*
-  * Storage driver: 'craft', 'redis', 'mysql', 'mongodb'
-  * Craft cache is used by default and is good for testing.
-  * Redis is recommended for production sites with high performance needs.
+  * Storage driver: 'redis', 'file', 'mysql', 'mongodb', 'craft'
+  * Redis is recommended for production sites with highest performance needs.
+  * File storage is recommended for sites without external dependencies and with custom binary format.
   * MySQL is recommended for production sites with large content volumes.
   * MongoDB is recommended for sites with complex content structures and high scalability needs.
+  * Craft cache is used by default and is good for testing but has limited persistence.
   */
   'storageDriver' => 'craft',
 

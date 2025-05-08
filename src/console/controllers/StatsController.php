@@ -5,7 +5,6 @@ namespace MadeByBramble\BrambleSearch\console\controllers;
 use Craft;
 use craft\console\Controller;
 use craft\helpers\Console;
-use MadeByBramble\BrambleSearch\Plugin;
 use MadeByBramble\BrambleSearch\adapters\BaseSearchAdapter;
 use yii\console\ExitCode;
 
@@ -23,7 +22,7 @@ class StatsController extends Controller
     public $detailed = false;
 
     /**
-     * The storage driver to use (craft, redis)
+     * The storage driver to use (redis, file, mysql, mongodb, craft)
      */
     public $driver;
 

@@ -13,6 +13,7 @@ use craft\utilities\ClearCaches;
 
 use MadeByBramble\BrambleSearch\adapters\BaseSearchAdapter;
 use MadeByBramble\BrambleSearch\adapters\CraftCacheSearchAdapter;
+use MadeByBramble\BrambleSearch\adapters\FileSearchAdapter;
 use MadeByBramble\BrambleSearch\adapters\MongoDbSearchAdapter;
 use MadeByBramble\BrambleSearch\adapters\MySqlSearchAdapter;
 use MadeByBramble\BrambleSearch\adapters\RedisSearchAdapter;
@@ -130,6 +131,9 @@ class Plugin extends BasePlugin
                         throw new \Exception('Redis extension is not installed. Please install the PHP Redis extension to use the Redis storage adapter.');
                     }
                     Craft::$app->set('search', new RedisSearchAdapter());
+                    break;
+                case 'file':
+                    Craft::$app->set('search', new FileSearchAdapter());
                     break;
                 case 'mysql':
                     Craft::$app->set('search', new MySqlSearchAdapter());

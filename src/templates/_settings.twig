@@ -14,20 +14,36 @@
 
 {% set storageOptions = [
     { value: 'craft', label: 'Craft Cache' },
-    { value: 'mysql', label: 'MySQL' },
 ] %}
 
 {% if redisAvailable %}
-    {% set storageOptions = storageOptions|merge([
-        { value: 'redis', label: 'Redis' },
-    ]) %}
+    {% set storageOptions = [
+        { value: 'redis', label: 'Redis (Fastest)' },
+    ]|merge(storageOptions) %}
 {% endif %}
 
+{% set storageOptions = [
+    { value: 'file', label: 'File Storage' },
+    { value: 'mysql', label: 'MySQL' },
+]|merge(storageOptions) %}
+
 {% if mongoDbAvailable %}
-    {% set storageOptions = storageOptions|merge([
+    {% set storageOptions = [
         { value: 'mongodb', label: 'MongoDB' },
-    ]) %}
+    ]|merge(storageOptions) %}
 {% endif %}
+
+{# Reorder the options to match our speed ranking #}
+{% set finalStorageOptions = [] %}
+{% for driver in ['redis', 'file', 'mysql', 'mongodb', 'craft'] %}
+    {% for option in storageOptions %}
+        {% if option.value == driver %}
+            {% set finalStorageOptions = finalStorageOptions|merge([option]) %}
+        {% endif %}
+    {% endfor %}
+{% endfor %}
+
+{% set storageOptions = finalStorageOptions %}
 
 {{ forms.selectField({
     label: "Storage Driver"|t('bramble-search'),
