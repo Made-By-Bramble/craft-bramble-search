@@ -4,43 +4,66 @@ namespace MadeByBramble\BrambleSearch;
 
 use Craft;
 use craft\base\Plugin as BasePlugin;
-use craft\controllers\ElementIndexesController;
-use MadeByBramble\BrambleSearch\adapters\BaseSearchAdapter;
-use MadeByBramble\BrambleSearch\adapters\RedisSearchAdapter;
-use MadeByBramble\BrambleSearch\adapters\CraftCacheSearchAdapter;
-use MadeByBramble\BrambleSearch\models\Settings;
-use MadeByBramble\BrambleSearch\jobs\RebuildIndexJob;
-use yii\base\Event;
-use craft\utilities\ClearCaches;
-use craft\events\RegisterCacheOptionsEvent;
 use craft\console\Application as ConsoleApplication;
+use craft\controllers\ElementIndexesController;
+use craft\elements\db\ElementQuery;
+use craft\events\RegisterCacheOptionsEvent;
 use craft\helpers\App;
+use craft\utilities\ClearCaches;
+
+use MadeByBramble\BrambleSearch\adapters\BaseSearchAdapter;
+use MadeByBramble\BrambleSearch\adapters\CraftCacheSearchAdapter;
+use MadeByBramble\BrambleSearch\adapters\RedisSearchAdapter;
+use MadeByBramble\BrambleSearch\jobs\RebuildIndexJob;
+use MadeByBramble\BrambleSearch\models\Settings;
+use yii\base\Event;
 
 /**
  * Bramble Search Plugin
  *
- * A powerful search engine for Craft CMS 5.x with inverted index, fuzzy search,
- * BM25 scoring and multiple storage backends (Craft Cache, Redis).
+ * A powerful search engine for Craft CMS 5.x that provides enhanced search capabilities
+ * with features including:
+ * - Inverted index for efficient search operations
+ * - Fuzzy search with Levenshtein distance
+ * - BM25 scoring algorithm for relevance ranking
+ * - Multiple storage backends (Craft Cache, Redis)
+ * - Seamless integration with Craft's element queries
+ * - Support for multi-site search
  */
 class Plugin extends BasePlugin
 {
     /**
-     * Plugin instance reference
+     * Static reference to the plugin instance.
+     * Used for accessing the plugin instance throughout the application.
+     *
+     * @var Plugin
      */
     public static $plugin;
 
     /**
-     * Schema version for database migrations
+     * Schema version for database migrations.
+     * This is used by Craft's migration system to determine if migrations need to be run.
+     *
+     * @var string
      */
     public string $schemaVersion = '1.0.0';
 
     /**
-     * Indicates plugin has Control Panel settings
+     * Indicates that the plugin has Control Panel settings.
+     * When true, a settings icon will appear in the Control Panel plugins page.
+     *
+     * @var bool
      */
     public bool $hasCpSettings = true;
 
     /**
-     * Initialize the plugin
+     * Initializes the plugin.
+     *
+     * This method is called after the plugin is instantiated by Craft.
+     * It sets up logging, registers event handlers, and initializes the search service
+     * if the plugin is enabled in settings.
+     *
+     * @return void
      */
     public function init()
     {
@@ -60,6 +83,9 @@ class Plugin extends BasePlugin
             // Register console commands
             if (Craft::$app instanceof ConsoleApplication) {
                 $this->controllerNamespace = 'MadeByBramble\\BrambleSearch\\console\\controllers';
+            } else {
+                // Register our controllers for web requests
+                $this->controllerNamespace = 'MadeByBramble\\BrambleSearch\\controllers';
             }
 
             // Initialize the search service
@@ -80,7 +106,13 @@ class Plugin extends BasePlugin
     }
 
     /**
-     * Initialize the search service with the appropriate adapter
+     * Initializes the search service with the appropriate adapter.
+     *
+     * This method determines which storage driver to use based on environment
+     * variables or plugin settings, then registers the appropriate search adapter
+     * with Craft's service container.
+     *
+     * @return void
      */
     protected function initializeSearchService(): void
     {
@@ -97,7 +129,14 @@ class Plugin extends BasePlugin
     }
 
     /**
-     * Register event handlers for the plugin
+     * Registers all event handlers for the plugin.
+     *
+     * This method sets up event listeners for:
+     * - Cache clearing options in the Control Panel
+     * - Element index controller actions for accurate search counts
+     * - Element query preparation to intercept search queries
+     *
+     * @return void
      */
     protected function registerEventHandlers(): void
     {
@@ -127,12 +166,107 @@ class Plugin extends BasePlugin
             ElementIndexesController::EVENT_AFTER_ACTION,
             [$this, 'handleElementCountAction']
         );
+
+        // Hook into the ElementQuery's prepare method to intercept all element queries with search parameters
+        Event::on(
+            ElementQuery::class,
+            ElementQuery::EVENT_BEFORE_PREPARE,
+            [$this, 'handleElementQueryPrepare']
+        );
     }
 
     /**
-     * Handle the element count action to provide accurate search counts
+     * Handles the ElementQuery prepare event to intercept search queries for exports.
      *
-     * @param Event $event The event object
+     * This method intercepts ElementQuery objects with search parameters during export
+     * operations and modifies them to use Bramble Search results instead of Craft's
+     * default search functionality.
+     *
+     * @param Event $event The event object containing the ElementQuery
+     * @return void
+     */
+    public function handleElementQueryPrepare(Event $event): void
+    {
+        /** @var ElementQuery $query */
+        $query = $event->sender;
+
+        // Check if this is a search query
+        if (!empty($query->search)) {
+            Craft::info(
+                sprintf(
+                    'Bramble Search: Intercepted ElementQuery with search: "%s"',
+                    $query->search
+                ),
+                'bramble-search'
+            );
+
+            // Get the search service
+            $searchService = Craft::$app->getSearch();
+
+            // Check if it's one of our adapters
+            if ($searchService instanceof BaseSearchAdapter) {
+                // Get the current request
+                $request = Craft::$app->getRequest();
+
+                // Check if this is an export request
+                $isExport = false;
+                $path = $request->getPathInfo();
+                if (
+                    strpos($path, 'element-indexes/export') !== false ||
+                    (strpos($path, 'actions/element-indexes/export') !== false)
+                ) {
+                    $isExport = true;
+                }
+
+                if ($isExport) {
+                    Craft::info(
+                        sprintf(
+                            'Bramble Search: Modifying export query for search: "%s"',
+                            $query->search
+                        ),
+                        'bramble-search'
+                    );
+
+                    // Perform the search using our adapter
+                    $searchResults = $searchService->searchElements($query);
+
+                    if (empty($searchResults)) {
+                        // If no results, set an impossible condition to return no results
+                        $query->id(0);
+                    } else {
+                        // Set the element IDs based on our search results
+                        $elementIds = [];
+                        foreach (array_keys($searchResults) as $key) {
+                            [$elementId,] = explode('-', $key);
+                            $elementIds[] = $elementId;
+                        }
+
+                        // Set the element IDs in the query and remove the search parameter
+                        $query->id($elementIds);
+                        $query->search = null;
+
+                        Craft::info(
+                            sprintf(
+                                'Bramble Search: Modified export query with %d results',
+                                count($searchResults)
+                            ),
+                            'bramble-search'
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /**
+     * Handles the element count action to provide accurate search counts.
+     *
+     * This method intercepts the response from the ElementIndexesController's
+     * countElements action and updates the count to reflect the actual number
+     * of search results when using Bramble Search.
+     *
+     * @param Event $event The event object containing the controller and response
+     * @return void
      */
     public function handleElementCountAction(Event $event): void
     {
@@ -208,9 +342,12 @@ class Plugin extends BasePlugin
     }
 
     /**
-     * Get the search query from the request
+     * Extracts the search query from the current request.
      *
-     * @return string|null The search query or null if not found
+     * This method checks various locations where a search query might be found
+     * in the request, including direct parameters, criteria arrays, and body parameters.
+     *
+     * @return string|null The search query string if found, null otherwise
      */
     protected function getSearchQueryFromRequest(): ?string
     {
@@ -240,9 +377,13 @@ class Plugin extends BasePlugin
     }
 
     /**
-     * Get the element type from the request
+     * Determines the element type class from the current request.
      *
-     * @return string|null The element type class or null if not found
+     * This method attempts to extract the element type from request parameters,
+     * body parameters, or context clues. If no element type can be determined,
+     * it returns null.
+     *
+     * @return string|null The fully qualified element type class name if found, null otherwise
      */
     protected function getElementTypeFromRequest(): ?string
     {
@@ -252,6 +393,12 @@ class Plugin extends BasePlugin
         $elementType = $request->getParam('elementType');
         if ($elementType) {
             return $elementType;
+        }
+
+        // Check body params for elementType
+        $bodyParams = $request->getBodyParams();
+        if (isset($bodyParams['elementType'])) {
+            return $bodyParams['elementType'];
         }
 
         // Try to determine element type from context
@@ -265,7 +412,9 @@ class Plugin extends BasePlugin
     }
 
     /**
-     * Create the settings model
+     * Creates and returns the settings model used by the plugin.
+     *
+     * @return \craft\base\Model|null The settings model
      */
     public function createSettingsModel(): ?\craft\base\Model
     {
@@ -273,7 +422,12 @@ class Plugin extends BasePlugin
     }
 
     /**
-     * Render the settings template
+     * Renders the settings template for the Control Panel.
+     *
+     * This method loads the current settings, validates them, and checks for
+     * any config file overrides before rendering the settings template.
+     *
+     * @return string|null The rendered settings HTML
      */
     protected function settingsHtml(): ?string
     {
