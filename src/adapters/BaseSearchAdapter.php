@@ -205,6 +205,7 @@ abstract class BaseSearchAdapter extends Search
      * Search for elements matching a query
      *
      * Implements BM25 scoring algorithm with title boosting and exact phrase matching.
+     * For multiple search terms, requires ALL terms to be present in a document (AND logic).
      *
      * @param ElementQuery $elementQuery The element query containing search parameters
      * @return array Element IDs and their relevance scores
@@ -216,23 +217,38 @@ abstract class BaseSearchAdapter extends Search
         $tokens = $this->tokenize($searchQuery);
         $tokens = $this->filterStopWords($tokens);
 
+        // If no valid tokens after filtering stop words, return empty results
+        if (empty($tokens)) {
+            return [];
+        }
+
         $totalDocs = max(1, $this->getTotalDocCount());
         $totalLength = max(1, $this->getTotalLength());
         $avgDocLength = $totalLength / $totalDocs;
 
+        // Track which documents match each term
+        $termMatches = [];
+        // Track scores for each document
         $docScores = [];
-        $matchedDocs = []; // Track which docs matched for exact phrase matching
+        // Track which terms matched for each document (for exact phrase matching)
+        $matchedTerms = [];
 
-        foreach ($tokens as $term) {
+        // First pass: collect all documents matching each term
+        foreach ($tokens as $termIndex => $term) {
+            $termMatches[$termIndex] = [];
+
+            // Try exact match first
             $termDocs = $this->getTermDocuments($term);
 
-            // Exact match short-circuit
             if (!empty($termDocs)) {
                 $docFreq = count($termDocs);
                 foreach ($termDocs as $docId => $freq) {
                     if (!str_starts_with($docId, "$siteId:")) {
                         continue;
                     }
+
+                    $termMatches[$termIndex][$docId] = true;
+                    $matchedTerms[$docId][$term] = true;
 
                     $docLen = max(1, $this->getDocumentLength($docId));
                     $score = $this->bm25($freq, $docFreq, $docLen, $avgDocLength);
@@ -243,55 +259,78 @@ abstract class BaseSearchAdapter extends Search
                     }
 
                     $docScores[$docId] = ($docScores[$docId] ?? 0) + $score;
-                    $matchedDocs[$docId][$term] = true;
                 }
-
-                continue;
-            }
-
-            // Fuzzy fallback
-            $fuzzyTerms = $this->findFuzzyMatches($term);
-            foreach ($fuzzyTerms as $fuzzy) {
-                $fuzzyDocs = $this->getTermDocuments($fuzzy);
-                $docFreq = count($fuzzyDocs);
-
-                foreach ($fuzzyDocs as $docId => $freq) {
-                    if (!str_starts_with($docId, "$siteId:")) {
+            } else {
+                // Fuzzy fallback if no exact matches
+                $fuzzyTerms = $this->findFuzzyMatches($term);
+                foreach ($fuzzyTerms as $fuzzy) {
+                    $fuzzyDocs = $this->getTermDocuments($fuzzy);
+                    if (empty($fuzzyDocs)) {
                         continue;
                     }
 
-                    $docLen = max(1, $this->getDocumentLength($docId));
-                    $score = $this->bm25($freq, $docFreq, $docLen, $avgDocLength);
+                    $docFreq = count($fuzzyDocs);
+                    foreach ($fuzzyDocs as $docId => $freq) {
+                        if (!str_starts_with($docId, "$siteId:")) {
+                            continue;
+                        }
 
-                    // Apply title boost if term is in title
-                    if ($this->isTermInTitle($fuzzy, $docId)) {
-                        $score *= $this->titleBoostFactor;
+                        $termMatches[$termIndex][$docId] = true;
+                        $matchedTerms[$docId][$term] = true;
+
+                        $docLen = max(1, $this->getDocumentLength($docId));
+                        $score = $this->bm25($freq, $docFreq, $docLen, $avgDocLength);
+
+                        // Apply title boost if term is in title
+                        if ($this->isTermInTitle($fuzzy, $docId)) {
+                            $score *= $this->titleBoostFactor;
+                        }
+
+                        $docScores[$docId] = ($docScores[$docId] ?? 0) + $score;
                     }
-
-                    $docScores[$docId] = ($docScores[$docId] ?? 0) + $score;
-                    $matchedDocs[$docId][$term] = true;
                 }
             }
         }
 
-        // Apply exact match boosting
+        // If we have multiple terms, find the intersection of all term matches
+        // This implements AND logic - a document must match ALL search terms
+        $validDocs = null;
+        foreach ($termMatches as $docs) {
+            if ($validDocs === null) {
+                $validDocs = array_keys($docs);
+            } else {
+                $validDocs = array_intersect($validDocs, array_keys($docs));
+            }
+
+            // Early exit if no documents match all terms so far
+            if (empty($validDocs)) {
+                return [];
+            }
+        }
+
+        // Filter scores to only include documents that matched all terms
+        $filteredScores = [];
+        foreach ($validDocs as $docId) {
+            $filteredScores[$docId] = $docScores[$docId];
+        }
+
+        // Apply exact match boosting for multi-term queries
         if (count($tokens) > 1) {
-            foreach ($matchedDocs as $docId => $docTerms) {
-                // If document contains all search terms, apply exact match boost
-                if (count($docTerms) === count($tokens)) {
-                    // Check if the document contains the exact phrase
-                    if ($this->containsExactPhrase($docId, $searchQuery)) {
-                        $docScores[$docId] *= $this->exactMatchBoostFactor;
-                    }
+            foreach ($filteredScores as $docId => $score) {
+                // Check if the document contains the exact phrase
+                if ($this->containsExactPhrase($docId, $searchQuery)) {
+                    $filteredScores[$docId] *= $this->exactMatchBoostFactor;
                 }
             }
         }
 
-        arsort($docScores);
+        // Sort by score (highest first)
+        arsort($filteredScores);
+
         $results = [];
 
         // Convert our internal docId format (siteId:elementId) to Craft's expected format (elementId-siteId)
-        foreach ($docScores as $docId => $score) {
+        foreach ($filteredScores as $docId => $score) {
             [$docSiteId, $elementId] = explode(':', $docId);
             $results["$elementId-$docSiteId"] = $score;
         }
