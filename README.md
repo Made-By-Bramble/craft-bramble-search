@@ -230,10 +230,10 @@ Choose the right storage driver based on your site's needs:
 | Driver | Best For | Pros | Cons |
 |--------|----------|------|------|
 | **Redis** | Medium to large sites | Fastest performance, persistent storage | Requires Redis server setup |
-| **File Storage** | Sites without external dependencies | Custom binary format, file locking for concurrent access | Good performance with no external dependencies |
-| **MySQL** | Medium to large sites | Persistent storage, no additional dependencies | Slightly slower than File Storage |
-| **MongoDB** | Complex content structures | Flexible schema, excellent scalability | Requires MongoDB server setup |
-| **Craft Cache** | Small to medium sites | Easy setup, no additional dependencies | Limited persistence, less scalable |
+| **File Storage** | Small to medium sites | Custom binary format, file locking for concurrent access | Slow on networked file systems |
+| **MySQL** | Small to medium sites | Persistent storage, no additional dependencies | Adds load to Craft's database |
+| **MongoDB** | Medium to large sites | Flexible schema, excellent scalability | Requires MongoDB server setup |
+| **Craft Cache** | Small to medium sites | Easy setup, no additional dependencies | Limited persistence, not scalable |
 
 ### Indexing Considerations
 
