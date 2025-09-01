@@ -131,6 +131,63 @@ class Install extends Migration
             );
         }
 
+        // Create n-grams table for fuzzy search optimization
+        if (!$this->db->tableExists($tablePrefix . 'ngrams}}')) {
+            $this->createTable($tablePrefix . 'ngrams}}', [
+                'id' => $this->primaryKey(),
+                'ngram' => $this->string(5)->notNull(), // Max 5 chars for up to 5-grams
+                'term' => $this->string(255)->notNull(),
+                'ngram_type' => $this->tinyInteger()->notNull(), // 2=bigram, 3=trigram, etc.
+                'siteId' => $this->integer()->notNull(),
+                'dateCreated' => $this->dateTime()->notNull(),
+                'dateUpdated' => $this->dateTime()->notNull(),
+                'uid' => $this->uid(),
+            ]);
+
+            // Add indexes for n-grams table
+            $this->createIndex(
+                null,
+                $tablePrefix . 'ngrams}}',
+                ['ngram', 'siteId']
+            );
+            $this->createIndex(
+                null,
+                $tablePrefix . 'ngrams}}',
+                ['term', 'siteId']
+            );
+            $this->createIndex(
+                null,
+                $tablePrefix . 'ngrams}}',
+                ['ngram_type', 'siteId']
+            );
+        }
+
+        // Create n-gram index table for fast term lookup
+        if (!$this->db->tableExists($tablePrefix . 'ngram_index}}')) {
+            $this->createTable($tablePrefix . 'ngram_index}}', [
+                'id' => $this->primaryKey(),
+                'term' => $this->string(255)->notNull(),
+                'ngram_count' => $this->integer()->notNull(),
+                'siteId' => $this->integer()->notNull(),
+                'dateCreated' => $this->dateTime()->notNull(),
+                'dateUpdated' => $this->dateTime()->notNull(),
+                'uid' => $this->uid(),
+            ]);
+
+            // Add indexes for n-gram index table
+            $this->createIndex(
+                null,
+                $tablePrefix . 'ngram_index}}',
+                ['term', 'siteId'],
+                true // unique
+            );
+            $this->createIndex(
+                null,
+                $tablePrefix . 'ngram_index}}',
+                ['siteId']
+            );
+        }
+
         return true;
     }
 
@@ -142,6 +199,8 @@ class Install extends Migration
         $tablePrefix = '{{%bramble_search_';
 
         // Drop tables in reverse order to avoid foreign key constraints
+        $this->dropTableIfExists($tablePrefix . 'ngram_index}}');
+        $this->dropTableIfExists($tablePrefix . 'ngrams}}');
         $this->dropTableIfExists($tablePrefix . 'metadata}}');
         $this->dropTableIfExists($tablePrefix . 'titles}}');
         $this->dropTableIfExists($tablePrefix . 'terms}}');

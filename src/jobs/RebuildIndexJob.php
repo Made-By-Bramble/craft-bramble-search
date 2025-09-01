@@ -27,7 +27,7 @@ class RebuildIndexJob extends BaseJob
     /**
      * Execute the job
      *
-     * @param craft\queue\QueueInterface $queue The queue the job belongs to
+     * @param \craft\queue\QueueInterface $queue The queue the job belongs to
      */
     public function execute($queue): void
     {
@@ -73,7 +73,7 @@ class RebuildIndexJob extends BaseJob
                     ($step * $this->batchSize + $i) / $count,
                     Craft::t('bramble-search', 'Indexed {current} of {total}', [
                         'current' => $step * $this->batchSize + $i + 1,
-                        'total' => $count
+                        'total' => $count,
                     ])
                 );
             }

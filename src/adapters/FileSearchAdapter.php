@@ -101,6 +101,19 @@ class FileSearchAdapter extends BaseSearchAdapter
         }
     }
 
+    /**
+     * Ensure a specific directory exists
+     */
+    protected function ensureDirectoryExists(string $dir): void
+    {
+        try {
+            FileHelper::createDirectory($dir);
+        } catch (Exception $e) {
+            Craft::error('Failed to create directory: ' . $e->getMessage(), 'bramble-search');
+            throw new \RuntimeException('Failed to create directory: ' . $e->getMessage());
+        }
+    }
+
     // =========================================================================
     // FILE OPERATIONS
     // =========================================================================
@@ -778,6 +791,43 @@ class FileSearchAdapter extends BaseSearchAdapter
     }
 
     /**
+     * Get document lengths for multiple documents in a single batch operation
+     *
+     * @param array $docIds Array of document IDs
+     * @return array Associative array with docId => length
+     */
+    protected function getDocumentLengthsBatch(array $docIds): array
+    {
+        if (empty($docIds)) {
+            return [];
+        }
+
+        $lengths = [];
+        
+        foreach ($docIds as $docId) {
+            [$siteId, $elementId] = explode(':', $docId);
+            $docPath = $this->docsDir . "/{$siteId}_{$elementId}.dat";
+            $data = $this->readFile($docPath);
+            
+            if ($data === false) {
+                $lengths[$docId] = 0;
+                continue;
+            }
+            
+            $doc = $this->decodeData($data);
+            
+            if ($doc === false || !is_array($doc)) {
+                $lengths[$docId] = 0;
+                continue;
+            }
+            
+            $lengths[$docId] = (int)($doc['_length'] ?? 0);
+        }
+
+        return $lengths;
+    }
+
+    /**
      * Get all terms in the index
      *
      * @return array All terms
@@ -1001,5 +1051,91 @@ class FileSearchAdapter extends BaseSearchAdapter
     {
         $lengthPath = $this->metaDir . "/length.dat";
         $this->writeFile($lengthPath, $this->encodeData(0));
+    }
+
+    // =========================================================================
+    // N-GRAM OPERATIONS (Basic file-based implementation)
+    // =========================================================================
+
+    /**
+     * Store n-grams for a term in files
+     *
+     * @param string $term The term to store n-grams for
+     * @param array $ngrams Array of n-grams for the term
+     * @param int $siteId The site ID
+     * @return void
+     */
+    protected function storeTermNgrams(string $term, array $ngrams, int $siteId): void
+    {
+        if (empty($ngrams)) {
+            return;
+        }
+
+        $ngramsDir = $this->baseDir . "/ngrams/site{$siteId}";
+        $this->ensureDirectoryExists($ngramsDir);
+
+        // Store n-grams for the term
+        $termNgramsPath = $ngramsDir . "/{$term}.dat";
+        $this->writeFile($termNgramsPath, $this->encodeData($ngrams));
+    }
+
+    /**
+     * Get terms that have similar n-grams to the search term (basic implementation)
+     *
+     * @param array $ngrams N-grams of the search term
+     * @param int $siteId The site ID
+     * @param float $threshold Minimum similarity threshold (0.0 - 1.0)
+     * @return array Array of [term => similarity_score]
+     */
+    protected function getTermsByNgramSimilarity(array $ngrams, int $siteId, float $threshold): array
+    {
+        // Simple implementation - just fallback to brute force for file adapter
+        return [];
+    }
+
+    /**
+     * Check if a term already has n-grams stored
+     *
+     * @param string $term The term to check
+     * @param int $siteId The site ID
+     * @return bool Whether the term has n-grams
+     */
+    protected function termHasNgrams(string $term, int $siteId): bool
+    {
+        $termNgramsPath = $this->baseDir . "/ngrams/site{$siteId}/{$term}.dat";
+        return file_exists($termNgramsPath);
+    }
+
+    /**
+     * Clear all n-grams for a site
+     *
+     * @param int $siteId The site ID
+     * @return void
+     */
+    protected function clearNgrams(int $siteId): void
+    {
+        $ngramsDir = $this->baseDir . "/ngrams/site{$siteId}";
+        if (is_dir($ngramsDir)) {
+            // Simple deletion of directory contents
+            $files = glob($ngramsDir . '/*.dat');
+            if ($files) {
+                foreach ($files as $file) {
+                    $this->deleteFile($file);
+                }
+            }
+        }
+    }
+
+    /**
+     * Remove n-grams for a specific term
+     *
+     * @param string $term The term to remove n-grams for
+     * @param int $siteId The site ID
+     * @return void
+     */
+    protected function removeTermNgrams(string $term, int $siteId): void
+    {
+        $termNgramsPath = $this->baseDir . "/ngrams/site{$siteId}/{$term}.dat";
+        $this->deleteFile($termNgramsPath);
     }
 }

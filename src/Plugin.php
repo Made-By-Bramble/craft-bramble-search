@@ -81,6 +81,7 @@ class Plugin extends BasePlugin
             'levels' => ['error', 'warning', 'info', 'trace'],
         ]);
 
+        /** @var \MadeByBramble\BrambleSearch\models\Settings $settings */
         $settings = $this->getSettings();
         if ($settings->enabled === true) {
             // Register console commands
@@ -119,6 +120,7 @@ class Plugin extends BasePlugin
      */
     protected function initializeSearchService(): void
     {
+        /** @var \MadeByBramble\BrambleSearch\models\Settings $settings */
         $settings = $this->getSettings();
 
         // Check for environment variable overrides first, then fall back to settings
@@ -195,17 +197,17 @@ class Plugin extends BasePlugin
         Event::on(
             ClearCaches::class,
             ClearCaches::EVENT_REGISTER_CACHE_OPTIONS,
-            function (RegisterCacheOptionsEvent $event) {
+            function(RegisterCacheOptionsEvent $event) {
                 $options = $event->options;
                 $options['bramble-search'] = [
                     'label' => 'Bramble Search',
                     'key' => 'bramble-search',
                     'info' => Craft::t('bramble-search', 'Triggers a queued rebuild of the search index.'),
-                    'action' => function () {
+                    'action' => function() {
                         Craft::$app->getQueue()->push(new RebuildIndexJob([
                             'siteId' => Craft::$app->getSites()->currentSite->id,
                         ]));
-                    }
+                    },
                 ];
                 $event->options = $options;
             }

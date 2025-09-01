@@ -2,9 +2,9 @@
 
 namespace MadeByBramble\BrambleSearch\adapters;
 
+use craft\helpers\App;
 use MadeByBramble\BrambleSearch\Plugin;
 use Redis;
-use craft\helpers\App;
 
 /**
  * Redis Search Adapter
@@ -34,6 +34,7 @@ class RedisSearchAdapter extends BaseSearchAdapter
     public function init(): void
     {
         parent::init();
+        /** @var \MadeByBramble\BrambleSearch\models\Settings $settings */
         $settings = Plugin::getInstance()->getSettings();
         $redisHost = App::parseEnv('$BRAMBLE_SEARCH_REDIS_HOST') ?: $settings->redisHost;
         $redisPort = (int)(App::parseEnv('$BRAMBLE_SEARCH_REDIS_PORT') ?: $settings->redisPort);
@@ -127,7 +128,37 @@ class RedisSearchAdapter extends BaseSearchAdapter
         return (int)$result;
     }
 
+    /**
+     * Get document lengths for multiple documents in a single batch operation
+     *
+     * @param array $docIds Array of document IDs
+     * @return array Associative array with docId => length
+     */
+    protected function getDocumentLengthsBatch(array $docIds): array
+    {
+        if (empty($docIds)) {
+            return [];
+        }
 
+        $pipe = $this->redis->multi(\Redis::PIPELINE);
+        
+        // Queue all the hGet commands
+        foreach ($docIds as $docId) {
+            $docKey = $this->prefix . "doc:$docId";
+            $pipe->hGet($docKey, '_length');
+        }
+        
+        $results = $pipe->exec();
+        $lengths = [];
+        
+        // Process results
+        foreach ($docIds as $index => $docId) {
+            $result = $results[$index] ?? false;
+            $lengths[$docId] = ($result === false || !is_numeric($result)) ? 0 : (int)$result;
+        }
+        
+        return $lengths;
+    }
 
     // =========================================================================
     // METADATA OPERATIONS
@@ -400,5 +431,169 @@ class RedisSearchAdapter extends BaseSearchAdapter
         $metaKey = $this->prefix . "meta";
         $totalLengthKey = $metaKey . ':totalLength';
         $this->redis->set($totalLengthKey, 0);
+    }
+
+    // =========================================================================
+    // N-GRAM OPERATIONS
+    // =========================================================================
+
+    /**
+     * Store n-grams for a term in Redis
+     *
+     * @param string $term The term to store n-grams for
+     * @param array $ngrams Array of n-grams for the term
+     * @param int $siteId The site ID
+     * @return void
+     */
+    protected function storeTermNgrams(string $term, array $ngrams, int $siteId): void
+    {
+        // First, remove any existing n-grams for this term
+        $this->removeTermNgrams($term, $siteId);
+
+        if (empty($ngrams)) {
+            return;
+        }
+
+        $pipe = $this->redis->multi(\Redis::PIPELINE);
+
+        // Store each n-gram → term mapping
+        foreach ($ngrams as $ngram) {
+            $ngramKey = $this->prefix . "ngram:{$siteId}:{$ngram}";
+            $pipe->sAdd($ngramKey, $term);
+        }
+
+        // Store term → n-gram count mapping
+        $countKey = $this->prefix . "ngram_count:{$siteId}";
+        $pipe->hSet($countKey, $term, count($ngrams));
+
+        // Store term → n-grams mapping for easier cleanup
+        $termNgramsKey = $this->prefix . "term_ngrams:{$siteId}:{$term}";
+        foreach ($ngrams as $ngram) {
+            $pipe->sAdd($termNgramsKey, $ngram);
+        }
+
+        $pipe->exec();
+    }
+
+    /**
+     * Get terms that have similar n-grams to the search term
+     *
+     * @param array $ngrams N-grams of the search term
+     * @param int $siteId The site ID
+     * @param float $threshold Minimum similarity threshold (0.0 - 1.0)
+     * @return array Array of [term => similarity_score]
+     */
+    protected function getTermsByNgramSimilarity(array $ngrams, int $siteId, float $threshold): array
+    {
+        if (empty($ngrams)) {
+            return [];
+        }
+
+        $termScores = [];
+        $searchCount = count($ngrams);
+
+        // Get all terms for each n-gram and count matches
+        foreach ($ngrams as $ngram) {
+            $ngramKey = $this->prefix . "ngram:{$siteId}:{$ngram}";
+            $terms = $this->redis->sMembers($ngramKey);
+
+            foreach ($terms as $term) {
+                $termScores[$term] = ($termScores[$term] ?? 0) + 1;
+            }
+        }
+
+        // Calculate Jaccard similarity for each candidate term
+        $results = [];
+        $countKey = $this->prefix . "ngram_count:{$siteId}";
+
+        foreach ($termScores as $term => $matchCount) {
+            $termNgramCount = (int)$this->redis->hGet($countKey, $term);
+
+            if ($termNgramCount > 0) {
+                // Jaccard similarity: |intersection| / |union|
+                $jaccard = $matchCount / ($termNgramCount + $searchCount - $matchCount);
+
+                if ($jaccard >= $threshold) {
+                    $results[$term] = $jaccard;
+                }
+            }
+        }
+
+        // Sort by similarity score (descending)
+        arsort($results);
+
+        // Return top 100 candidates
+        return array_slice($results, 0, 100, true);
+    }
+
+    /**
+     * Check if a term already has n-grams stored
+     *
+     * @param string $term The term to check
+     * @param int $siteId The site ID
+     * @return bool Whether the term has n-grams
+     */
+    protected function termHasNgrams(string $term, int $siteId): bool
+    {
+        $countKey = $this->prefix . "ngram_count:{$siteId}";
+        return $this->redis->hExists($countKey, $term);
+    }
+
+    /**
+     * Clear all n-grams for a site
+     *
+     * @param int $siteId The site ID
+     * @return void
+     */
+    protected function clearNgrams(int $siteId): void
+    {
+        // Find all n-gram keys for this site
+        $ngramPattern = $this->prefix . "ngram:{$siteId}:*";
+        $termNgramsPattern = $this->prefix . "term_ngrams:{$siteId}:*";
+        $countKey = $this->prefix . "ngram_count:{$siteId}";
+
+        $ngramKeys = $this->redis->keys($ngramPattern);
+        $termNgramKeys = $this->redis->keys($termNgramsPattern);
+
+        $allKeys = array_merge($ngramKeys ?: [], $termNgramKeys ?: [], [$countKey]);
+
+        // Filter out empty values and only delete if we have keys
+        $keysToDelete = array_filter($allKeys);
+        if (!empty($keysToDelete)) {
+            $this->redis->del($keysToDelete);
+        }
+    }
+
+    /**
+     * Remove n-grams for a specific term
+     *
+     * @param string $term The term to remove n-grams for
+     * @param int $siteId The site ID
+     * @return void
+     */
+    protected function removeTermNgrams(string $term, int $siteId): void
+    {
+        // Get all n-grams for this term
+        $termNgramsKey = $this->prefix . "term_ngrams:{$siteId}:{$term}";
+        $ngrams = $this->redis->sMembers($termNgramsKey);
+
+        if (!empty($ngrams)) {
+            $pipe = $this->redis->multi(\Redis::PIPELINE);
+
+            // Remove term from each n-gram set
+            foreach ($ngrams as $ngram) {
+                $ngramKey = $this->prefix . "ngram:{$siteId}:{$ngram}";
+                $pipe->sRem($ngramKey, $term);
+            }
+
+            // Remove the term's n-gram count
+            $countKey = $this->prefix . "ngram_count:{$siteId}";
+            $pipe->hDel($countKey, $term);
+
+            // Remove the term's n-gram list
+            $pipe->del($termNgramsKey);
+
+            $pipe->exec();
+        }
     }
 }

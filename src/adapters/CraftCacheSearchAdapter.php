@@ -56,6 +56,35 @@ class CraftCacheSearchAdapter extends BaseSearchAdapter
     }
 
     /**
+     * Get document lengths for multiple documents in a single batch operation
+     *
+     * @param array $docIds Array of document IDs
+     * @return array Associative array with docId => length
+     */
+    protected function getDocumentLengthsBatch(array $docIds): array
+    {
+        if (empty($docIds)) {
+            return [];
+        }
+
+        $lengths = [];
+        
+        // Note: Craft cache doesn't support batch operations, so we iterate
+        foreach ($docIds as $docId) {
+            $docKey = $this->prefix . "doc:$docId";
+            $docData = Craft::$app->cache->get($docKey);
+            
+            if ($docData === false || !is_array($docData)) {
+                $lengths[$docId] = 0;
+            } else {
+                $lengths[$docId] = (int)($docData['_length'] ?? 0);
+            }
+        }
+
+        return $lengths;
+    }
+
+    /**
      * Delete a document from the cache
      *
      * @param int $siteId The site ID
@@ -80,7 +109,7 @@ class CraftCacheSearchAdapter extends BaseSearchAdapter
         $docKey = $this->prefix . "doc:{$siteId}:{$elementId}";
         $docData = [
             'terms' => $termFreqs,
-            '_length' => $docLen
+            '_length' => $docLen,
         ];
 
         Craft::$app->cache->set($docKey, $docData);
@@ -452,5 +481,58 @@ class CraftCacheSearchAdapter extends BaseSearchAdapter
         $metaKey = $this->prefix . "meta";
         $totalLengthKey = $metaKey . ':totalLength';
         Craft::$app->cache->set($totalLengthKey, 0);
+    }
+
+    // =========================================================================
+    // N-GRAM OPERATIONS (Basic cache implementation)
+    // =========================================================================
+
+    /**
+     * Store n-grams for a term in cache
+     */
+    protected function storeTermNgrams(string $term, array $ngrams, int $siteId): void
+    {
+        if (empty($ngrams)) {
+            return;
+        }
+        
+        $ngramKey = $this->prefix . "ngrams:{$siteId}:{$term}";
+        Craft::$app->cache->set($ngramKey, $ngrams);
+    }
+
+    /**
+     * Get terms that have similar n-grams to the search term (basic implementation)
+     */
+    protected function getTermsByNgramSimilarity(array $ngrams, int $siteId, float $threshold): array
+    {
+        // Simple fallback - cache adapter will use brute force fuzzy search
+        return [];
+    }
+
+    /**
+     * Check if a term already has n-grams stored
+     */
+    protected function termHasNgrams(string $term, int $siteId): bool
+    {
+        $ngramKey = $this->prefix . "ngrams:{$siteId}:{$term}";
+        return Craft::$app->cache->exists($ngramKey);
+    }
+
+    /**
+     * Clear all n-grams for a site
+     */
+    protected function clearNgrams(int $siteId): void
+    {
+        // Cache doesn't support pattern-based deletion, so this is a no-op
+        // N-grams will expire naturally or be overwritten
+    }
+
+    /**
+     * Remove n-grams for a specific term
+     */
+    protected function removeTermNgrams(string $term, int $siteId): void
+    {
+        $ngramKey = $this->prefix . "ngrams:{$siteId}:{$term}";
+        Craft::$app->cache->delete($ngramKey);
     }
 }

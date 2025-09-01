@@ -2,7 +2,8 @@
 
 {{ forms.lightswitchField({
     label: "Enable Bramble Search"|t('bramble-search'),
-    instructions: "Replace Craft's search service with Bramble Search. This affects both the admin Control Panel and frontend templates."|t('bramble-search'),
+    instructions: "Replace Craft's search service with enhanced BM25 ranking algorithm, fuzzy search capabilities, and performance optimizations."|t('bramble-search'),
+    tip: "When enabled, this affects both the admin Control Panel and frontend templates with improved search relevance and speed."|t('bramble-search'),
     id: 'enabled',
     name: 'enabled',
     on: settings.enabled,
@@ -47,7 +48,7 @@
 
 {{ forms.selectField({
     label: "Storage Driver"|t('bramble-search'),
-    instructions: "Choose where to store the search index."|t('bramble-search'),
+    instructions: "Choose where to store the search index. Redis offers the best performance, while Craft Cache requires no additional setup."|t('bramble-search'),
     tip: "This can be overridden using the BRAMBLE_SEARCH_DRIVER environment variable in your .env file."|t('bramble-search'),
     id: 'storageDriver',
     name: 'storageDriver',
@@ -57,6 +58,12 @@
     toggle: true,
     targetPrefix: 'storage-'
 }) }}
+
+{# Storage Configuration Section #}
+{{ forms.field({
+    label: "Storage Configuration"|t('bramble-search'),
+    instructions: "Configure storage backend specific settings."|t('bramble-search'),
+}, null) }}
 
 <div id="storage-redis" class="{% if settings.storageDriver != 'redis' %}hidden{% endif %}">
     {{ forms.textField({
@@ -126,8 +133,125 @@
 
 <hr>
 
+{# Search Algorithm Configuration Section #}
 {{ forms.field({
-    label: "Rebuilding the Search Index"|t('bramble-search'),
+    label: "Search Algorithm Configuration"|t('bramble-search'),
+    instructions: "Configure the BM25 ranking algorithm parameters and boosting factors for optimal search relevance."|t('bramble-search'),
+}, null) }}
+
+{{ forms.textField({
+    label: "BM25 K1 Parameter"|t('bramble-search'),
+    instructions: "Controls how quickly term frequency scoring saturates. Lower values make term frequency less important, higher values give more weight to repeated terms."|t('bramble-search'),
+    tip: "Range: 0.1-5.0. Default of 1.5 works well for most content. Lower values (0.5-1.0) for documents with repeated keywords, higher values (2.0-5.0) for varied vocabulary."|t('bramble-search'),
+    id: 'bm25K1',
+    name: 'bm25K1',
+    value: settings.bm25K1,
+    type: 'number',
+    min: 0.1,
+    max: 5.0,
+    step: 0.1,
+    size: 5,
+    errors: settings.getErrors('bm25K1'),
+}) }}
+
+{{ forms.textField({
+    label: "BM25 B Parameter"|t('bramble-search'),
+    instructions: "Controls document length normalization. 0 means document length doesn't affect scoring, 1 means shorter documents are heavily favored."|t('bramble-search'),
+    tip: "Range: 0.0-1.0. Default of 0.75 balances relevance with document length. Use 0 for uniform document lengths, 1 when document length is very important."|t('bramble-search'),
+    id: 'bm25B',
+    name: 'bm25B',
+    value: settings.bm25B,
+    type: 'number',
+    min: 0.0,
+    max: 1.0,
+    step: 0.05,
+    size: 5,
+    errors: settings.getErrors('bm25B'),
+}) }}
+
+{{ forms.textField({
+    label: "Title Boost Factor"|t('bramble-search'),
+    instructions: "Multiplier applied to terms found in title fields to increase their relevance in search results."|t('bramble-search'),
+    tip: "Range: 1.0-20.0. Default of 5.0 significantly boosts title matches. Higher values (10.0+) make title matches dominant, lower values (2.0-3.0) provide subtle boosting."|t('bramble-search'),
+    id: 'titleBoostFactor',
+    name: 'titleBoostFactor',
+    value: settings.titleBoostFactor,
+    type: 'number',
+    min: 1.0,
+    max: 20.0,
+    step: 0.5,
+    size: 5,
+    errors: settings.getErrors('titleBoostFactor'),
+}) }}
+
+{{ forms.textField({
+    label: "Exact Match Boost Factor"|t('bramble-search'),
+    instructions: "Multiplier applied when all search terms appear as an exact phrase in the document."|t('bramble-search'),
+    tip: "Range: 1.0-20.0. Default of 3.0 moderately boosts exact phrase matches. Higher values favor exact matches, lower values reduce the exact match advantage."|t('bramble-search'),
+    id: 'exactMatchBoostFactor',
+    name: 'exactMatchBoostFactor',
+    value: settings.exactMatchBoostFactor,
+    type: 'number',
+    min: 1.0,
+    max: 20.0,
+    step: 0.5,
+    size: 5,
+    errors: settings.getErrors('exactMatchBoostFactor'),
+}) }}
+
+{# Fuzzy Search Configuration Section #}
+    {{ forms.checkboxGroupField({
+        label: "N-gram Sizes"|t('bramble-search'),
+        instructions: "Select the n-gram sizes to generate for fuzzy matching. Multiple sizes provide better accuracy."|t('bramble-search'),
+        tip: "Smaller sizes (2-3) are faster but less precise. Larger sizes (4-5) are more precise but slower. Default combination of 2-3 grams provides good balance."|t('bramble-search'),
+        id: 'ngramSizes',
+        name: 'ngramSizes',
+        values: settings.ngramSizes,
+        options: [
+            { value: '1', label: '1-gram (unigram) - Best for very short terms' },
+            { value: '2', label: '2-gram (bigram) - Fast, broad matching' },
+            { value: '3', label: '3-gram (trigram) - Balanced speed and precision' },
+            { value: '4', label: '4-gram - Precise but slower' },
+            { value: '5', label: '5-gram - Most precise, slowest' },
+        ],
+        errors: settings.getErrors('ngramSizes'),
+    }) }}
+
+    {{ forms.textField({
+        label: "Similarity Threshold"|t('bramble-search'),
+        instructions: "Minimum n-gram similarity score (0-1) for fuzzy search candidates. Lower values find more matches but may include irrelevant results."|t('bramble-search'),
+        tip: "Range: 0.0-1.0. Default of 0.25 optimized for short terms. Lower values (0.1-0.2) for very broad matching, higher values (0.4-0.6) for strict matching."|t('bramble-search'),
+        id: 'ngramSimilarityThreshold',
+        name: 'ngramSimilarityThreshold',
+        value: settings.ngramSimilarityThreshold,
+        type: 'number',
+        min: 0.0,
+        max: 1.0,
+        step: 0.05,
+        size: 5,
+        errors: settings.getErrors('ngramSimilarityThreshold'),
+    }) }}
+
+    {{ forms.textField({
+        label: "Max Fuzzy Candidates"|t('bramble-search'),
+        instructions: "Maximum number of candidate terms to process for fuzzy matching. Higher values improve accuracy but reduce performance."|t('bramble-search'),
+        tip: "Range: 10-1000. Default of 100 balances accuracy with performance. Increase for better fuzzy matching, decrease for faster searches."|t('bramble-search'),
+        id: 'fuzzySearchMaxCandidates',
+        name: 'fuzzySearchMaxCandidates',
+        value: settings.fuzzySearchMaxCandidates,
+        type: 'number',
+        min: 10,
+        max: 1000,
+        step: 10,
+        size: 5,
+        errors: settings.getErrors('fuzzySearchMaxCandidates'),
+    }) }}
+
+<hr>
+
+{# Index Management Section #}
+{{ forms.field({
+    label: "Index Management"|t('bramble-search'),
     instructions: "The search index is automatically maintained as content is created and updated."|t('bramble-search'),
 }, null) }}
 
@@ -165,8 +289,12 @@ document.addEventListener('DOMContentLoaded', function() {
     var redisSettings = document.getElementById('storage-redis');
     var mongoDbSettings = document.getElementById('storage-mongodb');
 
-    // Function to check value and toggle visibility
-    function updateVisibility() {
+    // Function to check storage driver value and toggle visibility
+    function updateStorageVisibility() {
+        if (!storageDriverSelect || !redisSettings || !mongoDbSettings) {
+            return;
+        }
+        
         var value = storageDriverSelect.value;
 
         // Redis settings
@@ -184,10 +312,14 @@ document.addEventListener('DOMContentLoaded', function() {
         }
     }
 
-    // Initial check
-    updateVisibility();
+    // Initial check (only if elements exist)
+    if (storageDriverSelect) {
+        updateStorageVisibility();
+    }
 
-    // Listen for changes
-    storageDriverSelect.addEventListener('change', updateVisibility);
+    // Listen for changes (only if elements exist)
+    if (storageDriverSelect) {
+        storageDriverSelect.addEventListener('change', updateStorageVisibility);
+    }
 });
 {% endjs %}

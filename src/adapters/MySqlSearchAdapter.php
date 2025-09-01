@@ -2,12 +2,10 @@
 
 namespace MadeByBramble\BrambleSearch\adapters;
 
-use MadeByBramble\BrambleSearch\Plugin;
 use Craft;
-use craft\helpers\App;
-use craft\helpers\StringHelper;
 use craft\db\Query;
 use craft\db\Table;
+use craft\helpers\StringHelper;
 
 /**
  * MySQL Search Adapter
@@ -129,15 +127,13 @@ class MySqlSearchAdapter extends BaseSearchAdapter
             'uid' => StringHelper::UUID(),
         ];
 
-        if (!empty($batch)) {
-            $db->createCommand()
-                ->batchInsert(
-                    $this->tablePrefix . 'documents}}',
-                    ['siteId', 'elementId', 'term', 'frequency', 'dateCreated', 'dateUpdated', 'uid'],
-                    $batch
-                )
-                ->execute();
-        }
+        $db->createCommand()
+            ->batchInsert(
+                $this->tablePrefix . 'documents}}',
+                ['siteId', 'elementId', 'term', 'frequency', 'dateCreated', 'dateUpdated', 'uid'],
+                $batch
+            )
+            ->execute();
     }
 
     /**
@@ -166,6 +162,47 @@ class MySqlSearchAdapter extends BaseSearchAdapter
         }
 
         return (int)$result;
+    }
+
+    /**
+     * Get document lengths for multiple documents in a single batch operation
+     *
+     * @param array $docIds Array of document IDs
+     * @return array Associative array with docId => length
+     */
+    protected function getDocumentLengthsBatch(array $docIds): array
+    {
+        if (empty($docIds)) {
+            return [];
+        }
+
+        $conditions = [];
+        foreach ($docIds as $docId) {
+            [$siteId, $elementId] = explode(':', $docId);
+            $conditions[] = ['siteId' => $siteId, 'elementId' => $elementId];
+        }
+
+        $results = (new Query())
+            ->select(['siteId', 'elementId', 'frequency'])
+            ->from($this->tablePrefix . 'documents}}')
+            ->where(['term' => '_length'])
+            ->andWhere(['or', ...$conditions])
+            ->all();
+
+        $lengths = [];
+        
+        // Initialize all to 0 first
+        foreach ($docIds as $docId) {
+            $lengths[$docId] = 0;
+        }
+        
+        // Fill in actual values
+        foreach ($results as $row) {
+            $docId = $row['siteId'] . ':' . $row['elementId'];
+            $lengths[$docId] = is_numeric($row['frequency']) ? (int)$row['frequency'] : 0;
+        }
+
+        return $lengths;
     }
 
     // =========================================================================
@@ -570,6 +607,191 @@ class MySqlSearchAdapter extends BaseSearchAdapter
                 'dateCreated' => $dateTime,
                 'dateUpdated' => $dateTime,
                 'uid' => StringHelper::UUID(),
+            ])
+            ->execute();
+    }
+
+    // =========================================================================
+    // N-GRAM OPERATIONS
+    // =========================================================================
+
+    /**
+     * Store n-grams for a term in MySQL
+     *
+     * @param string $term The term to store n-grams for
+     * @param array $ngrams Array of n-grams for the term
+     * @param int $siteId The site ID
+     * @return void
+     */
+    protected function storeTermNgrams(string $term, array $ngrams, int $siteId): void
+    {
+        $db = Craft::$app->getDb();
+        $now = new \DateTime();
+        $dateTime = $now->format('Y-m-d H:i:s');
+
+        // First, delete any existing n-grams for this term
+        $this->removeTermNgrams($term, $siteId);
+
+        if (empty($ngrams)) {
+            return;
+        }
+
+        // Prepare batch data for n-grams
+        $batch = [];
+        foreach ($ngrams as $ngram) {
+            $batch[] = [
+                'ngram' => $ngram,
+                'term' => $term,
+                'ngram_type' => strlen($ngram),
+                'siteId' => $siteId,
+                'dateCreated' => $dateTime,
+                'dateUpdated' => $dateTime,
+                'uid' => StringHelper::UUID(),
+            ];
+        }
+
+        // Batch insert n-grams
+        $db->createCommand()
+            ->batchInsert(
+                $this->tablePrefix . 'ngrams}}',
+                ['ngram', 'term', 'ngram_type', 'siteId', 'dateCreated', 'dateUpdated', 'uid'],
+                $batch
+            )
+            ->execute();
+
+        // Update or insert n-gram count
+        $db->createCommand()
+            ->upsert(
+                $this->tablePrefix . 'ngram_index}}',
+                [
+                    'term' => $term,
+                    'siteId' => $siteId,
+                    'ngram_count' => count($ngrams),
+                    'dateCreated' => $dateTime,
+                    'dateUpdated' => $dateTime,
+                    'uid' => StringHelper::UUID(),
+                ],
+                [
+                    'ngram_count' => count($ngrams),
+                    'dateUpdated' => $dateTime,
+                ]
+            )
+            ->execute();
+    }
+
+    /**
+     * Get terms that have similar n-grams to the search term
+     *
+     * @param array $ngrams N-grams of the search term
+     * @param int $siteId The site ID
+     * @param float $threshold Minimum similarity threshold (0.0 - 1.0)
+     * @return array Array of [term => similarity_score]
+     */
+    protected function getTermsByNgramSimilarity(array $ngrams, int $siteId, float $threshold): array
+    {
+        if (empty($ngrams)) {
+            return [];
+        }
+
+        $searchCount = count($ngrams);
+
+        // Use SQL to find terms with overlapping n-grams and calculate Jaccard similarity
+        $query = (new Query())
+            ->select([
+                'n.term',
+                'COUNT(DISTINCT n.ngram) as match_count',
+                'i.ngram_count',
+                '(COUNT(DISTINCT n.ngram) / (i.ngram_count + :searchCount - COUNT(DISTINCT n.ngram))) as jaccard_similarity',
+            ])
+            ->from($this->tablePrefix . 'ngrams}} n')
+            ->innerJoin($this->tablePrefix . 'ngram_index}} i', 'n.term = i.term AND n.siteId = i.siteId')
+            ->where(['n.ngram' => $ngrams, 'n.siteId' => $siteId])
+            ->groupBy(['n.term', 'i.ngram_count'])
+            ->having('jaccard_similarity >= :threshold')
+            ->orderBy(['match_count' => SORT_DESC, 'jaccard_similarity' => SORT_DESC])
+            ->limit(100)
+            ->params([
+                ':searchCount' => $searchCount,
+                ':threshold' => $threshold,
+            ]);
+
+        $results = $query->all();
+        $termSimilarities = [];
+
+        foreach ($results as $result) {
+            $termSimilarities[$result['term']] = (float)$result['jaccard_similarity'];
+        }
+
+        return $termSimilarities;
+    }
+
+    /**
+     * Check if a term already has n-grams stored
+     *
+     * @param string $term The term to check
+     * @param int $siteId The site ID
+     * @return bool Whether the term has n-grams
+     */
+    protected function termHasNgrams(string $term, int $siteId): bool
+    {
+        $result = (new Query())
+            ->select(['id'])
+            ->from($this->tablePrefix . 'ngram_index}}')
+            ->where(['term' => $term, 'siteId' => $siteId])
+            ->exists();
+
+        return (bool)$result;
+    }
+
+    /**
+     * Clear all n-grams for a site
+     *
+     * @param int $siteId The site ID
+     * @return void
+     */
+    protected function clearNgrams(int $siteId): void
+    {
+        $db = Craft::$app->getDb();
+
+        // Delete all n-grams for this site
+        $db->createCommand()
+            ->delete($this->tablePrefix . 'ngrams}}', [
+                'siteId' => $siteId,
+            ])
+            ->execute();
+
+        // Delete all n-gram index entries for this site
+        $db->createCommand()
+            ->delete($this->tablePrefix . 'ngram_index}}', [
+                'siteId' => $siteId,
+            ])
+            ->execute();
+    }
+
+    /**
+     * Remove n-grams for a specific term
+     *
+     * @param string $term The term to remove n-grams for
+     * @param int $siteId The site ID
+     * @return void
+     */
+    protected function removeTermNgrams(string $term, int $siteId): void
+    {
+        $db = Craft::$app->getDb();
+
+        // Delete n-grams for this term
+        $db->createCommand()
+            ->delete($this->tablePrefix . 'ngrams}}', [
+                'term' => $term,
+                'siteId' => $siteId,
+            ])
+            ->execute();
+
+        // Delete n-gram index entry for this term
+        $db->createCommand()
+            ->delete($this->tablePrefix . 'ngram_index}}', [
+                'term' => $term,
+                'siteId' => $siteId,
             ])
             ->execute();
     }

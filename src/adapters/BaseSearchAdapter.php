@@ -3,10 +3,10 @@
 namespace MadeByBramble\BrambleSearch\adapters;
 
 use Craft;
-use craft\services\Search;
 use craft\base\ElementInterface;
 use craft\elements\db\ElementQuery;
 use craft\helpers\ElementHelper;
+use craft\services\Search;
 use yii\log\Logger;
 
 /**
@@ -52,6 +52,22 @@ abstract class BaseSearchAdapter extends Search
      */
     protected array $stopWords = [];
 
+    /**
+     * N-gram sizes to generate for fuzzy matching
+     */
+    protected array $ngramSizes = [2, 3];
+
+    /**
+     * Minimum n-gram similarity threshold for fuzzy search candidates
+     */
+    protected float $ngramSimilarityThreshold = 0.4;
+
+    /**
+     * Maximum number of candidates to process for fuzzy matching
+     */
+    protected int $fuzzySearchMaxCandidates = 100;
+
+
     // =========================================================================
     // INITIALIZATION METHODS
     // =========================================================================
@@ -63,6 +79,7 @@ abstract class BaseSearchAdapter extends Search
     {
         parent::init();
         $this->loadStopWords();
+        $this->loadSettings();
     }
 
     /**
@@ -71,6 +88,27 @@ abstract class BaseSearchAdapter extends Search
     protected function loadStopWords(): void
     {
         $this->stopWords = require Craft::getAlias('@bramble_search/stopwords/en.php');
+    }
+
+    /**
+     * Load BM25 and boost parameters from plugin settings
+     */
+    protected function loadSettings(): void
+    {
+        $plugin = \MadeByBramble\BrambleSearch\Plugin::$plugin;
+        if ($plugin) {
+            /** @var \MadeByBramble\BrambleSearch\models\Settings $settings */
+            $settings = $plugin->getSettings();
+            $this->k1 = $settings->bm25K1;
+            $this->b = $settings->bm25B;
+            $this->titleBoostFactor = $settings->titleBoostFactor;
+            $this->exactMatchBoostFactor = $settings->exactMatchBoostFactor;
+            
+            // Load n-gram settings (with defaults if not set)
+            $this->ngramSizes = $settings->ngramSizes ?? [2, 3];
+            $this->ngramSimilarityThreshold = $settings->ngramSimilarityThreshold ?? 0.4;
+            $this->fuzzySearchMaxCandidates = $settings->fuzzySearchMaxCandidates ?? 100;
+        }
     }
 
     // =========================================================================
@@ -115,7 +153,7 @@ abstract class BaseSearchAdapter extends Search
             'siteId' => $element->siteId,
             'elementType' => get_class($element),
             'title' => $element->title ?? '(no title)',
-            'fields' => []
+            'fields' => [],
         ];
 
         // Process title for special handling
@@ -186,6 +224,17 @@ abstract class BaseSearchAdapter extends Search
             $this->storeTermDocument($term, $element->siteId, $element->id, $freq);
         }
 
+        // Generate and store n-grams for fuzzy search
+        foreach (array_keys($termFreqs) as $term) {
+            // Only generate n-grams for terms that don't already have them
+            if (!$this->termHasNgrams($term, $element->siteId)) {
+                $ngrams = $this->generateNgrams($term);
+                if (!empty($ngrams)) {
+                    $this->storeTermNgrams($term, $ngrams, $element->siteId);
+                }
+            }
+        }
+
         // Update metadata
         $this->addDocumentToIndex($element->siteId, $element->id);
         $this->updateTotalDocCount();
@@ -222,9 +271,10 @@ abstract class BaseSearchAdapter extends Search
             return [];
         }
 
-        $totalDocs = max(1, $this->getTotalDocCount());
-        $totalLength = max(1, $this->getTotalLength());
-        $avgDocLength = $totalLength / $totalDocs;
+        // Cache statistics once for the entire search operation
+        $searchStats = $this->getSearchStatistics();
+        $totalDocs = $searchStats['totalDocs'];
+        $avgDocLength = $searchStats['avgDocLength'];
 
         // Track which documents match each term
         $termMatches = [];
@@ -232,6 +282,9 @@ abstract class BaseSearchAdapter extends Search
         $docScores = [];
         // Track which terms matched for each document (for exact phrase matching)
         $matchedTerms = [];
+        // Collect all matching documents and their term data for batch processing
+        $allDocuments = [];
+        $termData = []; // [termIndex][docId] = ['freq' => freq, 'docFreq' => docFreq, 'actualTerm' => term]
 
         // First pass: collect all documents matching each term
         foreach ($tokens as $termIndex => $term) {
@@ -249,16 +302,12 @@ abstract class BaseSearchAdapter extends Search
 
                     $termMatches[$termIndex][$docId] = true;
                     $matchedTerms[$docId][$term] = true;
-
-                    $docLen = max(1, $this->getDocumentLength($docId));
-                    $score = $this->bm25($freq, $docFreq, $docLen, $avgDocLength);
-
-                    // Apply title boost if term is in title
-                    if ($this->isTermInTitle($term, $docId)) {
-                        $score *= $this->titleBoostFactor;
-                    }
-
-                    $docScores[$docId] = ($docScores[$docId] ?? 0) + $score;
+                    $allDocuments[$docId] = true;
+                    $termData[$termIndex][$docId] = [
+                        'freq' => $freq,
+                        'docFreq' => $docFreq,
+                        'actualTerm' => $term,
+                    ];
                 }
             } else {
                 // Fuzzy fallback if no exact matches
@@ -277,18 +326,32 @@ abstract class BaseSearchAdapter extends Search
 
                         $termMatches[$termIndex][$docId] = true;
                         $matchedTerms[$docId][$term] = true;
-
-                        $docLen = max(1, $this->getDocumentLength($docId));
-                        $score = $this->bm25($freq, $docFreq, $docLen, $avgDocLength);
-
-                        // Apply title boost if term is in title
-                        if ($this->isTermInTitle($fuzzy, $docId)) {
-                            $score *= $this->titleBoostFactor;
-                        }
-
-                        $docScores[$docId] = ($docScores[$docId] ?? 0) + $score;
+                        $allDocuments[$docId] = true;
+                        $termData[$termIndex][$docId] = [
+                            'freq' => $freq,
+                            'docFreq' => $docFreq,
+                            'actualTerm' => $fuzzy,
+                        ];
                     }
                 }
+            }
+        }
+
+        // Batch fetch all document lengths
+        $documentLengths = $this->getDocumentLengthsBatch(array_keys($allDocuments));
+
+        // Second pass: calculate BM25 scores using cached document lengths
+        foreach ($termData as $termIndex => $documents) {
+            foreach ($documents as $docId => $data) {
+                $docLen = max(1, $documentLengths[$docId] ?? 1);
+                $score = $this->bm25($data['freq'], $data['docFreq'], $docLen, $avgDocLength, $totalDocs);
+
+                // Apply title boost if term is in title
+                if ($this->isTermInTitle($data['actualTerm'], $docId)) {
+                    $score *= $this->titleBoostFactor;
+                }
+
+                $docScores[$docId] = ($docScores[$docId] ?? 0) + $score;
             }
         }
 
@@ -349,11 +412,11 @@ abstract class BaseSearchAdapter extends Search
      * @param int $docFreq Number of documents containing the term
      * @param int $docLen Document length in tokens
      * @param float $avgDocLen Average document length across the index
+     * @param int $totalDocs Total number of documents in the index
      * @return float BM25 score
      */
-    protected function bm25($freq, $docFreq, $docLen, $avgDocLen): float
+    protected function bm25($freq, $docFreq, $docLen, $avgDocLen, $totalDocs): float
     {
-        $totalDocs = $this->getTotalDocCount();
         $idf = log(1 + (($totalDocs - $docFreq + 0.5) / ($docFreq + 0.5)));
         return $idf * (($freq * ($this->k1 + 1)) / ($freq + $this->k1 * (1 - $this->b + $this->b * ($docLen / $avgDocLen))));
     }
@@ -367,16 +430,112 @@ abstract class BaseSearchAdapter extends Search
      */
     protected function findFuzzyMatches(string $term, int $maxDistance = 2): array
     {
-        $matches = [];
-        $allTerms = $this->getAllTerms();
-
-        foreach ($allTerms as $candidate) {
-            if (levenshtein($term, $candidate) <= $maxDistance) {
-                $matches[] = $candidate;
-            }
+        // Generate n-grams for the search term
+        $searchNgrams = $this->generateNgrams($term);
+        
+        if (empty($searchNgrams)) {
+            return [];
         }
 
-        return $matches;
+        // Get candidate terms with high n-gram similarity
+        $siteId = Craft::$app->getSites()->getCurrentSite()->id ?? 1;
+        
+        // Use adaptive threshold based on term length for better short-term support
+        $adaptiveThreshold = $this->getAdaptiveThreshold($term);
+        
+        $candidates = $this->getTermsByNgramSimilarity(
+            $searchNgrams,
+            $siteId,
+            $adaptiveThreshold
+        );
+
+        // Limit candidates for performance and return by similarity score
+        $candidates = array_slice($candidates, 0, $this->fuzzySearchMaxCandidates, true);
+
+        return array_keys($candidates);
+    }
+
+    /**
+     * Get adaptive similarity threshold based on term length
+     * Shorter terms get lower thresholds for better fuzzy matching
+     *
+     * @param string $term The search term
+     * @return float Adaptive threshold
+     */
+    protected function getAdaptiveThreshold(string $term): float
+    {
+        $termLength = mb_strlen($term);
+        $baseThreshold = $this->ngramSimilarityThreshold;
+        
+        // Apply scaling factor based on term length
+        if ($termLength <= 2) {
+            // Very short terms: use much lower threshold
+            return max(0.1, $baseThreshold * 0.4);
+        } elseif ($termLength == 3) {
+            // 3-character terms: use lower threshold
+            return max(0.15, $baseThreshold * 0.6);
+        } elseif ($termLength == 4) {
+            // 4-character terms: slightly lower threshold
+            return max(0.2, $baseThreshold * 0.8);
+        }
+        
+        // 5+ character terms: use full threshold
+        return $baseThreshold;
+    }
+
+    /**
+     * Generate n-grams for a term
+     *
+     * @param string $term The term to generate n-grams for
+     * @param array|null $sizes N-gram sizes to generate (defaults to configured sizes)
+     * @return array Array of n-grams
+     */
+    protected function generateNgrams(string $term, ?array $sizes = null): array
+    {
+        $sizes = $sizes ?? $this->ngramSizes;
+        $ngrams = [];
+        
+        // Add padding to capture word boundaries
+        $paddedTerm = ' ' . $term . ' ';
+        
+        foreach ($sizes as $size) {
+            if ($size < 1) {
+                continue;
+            }
+            
+            $termLength = strlen($paddedTerm);
+            
+            // Generate n-grams of specified size
+            for ($i = 0; $i <= $termLength - $size; $i++) {
+                $ngram = substr($paddedTerm, $i, $size);
+                
+                // Skip n-grams that are just spaces
+                if (trim($ngram) !== '') {
+                    $ngrams[] = $ngram;
+                }
+            }
+        }
+        
+        return array_unique($ngrams);
+    }
+
+    /**
+     * Calculate Jaccard similarity between two sets of n-grams
+     *
+     * @param array $ngrams1 First set of n-grams
+     * @param array $ngrams2 Second set of n-grams
+     * @return float Similarity score between 0.0 and 1.0
+     */
+    protected function calculateNgramSimilarity(array $ngrams1, array $ngrams2): float
+    {
+        if (empty($ngrams1) || empty($ngrams2)) {
+            return 0.0;
+        }
+
+        $intersection = count(array_intersect($ngrams1, $ngrams2));
+        $union = count(array_unique(array_merge($ngrams1, $ngrams2)));
+
+        return $union > 0 ? $intersection / $union : 0.0;
     }
 
     /**
@@ -561,6 +720,32 @@ abstract class BaseSearchAdapter extends Search
      */
     abstract protected function addDocumentToIndex(int $siteId, int $elementId): void;
 
+    /**
+     * Get cached search statistics for the current search operation
+     *
+     * This method caches the total document count and average document length
+     * to avoid repeated I/O operations during BM25 calculations.
+     *
+     * @return array Array with 'totalDocs' and 'avgDocLength' keys
+     */
+    protected function getSearchStatistics(): array
+    {
+        static $cachedStats = null;
+        
+        if ($cachedStats === null) {
+            $totalDocs = max(1, $this->getTotalDocCount());
+            $totalLength = max(1, $this->getTotalLength());
+            $avgDocLength = $totalLength / $totalDocs;
+            
+            $cachedStats = [
+                'totalDocs' => $totalDocs,
+                'avgDocLength' => $avgDocLength,
+            ];
+        }
+        
+        return $cachedStats;
+    }
+
     // =========================================================================
     // ABSTRACT METHODS - METADATA OPERATIONS
     // =========================================================================
@@ -615,6 +800,14 @@ abstract class BaseSearchAdapter extends Search
     abstract protected function getDocumentLength(string $docId): int;
 
     /**
+     * Get document lengths for multiple documents in a single batch operation
+     *
+     * @param array $docIds Array of document IDs
+     * @return array Associative array with docId => length
+     */
+    abstract protected function getDocumentLengthsBatch(array $docIds): array;
+
+    /**
      * Get all terms in the index
      *
      * @return array All terms
@@ -659,6 +852,9 @@ abstract class BaseSearchAdapter extends Search
 
             // Clear all terms that no longer have documents
             $this->cleanupOrphanedTerms();
+
+            // Clear n-grams for this site
+            $this->clearNgrams($siteId);
 
             // Update metadata
             $this->updateTotalDocCount();
@@ -774,12 +970,16 @@ abstract class BaseSearchAdapter extends Search
     public function cleanupOrphanedTerms(): void
     {
         $allTerms = $this->getAllTerms();
+        $currentSiteId = Craft::$app->getSites()->getCurrentSite()->id ?? 1;
 
         foreach ($allTerms as $term) {
             $docs = $this->getTermDocuments($term);
 
             if (empty($docs)) {
                 $this->removeTermFromIndex($term);
+                
+                // Also remove n-grams for this orphaned term
+                $this->removeTermNgrams($term, $currentSiteId);
             }
         }
     }
@@ -791,4 +991,54 @@ abstract class BaseSearchAdapter extends Search
      * @return void
      */
     abstract protected function removeTermFromIndex(string $term): void;
+
+    // =========================================================================
+    // N-GRAM ABSTRACT METHODS
+    // =========================================================================
+
+    /**
+     * Store n-grams for a term in the index
+     *
+     * @param string $term The term to store n-grams for
+     * @param array $ngrams Array of n-grams for the term
+     * @param int $siteId The site ID
+     * @return void
+     */
+    abstract protected function storeTermNgrams(string $term, array $ngrams, int $siteId): void;
+
+    /**
+     * Get terms that have similar n-grams to the search term
+     *
+     * @param array $ngrams N-grams of the search term
+     * @param int $siteId The site ID
+     * @param float $threshold Minimum similarity threshold (0.0 - 1.0)
+     * @return array Array of [term => similarity_score]
+     */
+    abstract protected function getTermsByNgramSimilarity(array $ngrams, int $siteId, float $threshold): array;
+
+    /**
+     * Check if a term already has n-grams stored
+     *
+     * @param string $term The term to check
+     * @param int $siteId The site ID
+     * @return bool Whether the term has n-grams
+     */
+    abstract protected function termHasNgrams(string $term, int $siteId): bool;
+
+    /**
+     * Clear all n-grams for a site
+     *
+     * @param int $siteId The site ID
+     * @return void
+     */
+    abstract protected function clearNgrams(int $siteId): void;
+
+    /**
+     * Remove n-grams for a specific term
+     *
+     * @param string $term The term to remove n-grams for
+     * @param int $siteId The site ID
+     * @return void
+     */
+    abstract protected function removeTermNgrams(string $term, int $siteId): void;
 }

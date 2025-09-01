@@ -2,9 +2,9 @@
 
 namespace MadeByBramble\BrambleSearch\adapters;
 
-use MadeByBramble\BrambleSearch\Plugin;
 use Craft;
 use craft\helpers\App;
+use MadeByBramble\BrambleSearch\Plugin;
 use MongoDB\Client;
 use MongoDB\Collection;
 use MongoDB\Database;
@@ -61,6 +61,7 @@ class MongoDbSearchAdapter extends BaseSearchAdapter
     public function init(): void
     {
         parent::init();
+        /** @var \MadeByBramble\BrambleSearch\models\Settings $settings */
         $settings = Plugin::getInstance()->getSettings();
 
         // Get connection settings from environment or settings
@@ -175,8 +176,8 @@ class MongoDbSearchAdapter extends BaseSearchAdapter
                     'siteId' => $siteId,
                     'elementId' => $elementId,
                     'terms' => $termFreqs,
-                    'length' => $docLen
-                ]
+                    'length' => $docLen,
+                ],
             ],
             ['upsert' => true]
         );
@@ -200,6 +201,40 @@ class MongoDbSearchAdapter extends BaseSearchAdapter
         }
 
         return (int)$document['length'];
+    }
+
+    /**
+     * Get document lengths for multiple documents in a single batch operation
+     *
+     * @param array $docIds Array of document IDs
+     * @return array Associative array with docId => length
+     */
+    protected function getDocumentLengthsBatch(array $docIds): array
+    {
+        if (empty($docIds)) {
+            return [];
+        }
+
+        $cursor = $this->documentsCollection->find(
+            ['docId' => ['$in' => $docIds]],
+            ['projection' => ['docId' => 1, 'length' => 1, '_id' => 0]]
+        );
+
+        $lengths = [];
+        
+        // Initialize all to 0 first
+        foreach ($docIds as $docId) {
+            $lengths[$docId] = 0;
+        }
+        
+        // Fill in actual values
+        foreach ($cursor as $document) {
+            if (isset($document['docId']) && isset($document['length'])) {
+                $lengths[$document['docId']] = (int)$document['length'];
+            }
+        }
+
+        return $lengths;
     }
 
     // =========================================================================
@@ -417,8 +452,8 @@ class MongoDbSearchAdapter extends BaseSearchAdapter
                 '$set' => [
                     'siteId' => $siteId,
                     'elementId' => $elementId,
-                    'terms' => array_keys($titleTerms)
-                ]
+                    'terms' => array_keys($titleTerms),
+                ],
             ],
             ['upsert' => true]
         );
@@ -528,5 +563,145 @@ class MongoDbSearchAdapter extends BaseSearchAdapter
             ['$set' => ['value' => 0]],
             ['upsert' => true]
         );
+    }
+
+    // =========================================================================
+    // N-GRAM OPERATIONS
+    // =========================================================================
+
+    /**
+     * Store n-grams for a term in MongoDB
+     *
+     * @param string $term The term to store n-grams for
+     * @param array $ngrams Array of n-grams for the term
+     * @param int $siteId The site ID
+     * @return void
+     */
+    protected function storeTermNgrams(string $term, array $ngrams, int $siteId): void
+    {
+        if (empty($ngrams)) {
+            return;
+        }
+
+        // Create n-gram documents for the term
+        $ngramDocs = [];
+        foreach ($ngrams as $ngram) {
+            $ngramDocs[] = [
+                'ngram' => $ngram,
+                'term' => $term,
+                'siteId' => $siteId,
+            ];
+        }
+
+        // Store n-grams in bulk
+        $this->database->selectCollection('ngrams')->insertMany($ngramDocs);
+
+        // Store n-gram count for the term
+        $this->database->selectCollection('ngram_index')->updateOne(
+            ['term' => $term, 'siteId' => $siteId],
+            ['$set' => ['ngram_count' => count($ngrams)]],
+            ['upsert' => true]
+        );
+    }
+
+    /**
+     * Get terms that have similar n-grams to the search term
+     *
+     * @param array $ngrams N-grams of the search term
+     * @param int $siteId The site ID
+     * @param float $threshold Minimum similarity threshold (0.0 - 1.0)
+     * @return array Array of [term => similarity_score]
+     */
+    protected function getTermsByNgramSimilarity(array $ngrams, int $siteId, float $threshold): array
+    {
+        if (empty($ngrams)) {
+            return [];
+        }
+
+        // Use aggregation pipeline to find similar terms
+        $pipeline = [
+            ['$match' => ['ngram' => ['$in' => $ngrams], 'siteId' => $siteId]],
+            ['$group' => ['_id' => '$term', 'match_count' => ['$sum' => 1]]],
+            ['$lookup' => [
+                'from' => 'ngram_index',
+                'localField' => '_id',
+                'foreignField' => 'term',
+                'as' => 'term_info',
+            ]],
+            ['$unwind' => '$term_info'],
+            ['$addFields' => [
+                'jaccard_similarity' => [
+                    '$divide' => [
+                        '$match_count',
+                        [
+                            '$subtract' => [
+                                ['$add' => ['$term_info.ngram_count', count($ngrams)]],
+                                '$match_count',
+                            ],
+                        ],
+                    ],
+                ],
+            ]],
+            ['$match' => ['jaccard_similarity' => ['$gte' => $threshold]]],
+            ['$sort' => ['jaccard_similarity' => -1, 'match_count' => -1]],
+            ['$limit' => 100],
+        ];
+
+        $cursor = $this->database->selectCollection('ngrams')->aggregate($pipeline);
+        $results = [];
+
+        foreach ($cursor as $doc) {
+            $results[$doc['_id']] = (float)$doc['jaccard_similarity'];
+        }
+
+        return $results;
+    }
+
+    /**
+     * Check if a term already has n-grams stored
+     *
+     * @param string $term The term to check
+     * @param int $siteId The site ID
+     * @return bool Whether the term has n-grams
+     */
+    protected function termHasNgrams(string $term, int $siteId): bool
+    {
+        $result = $this->database->selectCollection('ngram_index')->findOne([
+            'term' => $term,
+            'siteId' => $siteId,
+        ]);
+
+        return $result !== null;
+    }
+
+    /**
+     * Clear all n-grams for a site
+     *
+     * @param int $siteId The site ID
+     * @return void
+     */
+    protected function clearNgrams(int $siteId): void
+    {
+        $this->database->selectCollection('ngrams')->deleteMany(['siteId' => $siteId]);
+        $this->database->selectCollection('ngram_index')->deleteMany(['siteId' => $siteId]);
+    }
+
+    /**
+     * Remove n-grams for a specific term
+     *
+     * @param string $term The term to remove n-grams for
+     * @param int $siteId The site ID
+     * @return void
+     */
+    protected function removeTermNgrams(string $term, int $siteId): void
+    {
+        $this->database->selectCollection('ngrams')->deleteMany([
+            'term' => $term,
+            'siteId' => $siteId,
+        ]);
+        $this->database->selectCollection('ngram_index')->deleteOne([
+            'term' => $term,
+            'siteId' => $siteId,
+        ]);
     }
 }
