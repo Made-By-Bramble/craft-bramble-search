@@ -1,0 +1,14 @@
+<svg width="64" height="64" viewBox="0 0 64 64" fill="none" xmlns="http://www.w3.org/2000/svg">
+<path d="M16 0.75H48C56.4223 0.75 63.25 7.57766 63.25 16V48C63.25 56.4223 56.4223 63.25 48 63.25H16C7.57766 63.25 0.75 56.4223 0.75 48V16C0.75 7.57766 7.57766 0.75 16 0.75Z" fill="#EDE6DE"/>
+<path d="M16 0.75H48C56.4223 0.75 63.25 7.57766 63.25 16V48C63.25 56.4223 56.4223 63.25 48 63.25H16C7.57766 63.25 0.75 56.4223 0.75 48V16C0.75 7.57766 7.57766 0.75 16 0.75Z" stroke="#E6DBD1" stroke-width="1.5" stroke-linejoin="round"/>
+<path d="M32 16V20" stroke="#F55C3D" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
+<path d="M48 32H44" stroke="#F55C3D" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
+<path d="M32 48V44" stroke="#F55C3D" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
+<path d="M16 32H20" stroke="#F55C3D" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
+<path d="M42 22L46 18" stroke="#F55C3D" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
+<path d="M22 22L18 18" stroke="#F55C3D" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
+<path d="M22 42L18 46" stroke="#F55C3D" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
+<path d="M32 32L44 44" stroke="#F55C3D" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
+<circle cx="32" cy="32" r="7" fill="#F55C3D" stroke="#F55C3D" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
+<path d="M45 45L40 40" stroke="#F55C3D" stroke-width="3.5" stroke-linecap="round" stroke-linejoin="round"/>
+</svg>
