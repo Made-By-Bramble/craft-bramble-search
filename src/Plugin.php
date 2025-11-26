@@ -9,6 +9,7 @@ use craft\controllers\ElementIndexesController;
 use craft\elements\db\ElementQuery;
 use craft\events\RegisterCacheOptionsEvent;
 use craft\helpers\App;
+use craft\search\SearchQuery;
 use craft\utilities\ClearCaches;
 
 use MadeByBramble\BrambleSearch\adapters\BaseSearchAdapter;
@@ -248,7 +249,7 @@ class Plugin extends BasePlugin
             Craft::info(
                 sprintf(
                     'Bramble Search: Intercepted ElementQuery with search: "%s"',
-                    $query->search
+                    $this->normalizeSearchQueryForLogging($query->search)
                 ),
                 'bramble-search'
             );
@@ -275,7 +276,7 @@ class Plugin extends BasePlugin
                     Craft::info(
                         sprintf(
                             'Bramble Search: Modifying export query for search: "%s"',
-                            $query->search
+                            $this->normalizeSearchQueryForLogging($query->search)
                         ),
                         'bramble-search'
                     );
@@ -462,6 +463,23 @@ class Plugin extends BasePlugin
         }
 
         return null;
+    }
+
+    /**
+     * Normalizes a search query value to a string for logging.
+     *
+     * Handles both string search queries and SearchQuery objects.
+     *
+     * @param string|SearchQuery|null $search The search query value
+     * @return string The normalized search query string
+     */
+    protected function normalizeSearchQueryForLogging(string|SearchQuery|null $search): string
+    {
+        if ($search instanceof SearchQuery) {
+            return $search->getQuery();
+        }
+
+        return (string)$search;
     }
 
     /**

@@ -6,6 +6,7 @@ use Craft;
 use craft\base\ElementInterface;
 use craft\elements\db\ElementQuery;
 use craft\helpers\ElementHelper;
+use craft\search\SearchQuery;
 use craft\services\Search;
 use yii\log\Logger;
 
@@ -262,7 +263,7 @@ abstract class BaseSearchAdapter extends Search
     public function searchElements(ElementQuery $elementQuery): array
     {
         $siteId = $elementQuery->siteId ?? Craft::$app->sites->currentSite->id;
-        $searchQuery = $elementQuery->search;
+        $searchQuery = $this->normalizeSearchQueryToString($elementQuery->search);
         $tokens = $this->tokenize($searchQuery);
         $tokens = $this->filterStopWords($tokens);
 
@@ -536,6 +537,26 @@ abstract class BaseSearchAdapter extends Search
         $union = count(array_unique(array_merge($ngrams1, $ngrams2)));
 
         return $union > 0 ? $intersection / $union : 0.0;
+    }
+
+    /**
+     * Normalizes a search query value to a string for internal processing.
+     *
+     * Handles both string search queries and SearchQuery objects from Craft CMS.
+     * When Craft processes searches (especially in the asset manager), it may pass
+     * SearchQuery objects instead of strings. This method extracts the query string
+     * from SearchQuery objects so it can be used in tokenization and other string operations.
+     *
+     * @param string|SearchQuery|null $search The search query value
+     * @return string The normalized search query string
+     */
+    protected function normalizeSearchQueryToString(string|SearchQuery|null $search): string
+    {
+        if ($search instanceof SearchQuery) {
+            return $search->getQuery();
+        }
+
+        return (string)$search;
     }
 
     /**
