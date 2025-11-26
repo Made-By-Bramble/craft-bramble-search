@@ -3,16 +3,18 @@
 namespace MadeByBramble\BrambleSearch\jobs;
 
 use Craft;
+use craft\db\QueryBatcher;
 use craft\elements\Entry;
-use craft\queue\BaseJob;
+use craft\queue\BaseBatchedJob;
 
 /**
  * Rebuild Index Job
  *
  * Queue job that rebuilds the search index for a specific site.
- * Processes entries in batches to avoid memory issues.
+ * Uses Craft's batched job system to automatically split processing across
+ * multiple job executions, preventing timeouts on large sites.
  */
-class RebuildIndexJob extends BaseJob
+class RebuildIndexJob extends BaseBatchedJob
 {
     /**
      * The site ID to rebuild the index for
@@ -20,16 +22,18 @@ class RebuildIndexJob extends BaseJob
     public ?int $siteId = null;
 
     /**
-     * The batch size for processing entries to avoid memory issues
+     * The batch size for processing entries per job execution
+     * Craft will automatically create child jobs for each batch
      */
     public int $batchSize = 100;
 
     /**
-     * Execute the job
+     * Lifecycle hook: runs once before all batches are processed
+     * Clears the existing index for the site before rebuilding
      *
-     * @param \craft\queue\QueueInterface $queue The queue the job belongs to
+     * @return void
      */
-    public function execute($queue): void
+    protected function before(): void
     {
         // Get the site
         $site = Craft::$app->getSites()->getSiteById($this->siteId);
@@ -41,8 +45,24 @@ class RebuildIndexJob extends BaseJob
         // Clear the existing index for this site before rebuilding
         Craft::info("Starting index rebuild for site ID: {$site->id}", __METHOD__);
         $this->clearIndex($site->id);
+    }
 
-        // Get the total number of entries for this site
+    /**
+     * Load the data to be processed in batches
+     * Returns a QueryBatcher that will be automatically split into child jobs
+     *
+     * @return \craft\base\Batchable The batcher containing the entry query
+     */
+    public function loadData(): \craft\base\Batchable
+    {
+        // Get the site
+        $site = Craft::$app->getSites()->getSiteById($this->siteId);
+
+        if (!$site) {
+            throw new \Exception("Site with ID {$this->siteId} not found");
+        }
+
+        // Build the entry query
         // Exclude drafts, revisions, provisional drafts, and entries without titles
         $entryQuery = Entry::find()
             ->site($site)
@@ -51,38 +71,34 @@ class RebuildIndexJob extends BaseJob
             ->revisions(false)
             ->provisionalDrafts(false)
             ->andWhere(['not', ['title' => null]])
-            ->andWhere(['not', ['title' => '']]);
-        $count = $entryQuery->count();
+            ->andWhere(['not', ['title' => '']])
+            ->orderBy('id ASC'); // Required for QueryBatcher stability
 
-        if ($count === 0) {
-            return;
-        }
+        // Return a QueryBatcher that will handle the batch processing
+        return new QueryBatcher($entryQuery);
+    }
 
-        // Process entries in batches
-        $offset = 0;
-        $step = 0;
+    /**
+     * Process a single item from the batch
+     * Called once per entry by Craft's batching system
+     *
+     * @param Entry $item The entry to index
+     * @return void
+     */
+    public function processItem($item): void
+    {
+        $this->indexEntry($item);
+    }
 
-        while ($offset < $count) {
-            $entries = $entryQuery->offset($offset)->limit($this->batchSize)->all();
-
-            foreach ($entries as $i => $entry) {
-                $this->indexEntry($entry);
-
-                $this->setProgress(
-                    $queue,
-                    ($step * $this->batchSize + $i) / $count,
-                    Craft::t('bramble-search', 'Indexed {current} of {total}', [
-                        'current' => $step * $this->batchSize + $i + 1,
-                        'total' => $count,
-                    ])
-                );
-            }
-
-            $offset += $this->batchSize;
-            $step++;
-        }
-
-        Craft::info("Index rebuild completed for site ID: {$site->id}", __METHOD__);
+    /**
+     * Lifecycle hook: runs once after all batches are processed
+     * Logs completion of the index rebuild
+     *
+     * @return void
+     */
+    protected function after(): void
+    {
+        Craft::info("Index rebuild completed for site ID: {$this->siteId}", __METHOD__);
     }
 
     /**
