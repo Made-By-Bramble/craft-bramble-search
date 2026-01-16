@@ -245,6 +245,9 @@ class Plugin extends BasePlugin
      * operations and modifies them to use Bramble Search results instead of Craft's
      * default search functionality.
      *
+     * Also ensures orderBy['score'] is set when shouldCallSearchElements() returns true,
+     * to prevent Craft from accessing a non-existent array key.
+     *
      * @param Event $event The event object containing the ElementQuery
      * @return void
      */
@@ -268,6 +271,21 @@ class Plugin extends BasePlugin
 
             // Check if it's one of our adapters
             if ($searchService instanceof BaseSearchAdapter) {
+                // CRITICAL FIX: Ensure orderBy['score'] is set when shouldCallSearchElements() returns true
+                // Craft's _applySearchParam() method accesses orderBy['score'] without checking if it exists
+                // when shouldCallSearchElements() returns true, causing "Undefined array key 'score'" errors
+                if ($searchService->shouldCallSearchElements($query)) {
+                    // Initialize orderBy if it doesn't exist
+                    if (!is_array($query->orderBy)) {
+                        $query->orderBy = [];
+                    }
+                    // Set orderBy['score'] to SORT_DESC (default) if it's not already set
+                    // This prevents Craft from trying to access a non-existent array key
+                    if (!isset($query->orderBy['score'])) {
+                        $query->orderBy['score'] = SORT_DESC;
+                    }
+                }
+
                 // Get the current request
                 $request = Craft::$app->getRequest();
 

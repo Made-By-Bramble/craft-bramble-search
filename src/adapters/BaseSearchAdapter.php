@@ -4,6 +4,7 @@ namespace MadeByBramble\BrambleSearch\adapters;
 
 use Craft;
 use craft\base\ElementInterface;
+use craft\db\Query;
 use craft\elements\db\ElementQuery;
 use craft\helpers\ElementHelper;
 use craft\search\SearchQuery;
@@ -256,12 +257,18 @@ abstract class BaseSearchAdapter extends Search
     /**
      * Always use searchElements() for searches since we don't populate Craft's native searchindex table.
      *
+     * Only returns true when there's actually a search query, to avoid Craft's code path that
+     * assumes orderBy['score'] exists when shouldCallSearchElements() returns true.
+     *
      * @param ElementQuery $elementQuery
      * @return bool
      */
     public function shouldCallSearchElements(ElementQuery $elementQuery): bool
     {
-        return true;
+        // Only return true if there's actually a search query
+        // This ensures we use searchElements() for all searches while avoiding
+        // Craft's assumption that orderBy['score'] exists when this returns true
+        return !empty($elementQuery->search);
     }
 
     /**
