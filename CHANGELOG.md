@@ -1,5 +1,9 @@
 # Release Notes for Bramble Search
 
+## 1.0.3
+- Fixed "Undefined array key 'score'" error when searching elements without explicit orderBy('score')
+- Ensured orderBy['score'] is set when shouldCallSearchElements() returns true to prevent Craft from accessing non-existent array key
+
 ## 1.0.2
 - Fixed search routing to always use Bramble Search's inverted index (override `shouldCallSearchElements()`)
 - Enhanced RebuildIndexJob to index all registered element types, including Commerce Products and Variants
