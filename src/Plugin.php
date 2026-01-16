@@ -198,13 +198,13 @@ class Plugin extends BasePlugin
         Event::on(
             ClearCaches::class,
             ClearCaches::EVENT_REGISTER_CACHE_OPTIONS,
-            function(RegisterCacheOptionsEvent $event) {
+            function (RegisterCacheOptionsEvent $event) {
                 $options = $event->options;
                 $options['bramble-search'] = [
                     'label' => 'Bramble Search',
                     'key' => 'bramble-search',
                     'info' => Craft::t('bramble-search', 'Triggers a queued rebuild of the search index.'),
-                    'action' => function() {
+                    'action' => function () {
                         Craft::$app->getQueue()->push(new RebuildIndexJob([
                             'siteId' => Craft::$app->getSites()->currentSite->id,
                         ]));
@@ -226,6 +226,15 @@ class Plugin extends BasePlugin
             ElementQuery::class,
             ElementQuery::EVENT_BEFORE_PREPARE,
             [$this, 'handleElementQueryPrepare']
+        );
+
+        // Ensure new elements are indexed on creation
+        // Craft's native indexing only triggers if there are dirty fields/attributes,
+        // which might not be the case for new elements
+        // Register on the instance, not the class, to ensure it's active
+        Craft::$app->getElements()->on(
+            \craft\services\Elements::EVENT_AFTER_SAVE_ELEMENT,
+            [$this, 'handleElementSave']
         );
     }
 
@@ -463,6 +472,58 @@ class Plugin extends BasePlugin
         }
 
         return null;
+    }
+
+
+    /**
+     * Handles element save events to ensure new elements are indexed.
+     *
+     * Craft's native search indexing only triggers if there are dirty fields/attributes,
+     * which might not be detected for new elements. This handler ensures new elements
+     * are always indexed, including when they're first published from drafts.
+     *
+     * @param \craft\events\ElementEvent $event The element event
+     * @return void
+     */
+    public function handleElementSave(\craft\events\ElementEvent $event): void
+    {
+        $element = $event->element;
+        $isNew = $event->isNew ?? false;
+        $elementType = get_class($element);
+
+        // Skip drafts and revisions
+        if (\craft\helpers\ElementHelper::isDraftOrRevision($element)) {
+            return;
+        }
+
+        // Get the search service
+        $searchService = Craft::$app->getSearch();
+
+        // Check if it's one of our adapters
+        if (!($searchService instanceof BaseSearchAdapter)) {
+            return;
+        }
+
+        // Always queue indexing for enabled, non-draft elements
+        // queueIndexElement handles deduplication via the searchindexqueue table,
+        // so it's safe to call even if indexing was already queued by Craft's native system
+        // This ensures elements are indexed even when Craft's condition (dirty fields/attributes)
+        // isn't met, which commonly happens with new elements
+        if ($element->id && $element->siteId && $element->enabled) {
+            // Get all searchable field handles
+            $fieldHandles = [];
+            $fieldLayout = $element->getFieldLayout();
+            if ($fieldLayout) {
+                foreach ($fieldLayout->getCustomFields() as $field) {
+                    if ($field->searchable) {
+                        $fieldHandles[] = $field->handle;
+                    }
+                }
+            }
+
+            // Queue the indexing (this will use the queue for web requests)
+            $searchService->queueIndexElement($element, $fieldHandles);
+        }
     }
 
     /**

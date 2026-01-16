@@ -143,8 +143,10 @@ abstract class BaseSearchAdapter extends Search
             return true;
         }
 
-        // Skip entries without titles (likely section entries in Craft 5)
-        if (property_exists($element, 'title') && empty($element->title)) {
+        // Skip elements that should have titles but don't (e.g., section entries in Craft 5)
+        // Only apply this check to element types that explicitly support titles
+        $elementType = get_class($element);
+        if ($elementType::hasTitles() && empty($element->title)) {
             return true;
         }
 
@@ -248,6 +250,17 @@ abstract class BaseSearchAdapter extends Search
             'bramble-search'
         );
 
+        return true;
+    }
+
+    /**
+     * Always use searchElements() for searches since we don't populate Craft's native searchindex table.
+     *
+     * @param ElementQuery $elementQuery
+     * @return bool
+     */
+    public function shouldCallSearchElements(ElementQuery $elementQuery): bool
+    {
         return true;
     }
 

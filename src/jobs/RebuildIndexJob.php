@@ -3,8 +3,9 @@
 namespace MadeByBramble\BrambleSearch\jobs;
 
 use Craft;
-use craft\db\QueryBatcher;
-use craft\elements\Entry;
+use craft\base\ElementInterface;
+use craft\elements\db\ElementQuery;
+use MadeByBramble\BrambleSearch\jobs\MultiElementTypeBatcher;
 use craft\queue\BaseBatchedJob;
 
 /**
@@ -49,9 +50,9 @@ class RebuildIndexJob extends BaseBatchedJob
 
     /**
      * Load the data to be processed in batches
-     * Returns a QueryBatcher that will be automatically split into child jobs
+     * Returns a MultiElementTypeBatcher that processes all registered element types
      *
-     * @return \craft\base\Batchable The batcher containing the entry query
+     * @return \craft\base\Batchable The batcher containing queries for all element types
      */
     public function loadData(): \craft\base\Batchable
     {
@@ -62,32 +63,44 @@ class RebuildIndexJob extends BaseBatchedJob
             throw new \Exception("Site with ID {$this->siteId} not found");
         }
 
-        // Build the entry query
-        // Exclude drafts, revisions, provisional drafts, and entries without titles
-        $entryQuery = Entry::find()
-            ->site($site)
-            ->status(null)
-            ->drafts(false)
-            ->revisions(false)
-            ->provisionalDrafts(false)
-            ->andWhere(['not', ['title' => null]])
-            ->andWhere(['not', ['title' => '']])
-            ->orderBy('id ASC'); // Required for QueryBatcher stability
+        // Get all registered element types
+        $elementTypes = Craft::$app->getElements()->getAllElementTypes();
+        $queries = [];
 
-        // Return a QueryBatcher that will handle the batch processing
-        return new QueryBatcher($entryQuery);
+        // Build queries for each element type
+        foreach ($elementTypes as $elementType) {
+            /** @var class-string<ElementInterface> $elementType */
+            $query = $elementType::find()
+                ->site($site)
+                ->status(null)
+                ->drafts(false)
+                ->revisions(false)
+                ->provisionalDrafts(false)
+                ->orderBy('id ASC'); // Required for batch processing stability
+
+            // Only filter by title if the element type has titles
+            if ($elementType::hasTitles()) {
+                $query->andWhere(['not', ['title' => null]])
+                      ->andWhere(['not', ['title' => '']]);
+            }
+
+            $queries[] = $query;
+        }
+
+        // Return a MultiElementTypeBatcher that will handle batch processing for all element types
+        return new MultiElementTypeBatcher($queries);
     }
 
     /**
      * Process a single item from the batch
-     * Called once per entry by Craft's batching system
+     * Called once per element by Craft's batching system
      *
-     * @param Entry $item The entry to index
+     * @param ElementInterface $item The element to index
      * @return void
      */
     public function processItem($item): void
     {
-        $this->indexEntry($item);
+        $this->indexElement($item);
     }
 
     /**
@@ -112,37 +125,38 @@ class RebuildIndexJob extends BaseBatchedJob
     }
 
     /**
-     * Index a single entry in the search index
+     * Index a single element in the search index
      *
-     * @param Entry $entry The entry to index
+     * @param ElementInterface $element The element to index
      * @return bool Whether the indexing was successful
      */
-    protected function indexEntry(Entry $entry): bool
+    protected function indexElement(ElementInterface $element): bool
     {
         try {
             // Get all field handles that can be indexed
-            $fieldHandles = $this->getIndexableFieldHandles($entry);
+            $fieldHandles = $this->getIndexableFieldHandles($element);
 
-            // Use the search service to index the entry
-            return Craft::$app->getSearch()->indexElementAttributes($entry, $fieldHandles);
+            // Use the search service to index the element
+            return Craft::$app->getSearch()->indexElementAttributes($element, $fieldHandles);
         } catch (\Throwable $e) {
-            Craft::error("Error indexing entry {$entry->id}: {$e->getMessage()}", __METHOD__);
+            $elementType = get_class($element);
+            Craft::error("Error indexing {$elementType} {$element->id}: {$e->getMessage()}", __METHOD__);
             return false;
         }
     }
 
     /**
-     * Get the field handles that can be indexed for an entry
+     * Get the field handles that can be indexed for an element
      *
      * Filters fields based on their searchable property
      *
-     * @param Entry $entry The entry to get field handles for
+     * @param ElementInterface $element The element to get field handles for
      * @return array List of searchable field handles
      */
-    protected function getIndexableFieldHandles(Entry $entry): array
+    protected function getIndexableFieldHandles(ElementInterface $element): array
     {
         $fieldHandles = [];
-        $fieldLayout = $entry->getFieldLayout();
+        $fieldLayout = $element->getFieldLayout();
 
         if (!$fieldLayout) {
             return $fieldHandles;
