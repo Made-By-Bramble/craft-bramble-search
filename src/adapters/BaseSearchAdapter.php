@@ -485,7 +485,7 @@ abstract class BaseSearchAdapter extends Search
      */
     protected function getAdaptiveThreshold(string $term): float
     {
-        $termLength = mb_strlen($term);
+        $termLength = mb_strlen($term, 'UTF-8');
         $baseThreshold = $this->ngramSimilarityThreshold;
         
         // Apply scaling factor based on term length
@@ -515,28 +515,30 @@ abstract class BaseSearchAdapter extends Search
     {
         $sizes = $sizes ?? $this->ngramSizes;
         $ngrams = [];
-        
+
         // Add padding to capture word boundaries
         $paddedTerm = ' ' . $term . ' ';
-        
+
         foreach ($sizes as $size) {
             if ($size < 1) {
                 continue;
             }
-            
-            $termLength = strlen($paddedTerm);
-            
+
+            // Use mb_strlen for proper UTF-8 multibyte character handling
+            $termLength = mb_strlen($paddedTerm, 'UTF-8');
+
             // Generate n-grams of specified size
             for ($i = 0; $i <= $termLength - $size; $i++) {
-                $ngram = substr($paddedTerm, $i, $size);
-                
+                // Use mb_substr for proper UTF-8 multibyte character extraction
+                $ngram = mb_substr($paddedTerm, $i, $size, 'UTF-8');
+
                 // Skip n-grams that are just spaces
                 if (trim($ngram) !== '') {
                     $ngrams[] = $ngram;
                 }
             }
         }
-        
+
         return array_unique($ngrams);
     }
 

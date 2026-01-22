@@ -642,7 +642,7 @@ class MySqlSearchAdapter extends BaseSearchAdapter
             $batch[] = [
                 'ngram' => $ngram,
                 'term' => $term,
-                'ngram_type' => strlen($ngram),
+                'ngram_type' => mb_strlen($ngram, 'UTF-8'),
                 'siteId' => $siteId,
                 'dateCreated' => $dateTime,
                 'dateUpdated' => $dateTime,

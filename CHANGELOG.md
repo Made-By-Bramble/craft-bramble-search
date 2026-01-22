@@ -1,5 +1,8 @@
 # Release Notes for Bramble Search
 
+## 1.0.5
+- Fixed UTF-8 multibyte character handling in n-gram generation (fixes indexing of words with accented characters like café, naïve, über)
+
 ## 1.0.4
 - Fixed console command compatibility for search queries by checking request type before calling `getPathInfo()`
 
