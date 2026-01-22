@@ -1,5 +1,8 @@
 # Release Notes for Bramble Search
 
+## 1.0.4
+- Fixed console command compatibility for search queries by checking request type before calling `getPathInfo()`
+
 ## 1.0.3
 - Fixed "Undefined array key 'score'" error when searching elements without explicit orderBy('score')
 - Ensured orderBy['score'] is set when shouldCallSearchElements() returns true to prevent Craft from accessing non-existent array key

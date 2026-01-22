@@ -4,8 +4,6 @@ namespace MadeByBramble\BrambleSearch\jobs;
 
 use Craft;
 use craft\base\ElementInterface;
-use craft\elements\db\ElementQuery;
-use MadeByBramble\BrambleSearch\jobs\MultiElementTypeBatcher;
 use craft\queue\BaseBatchedJob;
 
 /**

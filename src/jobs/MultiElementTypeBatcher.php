@@ -3,8 +3,6 @@
 namespace MadeByBramble\BrambleSearch\jobs;
 
 use craft\base\Batchable;
-use craft\base\ElementInterface;
-use craft\db\QueryInterface;
 use craft\elements\db\ElementQuery;
 use yii\db\Connection as YiiConnection;
 

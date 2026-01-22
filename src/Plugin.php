@@ -198,13 +198,13 @@ class Plugin extends BasePlugin
         Event::on(
             ClearCaches::class,
             ClearCaches::EVENT_REGISTER_CACHE_OPTIONS,
-            function (RegisterCacheOptionsEvent $event) {
+            function(RegisterCacheOptionsEvent $event) {
                 $options = $event->options;
                 $options['bramble-search'] = [
                     'label' => 'Bramble Search',
                     'key' => 'bramble-search',
                     'info' => Craft::t('bramble-search', 'Triggers a queued rebuild of the search index.'),
-                    'action' => function () {
+                    'action' => function() {
                         Craft::$app->getQueue()->push(new RebuildIndexJob([
                             'siteId' => Craft::$app->getSites()->currentSite->id,
                         ]));
@@ -289,14 +289,16 @@ class Plugin extends BasePlugin
                 // Get the current request
                 $request = Craft::$app->getRequest();
 
-                // Check if this is an export request
+                // Check if this is an export request (only applicable for web requests)
                 $isExport = false;
-                $path = $request->getPathInfo();
-                if (
-                    strpos($path, 'element-indexes/export') !== false ||
-                    (strpos($path, 'actions/element-indexes/export') !== false)
-                ) {
-                    $isExport = true;
+                if ($request instanceof \craft\web\Request) {
+                    $path = $request->getPathInfo();
+                    if (
+                        strpos($path, 'element-indexes/export') !== false ||
+                        (strpos($path, 'actions/element-indexes/export') !== false)
+                    ) {
+                        $isExport = true;
+                    }
                 }
 
                 if ($isExport) {
