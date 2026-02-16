@@ -390,28 +390,66 @@ class Plugin extends BasePlugin
             return;
         }
 
-        // Create a query to perform the search
-        $query = $elementType::find();
-        $query->search = $searchQuery;
+        // Get search results (unfiltered by criteria — just the search term)
+        $searchQuery_temp = $elementType::find();
+        $searchQuery_temp->search = $searchQuery;
 
         // Set the site ID
         $siteId = Craft::$app->getRequest()->getParam('siteId');
         if (!$siteId) {
             $siteId = Craft::$app->getSites()->getCurrentSite()->id;
         }
+        $searchQuery_temp->siteId = $siteId;
+
+        $searchResults = $searchService->searchElements($searchQuery_temp);
+
+        if (empty($searchResults)) {
+            $controller->response->data = [
+                'resultSet' => $responseData['resultSet'],
+                'total' => 0,
+                'unfilteredTotal' => $responseData['unfilteredTotal'] ?? 0,
+            ];
+            return;
+        }
+
+        // Extract element IDs from search results
+        $elementIds = [];
+        foreach (array_keys($searchResults) as $key) {
+            [$elementId,] = explode('-', $key);
+            $elementIds[] = (int)$elementId;
+        }
+
+        // Build a properly filtered query using all criteria from the request,
+        // then constrain to only the IDs that matched the search
+        $query = $elementType::find();
         $query->siteId = $siteId;
 
-        // Get search results
-        $searchResults = $searchService->searchElements($query);
-        $total = count($searchResults);
+        // Apply all criteria from the request (section, status, entry type, etc.)
+        $criteria = Craft::$app->getRequest()->getParam('criteria');
+        if (is_array($criteria)) {
+            // Remove 'search' from criteria — we've already handled it via searchElements()
+            unset($criteria['search']);
+            Craft::configure($query, $criteria);
+        }
+
+        // Constrain to only the element IDs that matched our search
+        $query->id($elementIds);
+
+        // Remove the search param so Craft doesn't try to use its native search
+        $query->search = null;
+
+        // Count the filtered results
+        $total = $query->count();
 
         // Log the count update for debugging
         Craft::info(
             sprintf(
-                'Bramble Search: Updating count from %d to %d for search: "%s"',
+                'Bramble Search: Updating count from %d to %d for search: "%s" (search matched %d, after criteria filtering %d)',
                 $responseData['total'] ?? 0,
                 $total,
-                $searchQuery
+                $searchQuery,
+                count($searchResults),
+                $total
             ),
             'bramble-search'
         );
