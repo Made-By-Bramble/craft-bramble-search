@@ -1,5 +1,8 @@
 # Release Notes for Bramble Search
 
+## 1.0.7
+- Updated MySQL/MariaDB database table character sets to support accented characters
+
 ## 1.0.6
 - Fixed CP search results pagination
 
