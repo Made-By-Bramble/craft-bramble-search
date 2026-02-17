@@ -50,7 +50,7 @@ class Plugin extends BasePlugin
      *
      * @var string
      */
-    public string $schemaVersion = '1.0.0';
+    public string $schemaVersion = '1.0.1';
 
     /**
      * Indicates that the plugin has Control Panel settings.

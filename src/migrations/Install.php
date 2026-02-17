@@ -17,6 +17,7 @@ class Install extends Migration
     public function safeUp(): bool
     {
         $tablePrefix = '{{%bramble_search_';
+        $isMysql = $this->db->getDriverName() === 'mysql';
 
         // Create documents table
         if (!$this->db->tableExists($tablePrefix . 'documents}}')) {
@@ -24,7 +25,9 @@ class Install extends Migration
                 'id' => $this->primaryKey(),
                 'siteId' => $this->integer()->notNull(),
                 'elementId' => $this->integer()->notNull(),
-                'term' => $this->string(255)->notNull(),
+                'term' => $isMysql
+                    ? $this->string(255)->notNull()->append('CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_as_ci')
+                    : $this->string(255)->notNull(),
                 'frequency' => $this->integer()->notNull(),
                 'dateCreated' => $this->dateTime()->notNull(),
                 'dateUpdated' => $this->dateTime()->notNull(),
@@ -54,7 +57,9 @@ class Install extends Migration
         if (!$this->db->tableExists($tablePrefix . 'terms}}')) {
             $this->createTable($tablePrefix . 'terms}}', [
                 'id' => $this->primaryKey(),
-                'term' => $this->string(255)->notNull(),
+                'term' => $isMysql
+                    ? $this->string(255)->notNull()->append('CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_as_ci')
+                    : $this->string(255)->notNull(),
                 'docId' => $this->string(255)->notNull(),
                 'frequency' => $this->integer()->notNull(),
                 'dateCreated' => $this->dateTime()->notNull(),
@@ -87,7 +92,9 @@ class Install extends Migration
                 'id' => $this->primaryKey(),
                 'siteId' => $this->integer()->notNull(),
                 'elementId' => $this->integer()->notNull(),
-                'term' => $this->string(255)->notNull(),
+                'term' => $isMysql
+                    ? $this->string(255)->notNull()->append('CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_as_ci')
+                    : $this->string(255)->notNull(),
                 'dateCreated' => $this->dateTime()->notNull(),
                 'dateUpdated' => $this->dateTime()->notNull(),
                 'uid' => $this->uid(),
@@ -136,7 +143,9 @@ class Install extends Migration
             $this->createTable($tablePrefix . 'ngrams}}', [
                 'id' => $this->primaryKey(),
                 'ngram' => $this->string(5)->notNull(), // Max 5 chars for up to 5-grams
-                'term' => $this->string(255)->notNull(),
+                'term' => $isMysql
+                    ? $this->string(255)->notNull()->append('CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_as_ci')
+                    : $this->string(255)->notNull(),
                 'ngram_type' => $this->tinyInteger()->notNull(), // 2=bigram, 3=trigram, etc.
                 'siteId' => $this->integer()->notNull(),
                 'dateCreated' => $this->dateTime()->notNull(),
@@ -166,7 +175,9 @@ class Install extends Migration
         if (!$this->db->tableExists($tablePrefix . 'ngram_index}}')) {
             $this->createTable($tablePrefix . 'ngram_index}}', [
                 'id' => $this->primaryKey(),
-                'term' => $this->string(255)->notNull(),
+                'term' => $isMysql
+                    ? $this->string(255)->notNull()->append('CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_as_ci')
+                    : $this->string(255)->notNull(),
                 'ngram_count' => $this->integer()->notNull(),
                 'siteId' => $this->integer()->notNull(),
                 'dateCreated' => $this->dateTime()->notNull(),
