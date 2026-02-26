@@ -1,5 +1,10 @@
 # Release Notes for Bramble Search
 
+## 1.0.8
+- Fixed MySQL deadlocks during concurrent indexing by replacing DELETE+INSERT with atomic UPDATEs for metadata rows
+- Added automatic deadlock retry with random back-off for reliable concurrent indexing
+- Fixed race condition in total length tracking by using atomic SQL increment instead of read-then-write
+
 ## 1.0.7
 - Updated MySQL/MariaDB database table character sets to support accented characters
 
