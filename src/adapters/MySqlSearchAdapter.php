@@ -6,6 +6,7 @@ use Craft;
 use craft\db\Query;
 use craft\db\Table;
 use craft\helpers\StringHelper;
+use yii\db\Expression;
 
 /**
  * MySQL Search Adapter
@@ -35,6 +36,73 @@ class MySqlSearchAdapter extends BaseSearchAdapter
     public function init(): void
     {
         parent::init();
+    }
+
+    // =========================================================================
+    // CONCURRENCY HELPERS
+    // =========================================================================
+
+    /**
+     * Execute a callback with automatic retry on MySQL deadlock (error 1213).
+     *
+     * @param callable $callback The operation to execute
+     * @param int $maxRetries Maximum number of retry attempts
+     * @return mixed The callback return value
+     */
+    private function withDeadlockRetry(callable $callback, int $maxRetries = 3): mixed
+    {
+        $attempts = 0;
+        while (true) {
+            try {
+                return $callback();
+            } catch (\yii\db\Exception $e) {
+                if (str_contains($e->getMessage(), '1213') && $attempts < $maxRetries) {
+                    $attempts++;
+                    usleep(random_int(10000, 100000)); // 10–100 ms random back-off
+                    continue;
+                }
+                throw $e;
+            }
+        }
+    }
+
+    /**
+     * Atomically set a singleton metadata key (totalDocs, totalLength).
+     * Uses UPDATE first (no gap-lock), falls back to INSERT on first run.
+     *
+     * @param string $key The metadata key
+     * @param string $value The new value
+     */
+    private function upsertSingletonMeta(string $key, string $value): void
+    {
+        $db = Craft::$app->getDb();
+        $table = $this->tablePrefix . 'metadata}}';
+        $now = new \DateTime();
+        $dateTime = $now->format('Y-m-d H:i:s');
+
+        $this->withDeadlockRetry(function () use ($db, $table, $key, $value, $dateTime) {
+            $affected = $db->createCommand()
+                ->update($table, [
+                    'value' => $value,
+                    'dateUpdated' => $dateTime,
+                ], [
+                    'key' => $key,
+                ])
+                ->execute();
+
+            // Row does not exist yet (first indexing run) — insert it
+            if ($affected === 0) {
+                $db->createCommand()
+                    ->insert($table, [
+                        'key' => $key,
+                        'value' => $value,
+                        'dateCreated' => $dateTime,
+                        'dateUpdated' => $dateTime,
+                        'uid' => StringHelper::UUID(),
+                    ])
+                    ->execute();
+            }
+        });
     }
 
     // =========================================================================
@@ -232,69 +300,57 @@ class MySqlSearchAdapter extends BaseSearchAdapter
     }
 
     /**
-     * Update the total document count in MySQL
+     * Update the total document count in MySQL.
+     * Uses UPDATE instead of DELETE+INSERT to avoid deadlocks under concurrency.
      */
     protected function updateTotalDocCount(): void
     {
-        $db = Craft::$app->getDb();
         $count = (new Query())
             ->from($this->tablePrefix . 'metadata}}')
             ->where(['key' => 'doc'])
             ->count();
 
-        $now = new \DateTime();
-        $dateTime = $now->format('Y-m-d H:i:s');
-
-        // Delete existing count
-        $db->createCommand()
-            ->delete($this->tablePrefix . 'metadata}}', [
-                'key' => 'totalDocs',
-            ])
-            ->execute();
-
-        // Insert new count
-        $db->createCommand()
-            ->insert($this->tablePrefix . 'metadata}}', [
-                'key' => 'totalDocs',
-                'value' => (string)$count,
-                'dateCreated' => $dateTime,
-                'dateUpdated' => $dateTime,
-                'uid' => StringHelper::UUID(),
-            ])
-            ->execute();
+        $this->upsertSingletonMeta('totalDocs', (string)$count);
     }
 
     /**
-     * Update the total token length in MySQL
+     * Update the total token length in MySQL.
+     * Uses an atomic SQL increment to avoid both deadlocks and lost-update
+     * race conditions when multiple indexing jobs run concurrently.
      *
      * @param int $docLen The document length to add
      */
     protected function updateTotalLength(int $docLen): void
     {
         $db = Craft::$app->getDb();
-        $currentLength = $this->getTotalLength();
-        $newLength = $currentLength + $docLen;
-
+        $table = $this->tablePrefix . 'metadata}}';
         $now = new \DateTime();
         $dateTime = $now->format('Y-m-d H:i:s');
 
-        // Delete existing length
-        $db->createCommand()
-            ->delete($this->tablePrefix . 'metadata}}', [
-                'key' => 'totalLength',
-            ])
-            ->execute();
+        $this->withDeadlockRetry(function () use ($db, $table, $docLen, $dateTime) {
+            // Atomic increment — no read-then-write race condition
+            $affected = $db->createCommand()
+                ->update($table, [
+                    'value' => new Expression('CAST([[value]] AS SIGNED) + :docLen', [':docLen' => $docLen]),
+                    'dateUpdated' => $dateTime,
+                ], [
+                    'key' => 'totalLength',
+                ])
+                ->execute();
 
-        // Insert new length
-        $db->createCommand()
-            ->insert($this->tablePrefix . 'metadata}}', [
-                'key' => 'totalLength',
-                'value' => (string)$newLength,
-                'dateCreated' => $dateTime,
-                'dateUpdated' => $dateTime,
-                'uid' => StringHelper::UUID(),
-            ])
-            ->execute();
+            // Row does not exist yet (first indexing run) — insert it
+            if ($affected === 0) {
+                $db->createCommand()
+                    ->insert($table, [
+                        'key' => 'totalLength',
+                        'value' => (string)$docLen,
+                        'dateCreated' => $dateTime,
+                        'dateUpdated' => $dateTime,
+                        'uid' => StringHelper::UUID(),
+                    ])
+                    ->execute();
+            }
+        });
     }
 
     /**
@@ -584,31 +640,12 @@ class MySqlSearchAdapter extends BaseSearchAdapter
     }
 
     /**
-     * Reset the total length counter to zero in MySQL
+     * Reset the total length counter to zero in MySQL.
+     * Uses UPDATE instead of DELETE+INSERT to avoid deadlocks.
      */
     protected function resetTotalLength(): void
     {
-        $db = Craft::$app->getDb();
-        $now = new \DateTime();
-        $dateTime = $now->format('Y-m-d H:i:s');
-
-        // Delete existing length
-        $db->createCommand()
-            ->delete($this->tablePrefix . 'metadata}}', [
-                'key' => 'totalLength',
-            ])
-            ->execute();
-
-        // Insert new length
-        $db->createCommand()
-            ->insert($this->tablePrefix . 'metadata}}', [
-                'key' => 'totalLength',
-                'value' => '0',
-                'dateCreated' => $dateTime,
-                'dateUpdated' => $dateTime,
-                'uid' => StringHelper::UUID(),
-            ])
-            ->execute();
+        $this->upsertSingletonMeta('totalLength', '0');
     }
 
     // =========================================================================
