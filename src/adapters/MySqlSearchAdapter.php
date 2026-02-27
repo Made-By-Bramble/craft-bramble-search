@@ -9,7 +9,6 @@ use craft\db\Table;
 use craft\helpers\ElementHelper;
 use craft\helpers\StringHelper;
 use yii\db\Expression;
-use yii\log\Logger;
 
 /**
  * MySQL Search Adapter
@@ -313,6 +312,21 @@ class MySqlSearchAdapter extends BaseSearchAdapter
     public function refreshTotalDocCount(): void
     {
         $this->updateTotalDocCount();
+    }
+
+    /**
+     * Recalculate totalLength from actual stored document lengths.
+     * Called once after a bulk rebuild to ensure consistency.
+     */
+    public function refreshTotalLength(): void
+    {
+        $result = (new Query())
+            ->from($this->tablePrefix . 'documents}}')
+            ->where(['term' => '_length'])
+            ->sum('frequency');
+
+        $totalLength = $result ? (int)$result : 0;
+        $this->upsertSingletonMeta('totalLength', (string)$totalLength);
     }
 
     /**
@@ -929,6 +943,7 @@ class MySqlSearchAdapter extends BaseSearchAdapter
         ])->execute();
         $this->deleteDocument($siteId, $elementId);
         $this->deleteTitleTerms($siteId, $elementId);
+        $this->removeDocumentFromIndex($siteId, $elementId);
 
         // --- Store document ---
         $this->storeDocument($siteId, $elementId, $termFreqs, $docLen);

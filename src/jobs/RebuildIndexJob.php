@@ -117,14 +117,19 @@ class RebuildIndexJob extends BaseBatchedJob
     {
         $searchService = Craft::$app->getSearch();
 
-        // Update total document count once after all batches
-        if (method_exists($searchService, 'refreshTotalDocCount')) {
-            $searchService->refreshTotalDocCount();
-        }
-
-        // Disable bulk mode
-        if (property_exists($searchService, 'bulkMode')) {
-            $searchService->bulkMode = false;
+        try {
+            // Recalculate metadata once after all batches
+            if (method_exists($searchService, 'refreshTotalDocCount')) {
+                $searchService->refreshTotalDocCount();
+            }
+            if (method_exists($searchService, 'refreshTotalLength')) {
+                $searchService->refreshTotalLength();
+            }
+        } finally {
+            // Always reset bulk mode, even if metadata refresh fails
+            if (property_exists($searchService, 'bulkMode')) {
+                $searchService->bulkMode = false;
+            }
         }
 
         Craft::info("Index rebuild completed for site ID: {$this->siteId}", __METHOD__);
