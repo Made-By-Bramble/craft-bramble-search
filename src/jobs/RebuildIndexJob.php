@@ -41,6 +41,12 @@ class RebuildIndexJob extends BaseBatchedJob
             throw new \Exception("Site with ID {$this->siteId} not found");
         }
 
+        // Enable bulk mode to skip per-element updateTotalDocCount
+        $searchService = Craft::$app->getSearch();
+        if (property_exists($searchService, 'bulkMode')) {
+            $searchService->bulkMode = true;
+        }
+
         // Clear the existing index for this site before rebuilding
         Craft::info("Starting index rebuild for site ID: {$site->id}", __METHOD__);
         $this->clearIndex($site->id);
@@ -109,6 +115,18 @@ class RebuildIndexJob extends BaseBatchedJob
      */
     protected function after(): void
     {
+        $searchService = Craft::$app->getSearch();
+
+        // Update total document count once after all batches
+        if (method_exists($searchService, 'refreshTotalDocCount')) {
+            $searchService->refreshTotalDocCount();
+        }
+
+        // Disable bulk mode
+        if (property_exists($searchService, 'bulkMode')) {
+            $searchService->bulkMode = false;
+        }
+
         Craft::info("Index rebuild completed for site ID: {$this->siteId}", __METHOD__);
     }
 
