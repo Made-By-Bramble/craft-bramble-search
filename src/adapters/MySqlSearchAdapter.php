@@ -3,10 +3,13 @@
 namespace MadeByBramble\BrambleSearch\adapters;
 
 use Craft;
+use craft\base\ElementInterface;
 use craft\db\Query;
 use craft\db\Table;
+use craft\helpers\ElementHelper;
 use craft\helpers\StringHelper;
 use yii\db\Expression;
+use yii\log\Logger;
 
 /**
  * MySQL Search Adapter
@@ -25,6 +28,11 @@ class MySqlSearchAdapter extends BaseSearchAdapter
      * Table name prefix for all search tables
      */
     protected string $tablePrefix = '{{%bramble_search_';
+
+    /**
+     * When true, skip per-element updateTotalDocCount (bulk rebuild mode).
+     */
+    public bool $bulkMode = false;
 
     // =========================================================================
     // INITIALIZATION METHODS
@@ -297,6 +305,14 @@ class MySqlSearchAdapter extends BaseSearchAdapter
                 'uid' => StringHelper::UUID(),
             ])
             ->execute();
+    }
+
+    /**
+     * Public wrapper for updateTotalDocCount, callable from queue jobs.
+     */
+    public function refreshTotalDocCount(): void
+    {
+        $this->updateTotalDocCount();
     }
 
     /**
@@ -831,5 +847,228 @@ class MySqlSearchAdapter extends BaseSearchAdapter
                 'siteId' => $siteId,
             ])
             ->execute();
+    }
+
+    // =========================================================================
+    // OPTIMIZED ELEMENT INDEXING (BULK OVERRIDE)
+    // =========================================================================
+
+    /**
+     * Index element attributes using batch SQL operations.
+     *
+     * Overrides the base implementation which executes one INSERT per term
+     * and one COUNT(*) per element, causing extreme slowness on large indexes.
+     *
+     * @param ElementInterface $element The element to index
+     * @param array|null $fieldHandles The field handles to index
+     * @return bool Whether the indexing was successful
+     */
+    public function indexElementAttributes(ElementInterface $element, array|null $fieldHandles = null): bool
+    {
+        if (!$element->id || !$element->siteId || !$element->enabled) {
+            return true;
+        }
+
+        if (ElementHelper::isDraftOrRevision($element)) {
+            return true;
+        }
+
+        if (property_exists($element, 'isProvisionalDraft') && $element->isProvisionalDraft) {
+            return true;
+        }
+
+        $elementType = get_class($element);
+        if ($elementType::hasTitles() && empty($element->title)) {
+            return true;
+        }
+
+        $db = Craft::$app->getDb();
+        $now = (new \DateTime())->format('Y-m-d H:i:s');
+
+        // --- Tokenize title ---
+        $title = $element->title ?? '';
+        $titleTokens = $this->tokenize($title);
+        $titleTokens = $this->filterStopWords($titleTokens);
+        $titleTerms = array_flip($titleTokens);
+
+        // --- Build full text from searchable attributes + fields ---
+        $text = '';
+        foreach (ElementHelper::searchableAttributes($element) as $attribute) {
+            $value = $element->getSearchKeywords($attribute);
+            if (!empty($value)) {
+                $text .= ' ' . $value;
+            }
+        }
+
+        if ($fieldHandles !== null) {
+            foreach ($fieldHandles as $handle) {
+                $fieldValue = $element->getFieldValue($handle);
+                if ($fieldValue && $element->getFieldLayout()) {
+                    $field = $element->getFieldLayout()->getFieldByHandle($handle);
+                    if ($field && $field->searchable) {
+                        $keywords = $field->getSearchKeywords($fieldValue, $element);
+                        if (!empty($keywords)) {
+                            $text .= ' ' . $keywords;
+                        }
+                    }
+                }
+            }
+        }
+
+        $tokens = $this->tokenize($text);
+        $tokens = $this->filterStopWords($tokens);
+        $termFreqs = array_count_values($tokens);
+        $docLen = count($tokens);
+
+        $siteId = $element->siteId;
+        $elementId = $element->id;
+
+        // --- Clean up old data (bulk deletes) ---
+        $db->createCommand()->delete($this->tablePrefix . 'terms}}', [
+            'docId' => "$siteId:$elementId",
+        ])->execute();
+        $this->deleteDocument($siteId, $elementId);
+        $this->deleteTitleTerms($siteId, $elementId);
+
+        // --- Store document ---
+        $this->storeDocument($siteId, $elementId, $termFreqs, $docLen);
+
+        // --- Store title terms ---
+        $this->storeTitleTerms($siteId, $elementId, $titleTerms);
+
+        // --- Batch insert all term-document associations ---
+        if (!empty($termFreqs)) {
+            $termBatch = [];
+            foreach ($termFreqs as $term => $freq) {
+                $termBatch[] = [
+                    'term' => $term,
+                    'docId' => "$siteId:$elementId",
+                    'frequency' => $freq,
+                    'dateCreated' => $now,
+                    'dateUpdated' => $now,
+                    'uid' => StringHelper::UUID(),
+                ];
+            }
+            $db->createCommand()->batchInsert(
+                $this->tablePrefix . 'terms}}',
+                ['term', 'docId', 'frequency', 'dateCreated', 'dateUpdated', 'uid'],
+                $termBatch
+            )->execute();
+        }
+
+        // --- Batch n-grams: collect all new terms, generate ngrams, batch insert ---
+        $ngramBatch = [];
+        $ngramIndexBatch = [];
+        foreach (array_keys($termFreqs) as $term) {
+            if (!$this->termHasNgrams($term, $siteId)) {
+                $ngrams = $this->generateNgrams($term);
+                if (!empty($ngrams)) {
+                    foreach ($ngrams as $ngram) {
+                        $ngramBatch[] = [
+                            'ngram' => $ngram,
+                            'term' => $term,
+                            'ngram_type' => mb_strlen($ngram, 'UTF-8'),
+                            'siteId' => $siteId,
+                            'dateCreated' => $now,
+                            'dateUpdated' => $now,
+                            'uid' => StringHelper::UUID(),
+                        ];
+                    }
+                    $ngramIndexBatch[] = [
+                        'term' => $term,
+                        'ngram_count' => count($ngrams),
+                        'siteId' => $siteId,
+                        'dateCreated' => $now,
+                        'dateUpdated' => $now,
+                        'uid' => StringHelper::UUID(),
+                    ];
+                }
+            }
+        }
+        if (!empty($ngramBatch)) {
+            $db->createCommand()->batchInsert(
+                $this->tablePrefix . 'ngrams}}',
+                ['ngram', 'term', 'ngram_type', 'siteId', 'dateCreated', 'dateUpdated', 'uid'],
+                $ngramBatch
+            )->execute();
+        }
+        if (!empty($ngramIndexBatch)) {
+            foreach ($ngramIndexBatch as $row) {
+                $db->createCommand()->upsert(
+                    $this->tablePrefix . 'ngram_index}}',
+                    $row,
+                    ['ngram_count' => $row['ngram_count'], 'dateUpdated' => $now]
+                )->execute();
+            }
+        }
+
+        // --- Metadata ---
+        $this->addDocumentToIndex($siteId, $elementId);
+        $this->updateTotalLength($docLen);
+
+        if (!$this->bulkMode) {
+            $this->updateTotalDocCount();
+        }
+
+        return true;
+    }
+
+    // =========================================================================
+    // INDEX CLEARING (BULK OVERRIDE)
+    // =========================================================================
+
+    /**
+     * Clear the search index for a specific site using bulk SQL operations.
+     *
+     * Overrides the base implementation which deletes documents one by one,
+     * causing timeouts on large indexes (250K+ documents).
+     *
+     * @param int $siteId The site ID
+     * @return bool Whether the operation was successful
+     */
+    public function clearIndex(int $siteId): bool
+    {
+        try {
+            $db = Craft::$app->getDb();
+
+            // Bulk delete all documents for this site
+            $db->createCommand()
+                ->delete($this->tablePrefix . 'documents}}', ['siteId' => $siteId])
+                ->execute();
+
+            // Bulk delete all titles for this site
+            $db->createCommand()
+                ->delete($this->tablePrefix . 'titles}}', ['siteId' => $siteId])
+                ->execute();
+
+            // Bulk delete all terms whose docId starts with this siteId
+            $db->createCommand()
+                ->delete($this->tablePrefix . 'terms}}', [
+                    'LIKE', 'docId', "$siteId:%", false,
+                ])
+                ->execute();
+
+            // Bulk delete metadata doc entries for this site
+            $db->createCommand()
+                ->delete($this->tablePrefix . 'metadata}}', [
+                    'AND',
+                    ['key' => 'doc'],
+                    ['LIKE', 'value', "$siteId:%", false],
+                ])
+                ->execute();
+
+            // Clear n-grams for this site
+            $this->clearNgrams($siteId);
+
+            // Reset totals
+            $this->resetTotalLength();
+            $this->updateTotalDocCount();
+
+            Craft::info("Search index cleared (bulk) for site ID: $siteId", __METHOD__);
+            return true;
+        } catch (\Throwable $e) {
+            Craft::error("Error clearing search index: " . $e->getMessage(), __METHOD__);
+            return false;
+        }
     }
 }
