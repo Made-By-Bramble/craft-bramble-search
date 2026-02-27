@@ -1,5 +1,14 @@
 # Release Notes for Bramble Search
 
+## 1.0.9
+- Optimised MySQL adapter for large-scale index rebuilds (250K+ documents) by replacing per-document operations with bulk SQL
+- Added bulk `clearIndex()` override using direct DELETE statements instead of iterating documents one by one
+- Added batched `indexElementAttributes()` override using `batchInsert()` for term and n-gram storage
+- Added `bulkMode` flag to defer `updateTotalDocCount` during rebuilds, called once in `after()` instead of per element
+- Added `refreshTotalLength()` to recalculate total length from stored document data after rebuild
+- Fixed duplicate metadata rows caused by missing `removeDocumentFromIndex` call during re-indexing
+- Ensured `bulkMode` is always reset via `try/finally` even if the rebuild job fails
+
 ## 1.0.8
 - Fixed MySQL deadlocks during concurrent indexing by replacing DELETE+INSERT with atomic UPDATEs for metadata rows
 - Added automatic deadlock retry with random back-off for reliable concurrent indexing
