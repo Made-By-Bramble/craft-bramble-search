@@ -37,6 +37,11 @@ class Settings extends Model
     public string|null $redisPassword = null;
 
     /**
+     * Redis key prefix (allows multiple Bramble sites to share the same Redis instance/DB).
+     */
+    public string $redisKeyPrefix = 'bramble_search:';
+
+    /**
      * MongoDB connection URI
      */
     public string $mongoDbUri = 'mongodb://localhost:27017';
