@@ -103,6 +103,22 @@
         value: settings.redisPassword,
         errors: settings.getErrors('redisPassword'),
     }) }}
+
+    {% set envKeyPrefix = parseEnv('$BRAMBLE_SEARCH_REDIS_KEY_PREFIX') %}
+    {% set hasEnvKeyPrefix = envKeyPrefix is not empty and envKeyPrefix != '$BRAMBLE_SEARCH_REDIS_KEY_PREFIX' %}
+    {{ forms.textField({
+        label: "Redis Key Prefix"|t('bramble-search'),
+        instructions: "Prefix used for all Redis keys. Allows multiple Bramble-enabled sites to share the same Redis instance/database without collisions."|t('bramble-search'),
+        tip: "Default 'bramble_search:'. Change it (e.g. 'bramble_search_mysite:') if you share Redis with another site. Can be overridden with the BRAMBLE_SEARCH_REDIS_KEY_PREFIX environment variable."|t('bramble-search'),
+        warning: hasEnvKeyPrefix
+            ? ("Currently overridden by the BRAMBLE_SEARCH_REDIS_KEY_PREFIX environment variable: " ~ envKeyPrefix)|t('bramble-search')
+            : null,
+        id: 'redisKeyPrefix',
+        name: 'redisKeyPrefix',
+        placeholder: 'bramble_search:',
+        value: settings.redisKeyPrefix,
+        errors: settings.getErrors('redisKeyPrefix'),
+    }) }}
 </div>
 
 <div id="storage-mongodb" class="{% if settings.storageDriver != 'mongodb' %}hidden{% endif %}">
