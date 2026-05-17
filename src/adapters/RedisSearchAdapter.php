@@ -39,6 +39,10 @@ class RedisSearchAdapter extends BaseSearchAdapter
         $redisHost = App::parseEnv('$BRAMBLE_SEARCH_REDIS_HOST') ?: $settings->redisHost;
         $redisPort = (int)(App::parseEnv('$BRAMBLE_SEARCH_REDIS_PORT') ?: $settings->redisPort);
         $redisPassword = App::parseEnv('$BRAMBLE_SEARCH_REDIS_PASSWORD') ?: $settings->redisPassword;
+        $redisKeyPrefix = App::parseEnv('$BRAMBLE_SEARCH_REDIS_KEY_PREFIX') ?: $settings->redisKeyPrefix;
+        if ($redisKeyPrefix !== '') {
+            $this->prefix = $redisKeyPrefix;
+        }
 
         $this->redis = new Redis();
         $this->redis->connect($redisHost, $redisPort);
