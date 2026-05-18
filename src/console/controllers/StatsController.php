@@ -6,6 +6,11 @@ use Craft;
 use craft\console\Controller;
 use craft\helpers\Console;
 use MadeByBramble\BrambleSearch\adapters\BaseSearchAdapter;
+use MadeByBramble\BrambleSearch\adapters\CraftCacheSearchAdapter;
+use MadeByBramble\BrambleSearch\adapters\FileSearchAdapter;
+use MadeByBramble\BrambleSearch\adapters\MongoDbSearchAdapter;
+use MadeByBramble\BrambleSearch\adapters\MySqlSearchAdapter;
+use MadeByBramble\BrambleSearch\adapters\RedisSearchAdapter;
 use yii\console\ExitCode;
 
 /**
@@ -59,7 +64,14 @@ class StatsController extends Controller
      */
     public function actionIndex(): int
     {
-        $searchService = Craft::$app->getSearch();
+        try {
+            $searchService = $this->driver
+                ? $this->createAdapterForDriver($this->driver)
+                : Craft::$app->getSearch();
+        } catch (\Throwable $e) {
+            $this->stderr('Unable to initialize Bramble Search adapter: ' . $e->getMessage() . PHP_EOL, Console::FG_RED);
+            return ExitCode::UNSPECIFIED_ERROR;
+        }
 
         // Check if the search service is a Bramble Search adapter
         if (!($searchService instanceof BaseSearchAdapter)) {
@@ -100,6 +112,24 @@ class StatsController extends Controller
 
         $this->stdout('Done!' . PHP_EOL, Console::FG_GREEN);
         return ExitCode::OK;
+    }
+
+    /**
+     * Creates a Bramble Search adapter for an explicit stats driver option.
+     *
+     * @param string $driver Storage driver handle
+     * @return BaseSearchAdapter
+     */
+    protected function createAdapterForDriver(string $driver): BaseSearchAdapter
+    {
+        return match ($driver) {
+            'redis' => new RedisSearchAdapter(),
+            'file' => new FileSearchAdapter(),
+            'mysql' => new MySqlSearchAdapter(),
+            'mongodb' => new MongoDbSearchAdapter(),
+            'craft' => new CraftCacheSearchAdapter(),
+            default => throw new \InvalidArgumentException("Unsupported storage driver: $driver"),
+        };
     }
 
     /**
