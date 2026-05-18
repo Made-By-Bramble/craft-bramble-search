@@ -10,11 +10,65 @@ on:
       - craftcms/new-release
 
 jobs:
-  build:
+  create-release:
     runs-on: ubuntu-latest
     permissions:
       contents: write
     steps:
+      - name: Resolve version branch
+        id: version
+        shell: bash
+        env:
+          RELEASE_TAG: ${{ github.event.client_payload.tag }}
+          RELEASE_VERSION: ${{ github.event.client_payload.version }}
+        run: |
+          set -euo pipefail
+
+          version="${RELEASE_TAG:-$RELEASE_VERSION}"
+          version="${version#v}"
+          major="${version%%.*}"
+
+          case "$major" in
+            1)
+              branch="1.x"
+              ;;
+            2)
+              branch="2.x"
+              ;;
+            *)
+              echo "::error::Unsupported release major version '$major'. Expected a 1.x or 2.x release."
+              exit 1
+              ;;
+          esac
+
+          echo "branch=$branch" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Verify release tag belongs to version branch
+        shell: bash
+        env:
+          RELEASE_TAG: ${{ github.event.client_payload.tag }}
+          VERSION_BRANCH: ${{ steps.version.outputs.branch }}
+        run: |
+          set -euo pipefail
+
+          if [ -z "$RELEASE_TAG" ]; then
+            echo "::error::Release payload did not include a tag."
+            exit 1
+          fi
+
+          git fetch --force origin "refs/heads/${VERSION_BRANCH}:refs/remotes/origin/${VERSION_BRANCH}" --tags
+
+          tag_commit="$(git rev-list -n 1 "$RELEASE_TAG")"
+
+          if ! git merge-base --is-ancestor "$tag_commit" "origin/${VERSION_BRANCH}"; then
+            echo "::error::Release tag '$RELEASE_TAG' does not belong to the ${VERSION_BRANCH} branch."
+            exit 1
+          fi
+
       - uses: ncipollo/release-action@v1
         with:
           body: ${{ github.event.client_payload.notes }}
