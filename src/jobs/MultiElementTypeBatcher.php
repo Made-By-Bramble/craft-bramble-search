@@ -4,7 +4,6 @@ namespace MadeByBramble\BrambleSearch\jobs;
 
 use craft\base\Batchable;
 use craft\elements\db\ElementQuery;
-use yii\db\Connection as YiiConnection;
 
 /**
  * MultiElementTypeBatcher
@@ -20,30 +19,18 @@ class MultiElementTypeBatcher implements Batchable
     private array $queries;
 
     /**
-     * @var int Current query index
-     */
-    private int $currentQueryIndex = 0;
-
-    /**
      * @var int Total count across all queries (cached)
      */
     private ?int $totalCount = null;
 
     /**
-     * @var YiiConnection|null Database connection
-     */
-    private ?YiiConnection $db;
-
-    /**
      * Constructor
      *
      * @param ElementQuery[] $queries Array of element queries to process
-     * @param YiiConnection|null $db Database connection
      */
-    public function __construct(array $queries, ?YiiConnection $db = null)
+    public function __construct(array $queries)
     {
         $this->queries = $queries;
-        $this->db = $db;
     }
 
     /**

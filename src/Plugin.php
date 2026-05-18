@@ -43,7 +43,7 @@ class Plugin extends BasePlugin
      * Static reference to the plugin instance.
      * Used for accessing the plugin instance throughout the application.
      *
-     * @var Plugin
+     * @var self|null
      */
     public static $plugin;
 
