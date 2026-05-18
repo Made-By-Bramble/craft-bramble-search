@@ -87,7 +87,7 @@ class MySqlSearchAdapter extends BaseSearchAdapter
         $now = new \DateTime();
         $dateTime = $now->format('Y-m-d H:i:s');
 
-        $this->withDeadlockRetry(function () use ($db, $table, $key, $value, $dateTime) {
+        $this->withDeadlockRetry(function() use ($db, $table, $key, $value, $dateTime) {
             $affected = $db->createCommand()
                 ->update($table, [
                     'value' => $value,
@@ -357,7 +357,7 @@ class MySqlSearchAdapter extends BaseSearchAdapter
         $now = new \DateTime();
         $dateTime = $now->format('Y-m-d H:i:s');
 
-        $this->withDeadlockRetry(function () use ($db, $table, $docLen, $dateTime) {
+        $this->withDeadlockRetry(function() use ($db, $table, $docLen, $dateTime) {
             // Atomic increment — no read-then-write race condition
             $affected = $db->createCommand()
                 ->update($table, [

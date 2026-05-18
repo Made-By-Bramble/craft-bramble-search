@@ -37,6 +37,11 @@ class Settings extends Model
     public string|null $redisPassword = null;
 
     /**
+     * Redis key prefix
+     */
+    public string $redisKeyPrefix = 'bramble_search:';
+
+    /**
      * MongoDB connection URI
      */
     public string $mongoDbUri = 'mongodb://localhost:27017';
@@ -94,6 +99,7 @@ class Settings extends Model
       [['redisHost', 'redisPort'], 'required', 'when' => function($model) {
           return $model->storageDriver === 'redis';
       }],
+      ['redisKeyPrefix', 'string'],
       ['redisPort', 'integer', 'min' => 1, 'max' => 65535],
       [['mongoDbUri', 'mongoDbDatabase'], 'required', 'when' => function($model) {
           return $model->storageDriver === 'mongodb';

@@ -1,5 +1,9 @@
 # Release Notes for Bramble Search
 
+## 1.0.10
+- Added configurable Redis key prefixes to isolate indexes when multiple Craft installs share one Redis database
+- Fixed Control Panel search pagination counts so active element index source constraints are preserved
+
 ## 1.0.9
 - Optimised MySQL adapter for large-scale index rebuilds (250K+ documents) by replacing per-document operations with bulk SQL
 - Added bulk `clearIndex()` override using direct DELETE statements instead of iterating documents one by one

@@ -9,7 +9,10 @@ use craft\controllers\ElementIndexesController;
 use craft\elements\db\ElementQuery;
 use craft\events\RegisterCacheOptionsEvent;
 use craft\helpers\App;
+use craft\helpers\Component;
+use craft\helpers\ElementHelper;
 use craft\search\SearchQuery;
+use craft\services\ElementSources;
 use craft\utilities\ClearCaches;
 
 use MadeByBramble\BrambleSearch\adapters\BaseSearchAdapter;
@@ -419,24 +422,23 @@ class Plugin extends BasePlugin
             $elementIds[] = (int)$elementId;
         }
 
-        // Build a properly filtered query using all criteria from the request,
-        // then constrain to only the IDs that matched the search
-        $query = $elementType::find();
+        // Start from Craft's prepared element index query so active sources,
+        // base criteria, custom sources, filters, and user criteria are preserved.
+        /** @var ElementQuery $query */
+        $query = clone $controller->getElementQuery();
         $query->siteId = $siteId;
 
-        // Apply all criteria from the request (section, status, entry type, etc.)
-        $criteria = Craft::$app->getRequest()->getParam('criteria');
-        if (is_array($criteria)) {
-            // Remove 'search' from criteria — we've already handled it via searchElements()
-            unset($criteria['search']);
-            Craft::configure($query, $criteria);
-        }
+        // Native source criteria can be supplied only by the source key, so make
+        // sure the replacement count query has the same source constraint.
+        $this->applySourceCriteriaFromRequest($query, $elementType);
 
         // Constrain to only the element IDs that matched our search
         $query->id($elementIds);
 
         // Remove the search param so Craft doesn't try to use its native search
         $query->search = null;
+        $query->offset(null);
+        $query->limit(null);
 
         // Count the filtered results
         $total = $query->count();
@@ -460,6 +462,30 @@ class Plugin extends BasePlugin
             'total' => $total,
             'unfilteredTotal' => $responseData['unfilteredTotal'] ?? $total,
         ];
+    }
+
+    /**
+     * Applies the active element index source criteria to a replacement count query.
+     *
+     * @param ElementQuery $query The query being used for the replacement count
+     * @param string $elementType The element type class from the request
+     * @return void
+     */
+    protected function applySourceCriteriaFromRequest(ElementQuery $query, string $elementType): void
+    {
+        $request = Craft::$app->getRequest();
+        $sourceKey = $request->getParam('source');
+        if (!$sourceKey || $sourceKey === '__IMP__') {
+            return;
+        }
+
+        $context = $request->getParam('context') ?: ElementSources::CONTEXT_INDEX;
+        $source = ElementHelper::findSource($elementType, $sourceKey, $context);
+        $criteria = $source['criteria'] ?? null;
+
+        if (is_array($criteria)) {
+            Craft::configure($query, Component::cleanseConfig($criteria));
+        }
     }
 
     /**

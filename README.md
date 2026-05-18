@@ -70,6 +70,7 @@ return [
     'redisHost' => 'localhost',
     'redisPort' => 6379,
     'redisPassword' => null,
+    'redisKeyPrefix' => 'bramble_search:',
 
     // MongoDB connection settings (only needed if using MongoDB driver)
     'mongoDbUri' => 'mongodb://localhost:27017',
@@ -93,6 +94,7 @@ All settings can be overridden using environment variables:
 - `BRAMBLE_SEARCH_REDIS_HOST` - Redis host
 - `BRAMBLE_SEARCH_REDIS_PORT` - Redis port
 - `BRAMBLE_SEARCH_REDIS_PASSWORD` - Redis password
+- `BRAMBLE_SEARCH_REDIS_KEY_PREFIX` - Redis key prefix, useful when multiple sites share a Redis database
 - `BRAMBLE_SEARCH_MONGODB_URI` - MongoDB connection URI
 - `BRAMBLE_SEARCH_MONGODB_DATABASE` - MongoDB database name
 
