@@ -5,6 +5,3 @@
 .env
 /node_modules
 /vendor
-
-# Claude Code context file
-CLAUDE.md
