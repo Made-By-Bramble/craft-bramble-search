@@ -505,8 +505,28 @@ class CraftCacheSearchAdapter extends BaseSearchAdapter
      */
     protected function getTermsByNgramSimilarity(array $ngrams, int $siteId, float $threshold): array
     {
-        // Simple fallback - cache adapter will use brute force fuzzy search
-        return [];
+        if (empty($ngrams)) {
+            return [];
+        }
+
+        $ngrams = array_values(array_unique($ngrams));
+        $matches = [];
+
+        foreach ($this->getAllTerms() as $term) {
+            $termNgrams = Craft::$app->cache->get($this->prefix . "ngrams:{$siteId}:{$term}");
+            if ($termNgrams === false || !is_array($termNgrams)) {
+                continue;
+            }
+
+            $similarity = $this->calculateNgramSimilarity($ngrams, array_values(array_unique($termNgrams)));
+            if ($similarity >= $threshold) {
+                $matches[$term] = $similarity;
+            }
+        }
+
+        arsort($matches);
+
+        return $matches;
     }
 
     /**

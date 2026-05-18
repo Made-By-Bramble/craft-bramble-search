@@ -183,15 +183,18 @@ abstract class BaseSearchAdapter extends Search
         // Process custom fields if specified
         if ($fieldHandles !== null) {
             foreach ($fieldHandles as $handle) {
+                $fieldLayout = $element->getFieldLayout();
+                $field = $fieldLayout?->getFieldByHandle($handle);
+                if (!$field || !$field->searchable) {
+                    continue;
+                }
+
                 $fieldValue = $element->getFieldValue($handle);
-                if ($fieldValue && $element->getFieldLayout()) {
-                    $field = $element->getFieldLayout()->getFieldByHandle($handle);
-                    if ($field && $field->searchable) {
-                        $keywords = $field->getSearchKeywords($fieldValue, $element);
-                        if (!empty($keywords)) {
-                            $text .= ' ' . $keywords;
-                            $logData['fields'][$handle] = $keywords;
-                        }
+                if ($fieldValue) {
+                    $keywords = $field->getSearchKeywords($fieldValue, $element);
+                    if (!empty($keywords)) {
+                        $text .= ' ' . $keywords;
+                        $logData['fields'][$handle] = $keywords;
                     }
                 }
             }
@@ -332,7 +335,7 @@ abstract class BaseSearchAdapter extends Search
                 }
             } else {
                 // Fuzzy fallback if no exact matches
-                $fuzzyTerms = $this->findFuzzyMatches($term);
+                $fuzzyTerms = $this->findFuzzyMatches($term, siteId: (int)$siteId);
                 foreach ($fuzzyTerms as $fuzzy) {
                     $fuzzyDocs = $this->getTermDocuments($fuzzy);
                     if (empty($fuzzyDocs)) {
@@ -449,7 +452,7 @@ abstract class BaseSearchAdapter extends Search
      * @param int $maxDistance Maximum Levenshtein distance for matches
      * @return array List of matching terms
      */
-    protected function findFuzzyMatches(string $term, int $maxDistance = 2): array
+    protected function findFuzzyMatches(string $term, int $maxDistance = 2, ?int $siteId = null): array
     {
         // Generate n-grams for the search term
         $searchNgrams = $this->generateNgrams($term);
@@ -459,7 +462,7 @@ abstract class BaseSearchAdapter extends Search
         }
 
         // Get candidate terms with high n-gram similarity
-        $siteId = Craft::$app->getSites()->getCurrentSite()->id ?? 1;
+        $siteId ??= Craft::$app->getSites()->getCurrentSite()->id ?? 1;
         
         // Use adaptive threshold based on term length for better short-term support
         $adaptiveThreshold = $this->getAdaptiveThreshold($term);
@@ -539,7 +542,7 @@ abstract class BaseSearchAdapter extends Search
             }
         }
 
-        return array_unique($ngrams);
+        return array_values(array_unique($ngrams));
     }
 
     /**
@@ -558,7 +561,7 @@ abstract class BaseSearchAdapter extends Search
         $intersection = count(array_intersect($ngrams1, $ngrams2));
         $union = count(array_unique(array_merge($ngrams1, $ngrams2)));
 
-        return $union > 0 ? $intersection / $union : 0.0;
+        return $intersection / $union;
     }
 
     /**

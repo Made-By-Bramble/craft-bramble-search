@@ -1089,8 +1089,35 @@ class FileSearchAdapter extends BaseSearchAdapter
      */
     protected function getTermsByNgramSimilarity(array $ngrams, int $siteId, float $threshold): array
     {
-        // Simple implementation - just fallback to brute force for file adapter
-        return [];
+        if (empty($ngrams)) {
+            return [];
+        }
+
+        $ngrams = array_values(array_unique($ngrams));
+        $matches = [];
+
+        foreach ($this->getAllTerms() as $term) {
+            $termNgramsPath = $this->baseDir . "/ngrams/site{$siteId}/{$term}.dat";
+            $data = $this->readFile($termNgramsPath);
+
+            if ($data === false) {
+                continue;
+            }
+
+            $termNgrams = $this->decodeData($data);
+            if (!is_array($termNgrams)) {
+                continue;
+            }
+
+            $similarity = $this->calculateNgramSimilarity($ngrams, array_values(array_unique($termNgrams)));
+            if ($similarity >= $threshold) {
+                $matches[$term] = $similarity;
+            }
+        }
+
+        arsort($matches);
+
+        return $matches;
     }
 
     /**

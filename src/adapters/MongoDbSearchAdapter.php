@@ -583,6 +583,8 @@ class MongoDbSearchAdapter extends BaseSearchAdapter
             return;
         }
 
+        $ngrams = array_values(array_unique($ngrams));
+
         // Create n-gram documents for the term
         $ngramDocs = [];
         foreach ($ngrams as $ngram) {
@@ -617,6 +619,8 @@ class MongoDbSearchAdapter extends BaseSearchAdapter
         if (empty($ngrams)) {
             return [];
         }
+
+        $ngrams = array_values(array_unique($ngrams));
 
         // Use aggregation pipeline to find similar terms
         $pipeline = [

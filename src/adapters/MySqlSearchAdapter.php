@@ -916,14 +916,17 @@ class MySqlSearchAdapter extends BaseSearchAdapter
 
         if ($fieldHandles !== null) {
             foreach ($fieldHandles as $handle) {
+                $fieldLayout = $element->getFieldLayout();
+                $field = $fieldLayout?->getFieldByHandle($handle);
+                if (!$field || !$field->searchable) {
+                    continue;
+                }
+
                 $fieldValue = $element->getFieldValue($handle);
-                if ($fieldValue && $element->getFieldLayout()) {
-                    $field = $element->getFieldLayout()->getFieldByHandle($handle);
-                    if ($field && $field->searchable) {
-                        $keywords = $field->getSearchKeywords($fieldValue, $element);
-                        if (!empty($keywords)) {
-                            $text .= ' ' . $keywords;
-                        }
+                if ($fieldValue) {
+                    $keywords = $field->getSearchKeywords($fieldValue, $element);
+                    if (!empty($keywords)) {
+                        $text .= ' ' . $keywords;
                     }
                 }
             }

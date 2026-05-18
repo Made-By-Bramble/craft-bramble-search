@@ -1,5 +1,6 @@
 {
   "name": "madebybramble/craft-bramble-search",
+  "description": "Bramble Search plugin for Craft CMS.",
   "type": "craft-plugin",
   "license": "proprietary",
   "support": {
@@ -7,7 +8,8 @@
   },
   "require": {
     "php": ">=8.2",
-    "craftcms/cms": "^5.5.0"
+    "craftcms/cms": "^5.5.0",
+    "mongodb/mongodb": "^1.15 || ^2.0"
   },
   "suggest": {
     "ext-redis": "Required for Redis storage adapter",
