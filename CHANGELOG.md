@@ -1,5 +1,14 @@
 # Release Notes for Bramble Search
 
+## 1.0.11
+- Fixed fuzzy search for file and Craft cache storage drivers by using stored n-gram similarity data.
+- Fixed fuzzy search lookups so candidate terms are scoped to the element query site.
+- Fixed MongoDB fuzzy search by normalising n-gram arrays before storage and aggregation queries.
+- Fixed indexing when Craft passes native or stale field handles by ignoring non-custom or non-searchable field handles before reading field values.
+- Fixed stats command driver selection so `--driver` uses the requested storage adapter.
+- Added MongoDB library dependency required by the MongoDB storage adapter.
+- Added Craft 5 feature and live-field test coverage for all standard field types, multi-site language search, fuzzy search, queue indexing, settings rendering, and all storage drivers.
+
 ## 1.0.10
 - Added configurable Redis key prefixes to isolate indexes when multiple Craft installs share one Redis database
 - Fixed Control Panel search pagination counts so active element index source constraints are preserved
