@@ -1,5 +1,8 @@
 # Release Notes for Bramble Search
 
+## 1.0.12
+- Fixed Composer installs by making the MongoDB library an optional suggested package instead of a default requirement.
+
 ## 1.0.11
 - Fixed fuzzy search for file and Craft cache storage drivers by using stored n-gram similarity data.
 - Fixed fuzzy search lookups so candidate terms are scoped to the element query site.
