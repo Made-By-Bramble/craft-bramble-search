@@ -162,7 +162,7 @@ function matrix_ensure_second_site(Section $section): Site
     return $site;
 }
 
-function matrix_create_entry(Section $section, int $siteId, string $title): Entry
+function matrix_create_entry(Section $section, int $siteId, string $title, ?string $slug = null): Entry
 {
     $entryTypes = $section->getEntryTypes();
     $entryType = $entryTypes[0] ?? null;
@@ -173,11 +173,11 @@ function matrix_create_entry(Section $section, int $siteId, string $title): Entr
     $entry->typeId = $entryType->id;
     $entry->siteId = $siteId;
     $entry->title = $title;
-    $entry->slug = StringHelper::slugify($title);
+    $entry->slug = $slug ?? StringHelper::slugify($title);
     $entry->enabled = true;
     $entry->enabledForSite = true;
 
-    matrix_assert(Craft::$app->getElements()->saveElement($entry, false, true, false), 'Failed to save fixture entry', [
+    matrix_assert(Craft::$app->getElements()->saveElement($entry, false, false, false), 'Failed to save fixture entry', [
         'title' => $title,
         'errors' => $entry->getErrors(),
     ]);
@@ -406,19 +406,21 @@ function matrix_run_driver(string $driver, string $token, array $entriesBySite, 
     $fuzzy = matrix_search_ids($adapter, 'lavendr', $site1);
     matrix_assert(in_array($entriesBySite[$site1]['lavender']->id . "-$site1", $fuzzy, true), "$driver fuzzy search failed", ['ids' => $fuzzy]);
 
-    $offsiteExactDocs = matrix_reflect($adapter, 'getTermDocuments', 'antibioti');
+    $exactTypoDocs = matrix_reflect($adapter, 'getTermDocuments', 'antibioti');
     matrix_assert(
-        isset($offsiteExactDocs[$site2 . ':' . $entriesBySite[$site2]['antibioti']->id])
-            && !isset($offsiteExactDocs[$site1 . ':' . $entriesBySite[$site1]['antibiotic']->id]),
-        "$driver fuzzy fallback fixture did not create the expected off-site exact term",
-        ['docs' => $offsiteExactDocs]
+        isset($exactTypoDocs[$site1 . ':' . $entriesBySite[$site1]['antibioti']->id])
+            && isset($exactTypoDocs[$site2 . ':' . $entriesBySite[$site2]['antibioti']->id])
+            && !isset($exactTypoDocs[$site1 . ':' . $entriesBySite[$site1]['antibiotic']->id]),
+        "$driver fuzzy fixture did not create the expected exact typo terms",
+        ['docs' => $exactTypoDocs]
     );
 
-    $fuzzyWithOffsiteExact = matrix_search_ids($adapter, 'antibioti', $site1);
+    $fuzzyWithExactTypo = matrix_search_ids($adapter, 'antibioti', $site1);
     matrix_assert(
-        in_array($entriesBySite[$site1]['antibiotic']->id . "-$site1", $fuzzyWithOffsiteExact, true),
-        "$driver fuzzy search skipped fallback when an exact match existed on another site",
-        ['ids' => $fuzzyWithOffsiteExact]
+        in_array($entriesBySite[$site1]['antibiotic']->id . "-$site1", $fuzzyWithExactTypo, true)
+            && in_array($entriesBySite[$site1]['antibioti']->id . "-$site1", $fuzzyWithExactTypo, true),
+        "$driver fuzzy search skipped close matches when an exact typo existed on the same site",
+        ['ids' => $fuzzyWithExactTypo]
     );
 
     $whyTerms = matrix_reflect($adapter, 'getDocumentTerms', $site1, $entriesBySite[$site1]['why']->id);
@@ -532,7 +534,7 @@ function matrix_run_driver(string $driver, string $token, array $entriesBySite, 
     matrix_pass("$driver driver matrix", [
         'exact' => $exact,
         'fuzzy' => $fuzzy,
-        'fuzzyWithOffsiteExact' => $fuzzyWithOffsiteExact,
+        'fuzzyWithExactTypo' => $fuzzyWithExactTypo,
         'titleStopWord' => $titleStopWord,
         'count' => $count,
         'fields' => count($fields),
@@ -587,7 +589,8 @@ try {
             'lavender' => matrix_create_entry($section, $site1, "Beta Lavender Beacon Pageprobe $token"),
             'cedar' => matrix_create_entry($section, $site1, "Gamma Cedar Pageprobe $token"),
             'delete' => matrix_create_entry($section, $site1, "Delta Deleteprobe Pageprobe $token"),
-            'antibiotic' => matrix_create_entry($section, $site1, "Antibiotic Oil $token"),
+            'antibiotic' => matrix_create_entry($section, $site1, 'Antibiotic Oil', "antibiotic-oil-$token"),
+            'antibioti' => matrix_create_entry($section, $site1, "Antibioti Exact $token"),
             'why' => matrix_create_entry($section, $site1, "Why do you sell the supplements you sell? $token"),
         ],
         $site2 => [

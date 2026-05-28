@@ -57,12 +57,12 @@ abstract class BaseSearchAdapter extends Search
     /**
      * N-gram sizes to generate for fuzzy matching
      */
-    protected array $ngramSizes = [2, 3];
+    protected array $ngramSizes = [1, 2, 3];
 
     /**
      * Minimum n-gram similarity threshold for fuzzy search candidates
      */
-    protected float $ngramSimilarityThreshold = 0.4;
+    protected float $ngramSimilarityThreshold = 0.25;
 
     /**
      * Maximum number of candidates to process for fuzzy matching
@@ -199,14 +199,11 @@ abstract class BaseSearchAdapter extends Search
             }
         }
 
-        $tokens = $this->tokenize($text);
-        $tokens = $this->filterStopWords($tokens);
-        $tokens = array_merge($tokens, $this->getStopWords($titleTokens));
-        $termFreqs = array_count_values($tokens);
-        $docLen = count($tokens);
+        $termFreqs = $this->buildIndexedTermFrequencies($text, $titleTokens);
+        $docLen = array_sum($termFreqs);
 
         // Add tokenization results to log data
-        $logData['allTokens'] = $tokens;
+        $logData['allTokens'] = array_keys($termFreqs);
         $logData['termFrequencies'] = $termFreqs;
         $logData['documentLength'] = $docLen;
 
@@ -326,28 +323,43 @@ abstract class BaseSearchAdapter extends Search
                         'freq' => $freq,
                         'docFreq' => $docFreq,
                         'actualTerm' => $term,
+                        'confidence' => 1.0,
                     ];
                 }
-            } else {
-                // Fuzzy fallback if no exact matches
-                $fuzzyTerms = $this->findFuzzyMatches($term, siteId: (int)$siteId);
-                foreach ($fuzzyTerms as $fuzzy) {
-                    $fuzzyDocs = $this->filterDocumentsBySite($this->getTermDocuments($fuzzy), (int)$siteId);
-                    if (empty($fuzzyDocs)) {
+            }
+
+            if (!$this->shouldFindFuzzyMatches($term, !empty($termDocs))) {
+                continue;
+            }
+
+            // Include fuzzy matches as supplemental results. Exact matches remain preferred,
+            // but a same-site exact typo should not suppress a close title match.
+            $fuzzyTerms = $this->findFuzzyMatchScores($term, siteId: (int)$siteId);
+            foreach ($fuzzyTerms as $fuzzy => $confidence) {
+                if ($fuzzy === $term) {
+                    continue;
+                }
+
+                $fuzzyDocs = $this->filterDocumentsBySite($this->getTermDocuments($fuzzy), (int)$siteId);
+                if (empty($fuzzyDocs)) {
+                    continue;
+                }
+
+                $docFreq = count($fuzzyDocs);
+                foreach ($fuzzyDocs as $docId => $freq) {
+                    if (isset($termData[$termIndex][$docId])) {
                         continue;
                     }
 
-                    $docFreq = count($fuzzyDocs);
-                    foreach ($fuzzyDocs as $docId => $freq) {
-                        $termMatches[$termIndex][$docId] = true;
-                        $matchedTerms[$docId][$term] = true;
-                        $allDocuments[$docId] = true;
-                        $termData[$termIndex][$docId] = [
-                            'freq' => $freq,
-                            'docFreq' => $docFreq,
-                            'actualTerm' => $fuzzy,
-                        ];
-                    }
+                    $termMatches[$termIndex][$docId] = true;
+                    $matchedTerms[$docId][$term] = true;
+                    $allDocuments[$docId] = true;
+                    $termData[$termIndex][$docId] = [
+                        'freq' => $freq,
+                        'docFreq' => $docFreq,
+                        'actualTerm' => $fuzzy,
+                        'confidence' => $confidence,
+                    ];
                 }
             }
         }
@@ -365,6 +377,8 @@ abstract class BaseSearchAdapter extends Search
                 if ($this->isTermInTitle($data['actualTerm'], $docId)) {
                     $score *= $this->titleBoostFactor;
                 }
+
+                $score *= $data['confidence'] ?? 1.0;
 
                 $docScores[$docId] = ($docScores[$docId] ?? 0) + $score;
             }
@@ -437,6 +451,29 @@ abstract class BaseSearchAdapter extends Search
     }
 
     /**
+     * Build the indexed term frequencies for an element.
+     *
+     * Craft usually includes title text in searchable attributes, but this method
+     * explicitly preserves every title token so exact title searches never depend
+     * on that behavior. Stop words remain excluded from non-title content.
+     *
+     * @param string $text Searchable attribute and field text
+     * @param array $titleTokens Tokenized element title
+     * @return array Terms keyed to frequency
+     */
+    protected function buildIndexedTermFrequencies(string $text, array $titleTokens): array
+    {
+        $tokens = $this->filterStopWords($this->tokenize($text));
+        $termFreqs = array_count_values($tokens);
+
+        foreach ($titleTokens as $titleToken) {
+            $termFreqs[$titleToken] ??= 1;
+        }
+
+        return $termFreqs;
+    }
+
+    /**
      * Find terms that are similar to the given term using Levenshtein distance
      *
      * @param string $term The term to find matches for
@@ -444,6 +481,22 @@ abstract class BaseSearchAdapter extends Search
      * @return array List of matching terms
      */
     protected function findFuzzyMatches(string $term, int $maxDistance = 2, ?int $siteId = null): array
+    {
+        return array_keys($this->findFuzzyMatchScores($term, $maxDistance, $siteId));
+    }
+
+    /**
+     * Find terms similar to the given term, with confidence scores.
+     *
+     * N-gram similarity gives us cheap candidate retrieval. Edit distance then
+     * removes candidates that share fragments but are not close typos.
+     *
+     * @param string $term The term to find matches for
+     * @param int $maxDistance Maximum Levenshtein distance for matches
+     * @param int|null $siteId Site to search within
+     * @return array Matching terms keyed to confidence scores
+     */
+    protected function findFuzzyMatchScores(string $term, int $maxDistance = 2, ?int $siteId = null): array
     {
         // Generate n-grams for the search term
         $searchNgrams = $this->generateNgrams($term);
@@ -464,10 +517,111 @@ abstract class BaseSearchAdapter extends Search
             $adaptiveThreshold
         );
 
-        // Limit candidates for performance and return by similarity score
-        $candidates = array_slice($candidates, 0, $this->fuzzySearchMaxCandidates, true);
+        $maxDistance = $this->getAdaptiveMaxDistance($term, $maxDistance);
+        $matches = [];
 
-        return array_keys($candidates);
+        foreach ($candidates as $candidate => $similarity) {
+            $candidate = (string)$candidate;
+            if ($this->isWithinFuzzyEditDistance($term, $candidate, $maxDistance)) {
+                $matches[$candidate] = $this->calculateFuzzyConfidence($term, $candidate, $similarity);
+            }
+        }
+
+        // Limit candidates for performance and return by similarity score
+        $matches = array_slice($matches, 0, $this->fuzzySearchMaxCandidates, true);
+
+        return $matches;
+    }
+
+    /**
+     * Decide whether to look for fuzzy candidates for a search term.
+     *
+     * Long exact terms may still be typos that exist elsewhere in the index, so fuzzy
+     * supplements are useful. Short exact terms are noisy, so keep them exact unless
+     * no exact match exists.
+     *
+     * @param string $term The search term
+     * @param bool $hasExactMatches Whether exact matches were found on the active site
+     * @return bool Whether fuzzy matching should run
+     */
+    protected function shouldFindFuzzyMatches(string $term, bool $hasExactMatches): bool
+    {
+        $termLength = mb_strlen($term, 'UTF-8');
+
+        return $termLength >= 3 && (!$hasExactMatches || $termLength >= 5);
+    }
+
+    /**
+     * Keep short fuzzy searches conservative while still allowing longer typo repairs.
+     *
+     * @param string $term The search term
+     * @param int $maxDistance Configured maximum edit distance
+     * @return int Effective maximum edit distance
+     */
+    protected function getAdaptiveMaxDistance(string $term, int $maxDistance): int
+    {
+        if (mb_strlen($term, 'UTF-8') <= 3) {
+            return min(1, $maxDistance);
+        }
+
+        return $maxDistance;
+    }
+
+    /**
+     * Check a fuzzy candidate against edit distance after n-gram preselection.
+     *
+     * @param string $term The search term
+     * @param string $candidate The indexed candidate term
+     * @param int $maxDistance Effective maximum edit distance
+     * @return bool Whether the candidate is close enough
+     */
+    protected function isWithinFuzzyEditDistance(string $term, string $candidate, int $maxDistance): bool
+    {
+        if ($this->isFuzzyPrefixMatch($term, $candidate)) {
+            return true;
+        }
+
+        return levenshtein($term, $candidate) <= $maxDistance;
+    }
+
+    /**
+     * Check whether a query term is a useful prefix of an indexed term.
+     *
+     * @param string $term The search term
+     * @param string $candidate The indexed candidate term
+     * @return bool Whether this is an acceptable partial-word match
+     */
+    protected function isFuzzyPrefixMatch(string $term, string $candidate): bool
+    {
+        return mb_strlen($term, 'UTF-8') >= 4
+            && mb_strlen($term, 'UTF-8') < mb_strlen($candidate, 'UTF-8')
+            && str_starts_with($candidate, $term);
+    }
+
+    /**
+     * Calculate a confidence multiplier for fuzzy and partial matches.
+     *
+     * @param string $term The search term
+     * @param string $candidate The indexed candidate term
+     * @param float $ngramSimilarity Candidate n-gram similarity
+     * @return float Score multiplier between 0 and 1
+     */
+    protected function calculateFuzzyConfidence(string $term, string $candidate, float $ngramSimilarity): float
+    {
+        if ($term === $candidate) {
+            return 1.0;
+        }
+
+        if ($this->isFuzzyPrefixMatch($term, $candidate)) {
+            $coverage = mb_strlen($term, 'UTF-8') / max(1, mb_strlen($candidate, 'UTF-8'));
+            return max(0.25, min(0.45, (0.5 * $coverage) + (0.5 * $ngramSimilarity)));
+        }
+
+        $distance = levenshtein($term, $candidate);
+        $length = max(mb_strlen($term, 'UTF-8'), mb_strlen($candidate, 'UTF-8'), 1);
+        $editSimilarity = 1 - ($distance / $length);
+
+        return max(0.25, min(0.6, (0.6 * $editSimilarity) + (0.4 * $ngramSimilarity)));
     }
 
     /**
@@ -492,6 +646,9 @@ abstract class BaseSearchAdapter extends Search
         } elseif ($termLength == 4) {
             // 4-character terms: slightly lower threshold
             return max(0.2, $baseThreshold * 0.8);
+        } elseif ($termLength <= 6) {
+            // 5-6 character terms need room for common adjacent-letter transpositions
+            return max(0.25, $baseThreshold * 0.8);
         }
         
         // 5+ character terms: use full threshold

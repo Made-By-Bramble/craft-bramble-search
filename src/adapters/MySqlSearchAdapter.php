@@ -931,11 +931,8 @@ class MySqlSearchAdapter extends BaseSearchAdapter
             }
         }
 
-        $tokens = $this->tokenize($text);
-        $tokens = $this->filterStopWords($tokens);
-        $tokens = array_merge($tokens, $this->getStopWords($titleTokens));
-        $termFreqs = array_count_values($tokens);
-        $docLen = count($tokens);
+        $termFreqs = $this->buildIndexedTermFrequencies($text, $titleTokens);
+        $docLen = array_sum($termFreqs);
 
         $siteId = $element->siteId;
         $elementId = $element->id;

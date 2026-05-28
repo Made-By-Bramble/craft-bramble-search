@@ -1,5 +1,10 @@
 # Release Notes for Bramble Search
 
+## 1.0.14
+- Improved fuzzy search robustness with supplemental fuzzy results, edit-distance precision filtering, partial-prefix matches, and confidence scoring so exact matches remain preferred.
+- Fixed exact title indexing so title terms are always indexed directly, including stop words such as `Why`.
+- Added broad unit and live Craft 5 coverage for title and field fuzzy searches, including `Antibioti` finding `Antibiotic Oil` and `Why` finding `Why do you sell the supplements you sell?`.
+
 ## 1.0.13
 - Fixed title stop words so terms like `Why` are retained in title indexes and can be found by title-only searches.
 - Fixed fuzzy fallback so exact matches on another site do not prevent fuzzy matching on the active element query site.

@@ -79,6 +79,131 @@ final class AdapterFeatureTest extends TestCase
         self::assertArrayHasKey('100-1', $matches);
     }
 
+    public function testFuzzySearchFindsAntibioticOilTitleWhenExactTypoExistsOnSameSite(): void
+    {
+        $adapter = new InMemorySearchAdapter();
+        $adapter->addTitle('Antibiotic Oil', 1, 100);
+        $adapter->addSearchTerm('antibioti', 1, 200);
+
+        $query = Entry::find()->siteId(1)->search('antibioti');
+        $matches = $adapter->searchElements($query);
+
+        self::assertArrayHasKey('100-1', $matches);
+        self::assertArrayHasKey('200-1', $matches);
+    }
+
+    public function testFuzzySearchCoversCommonTypoShapes(): void
+    {
+        $adapter = new InMemorySearchAdapter();
+        $adapter->addTitle('Antibiotic Oil', 1, 100);
+        $adapter->addTitle('Lavender Extract', 1, 110);
+        $adapter->addTitle('Ginger Root', 1, 120);
+        $adapter->addTitle('Mineral Complex', 1, 130);
+        $adapter->addTitle('Supplements Guide', 1, 140);
+
+        $cases = [
+            'antibioti' => '100-1',
+            'antibotic' => '100-1',
+            'lavendr' => '110-1',
+            'lavendar' => '110-1',
+            'gigner' => '120-1',
+            'minerlas' => '130-1',
+            'supplemnts' => '140-1',
+        ];
+
+        foreach ($cases as $queryTerm => $expectedDocId) {
+            $matches = $adapter->searchElements(Entry::find()->siteId(1)->search($queryTerm));
+            self::assertArrayHasKey($expectedDocId, $matches, "Expected $queryTerm to find $expectedDocId");
+        }
+    }
+
+    public function testFuzzySearchSupportsTitleAndFieldPrefixes(): void
+    {
+        $adapter = new InMemorySearchAdapter();
+        $adapter->addTitle('Antibiotic Oil', 1, 100);
+        $adapter->addSearchTerm('supplements', 1, 110);
+        $adapter->addSearchTerm('minerals', 1, 120);
+
+        $cases = [
+            'antibi' => '100-1',
+            'supplem' => '110-1',
+            'minera' => '120-1',
+        ];
+
+        foreach ($cases as $queryTerm => $expectedDocId) {
+            $matches = $adapter->searchElements(Entry::find()->siteId(1)->search($queryTerm));
+            self::assertArrayHasKey($expectedDocId, $matches, "Expected $queryTerm to find $expectedDocId");
+        }
+    }
+
+    public function testFuzzySearchRejectsDistantSharedNgramCandidates(): void
+    {
+        $adapter = new InMemorySearchAdapter();
+        $adapter->addTitle('Antibiotic Oil', 1, 100);
+        $adapter->addTitle('Antibody Research', 1, 200);
+        $adapter->addTitle('Caterpillar Study', 1, 300);
+
+        $antibiotiMatches = $adapter->searchElements(Entry::find()->siteId(1)->search('antibioti'));
+        $catMatches = $adapter->searchElements(Entry::find()->siteId(1)->search('cat'));
+
+        self::assertArrayHasKey('100-1', $antibiotiMatches);
+        self::assertArrayNotHasKey('200-1', $antibiotiMatches);
+        self::assertArrayNotHasKey('300-1', $catMatches);
+    }
+
+    public function testExactShortTitleSearchDoesNotIncludeFuzzyLookalikes(): void
+    {
+        $adapter = new InMemorySearchAdapter();
+        $adapter->addTitle('Why do you sell the supplements you sell?', 1, 100);
+        $adapter->addTitle('Whey Protein Guide', 1, 200);
+
+        $exactMatches = $adapter->searchElements(Entry::find()->siteId(1)->search('why'));
+        $typoMatches = $adapter->searchElements(Entry::find()->siteId(1)->search('whi'));
+
+        self::assertSame(['100-1'], array_keys($exactMatches));
+        self::assertArrayHasKey('100-1', $typoMatches);
+        self::assertArrayNotHasKey('200-1', $typoMatches);
+    }
+
+    public function testMultiTermFuzzySearchStillRequiresEverySearchTerm(): void
+    {
+        $adapter = new InMemorySearchAdapter();
+        $adapter->addTitle('Antibiotic Oil', 1, 100);
+        $adapter->addTitle('Antibiotic Capsules', 1, 110);
+        $adapter->addTitle('Lavender Oil', 1, 120);
+
+        $matches = $adapter->searchElements(Entry::find()->siteId(1)->search('antibioti oil'));
+
+        self::assertSame(['100-1'], array_keys($matches));
+    }
+
+    public function testExactMatchesRemainPreferredOverFuzzySupplements(): void
+    {
+        $adapter = new InMemorySearchAdapter();
+        $adapter->addTitle('Antibiotic Oil', 1, 100);
+        $adapter->addTitle('Antibioti Exact', 1, 200);
+
+        $matches = $adapter->searchElements(Entry::find()->siteId(1)->search('antibioti'));
+
+        self::assertArrayHasKey('100-1', $matches);
+        self::assertArrayHasKey('200-1', $matches);
+        self::assertSame('200-1', array_key_first($matches));
+    }
+
+    public function testTitleTermsAreIndexedEvenWhenSearchableTextDoesNotContainTitle(): void
+    {
+        $adapter = new InMemorySearchAdapter();
+
+        $terms = $adapter->publicBuildIndexedTermFrequencies(
+            'field content without the heading words',
+            'Why Antibiotic Oil'
+        );
+
+        self::assertArrayHasKey('why', $terms);
+        self::assertArrayHasKey('antibiotic', $terms);
+        self::assertArrayHasKey('oil', $terms);
+    }
+
     public function testStopWordOnlySearchCanMatchLongQuestionTitle(): void
     {
         $adapter = new InMemorySearchAdapter();
@@ -168,11 +293,16 @@ final class InMemorySearchAdapter extends BaseSearchAdapter
     public function addTitle(string $title, int $siteId, int $elementId): void
     {
         $titleTokens = $this->tokenize($title);
-        $indexedTerms = array_merge($this->filterStopWords($titleTokens), $this->getStopWords($titleTokens));
+        $indexedTerms = array_keys($this->buildIndexedTermFrequencies('', $titleTokens));
 
         foreach ($indexedTerms as $term) {
             $this->addSearchTerm($term, $siteId, $elementId, true);
         }
+    }
+
+    public function publicBuildIndexedTermFrequencies(string $text, string $title): array
+    {
+        return $this->buildIndexedTermFrequencies($text, $this->tokenize($title));
     }
 
     protected function getDocumentTerms(int $siteId, int $elementId): array
