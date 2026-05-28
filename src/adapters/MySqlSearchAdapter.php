@@ -879,21 +879,25 @@ class MySqlSearchAdapter extends BaseSearchAdapter
      */
     public function indexElementAttributes(ElementInterface $element, array|null $fieldHandles = null): bool
     {
-        if (!$element->id || !$element->siteId || !$element->enabled) {
+        if (!$element->id || !$element->siteId) {
             return true;
+        }
+
+        if (!$element->enabled || !$element->getEnabledForSite()) {
+            return $this->removeElementFromIndexAndUpdateMetadata($element);
         }
 
         if (ElementHelper::isDraftOrRevision($element)) {
-            return true;
+            return $this->removeElementFromIndexAndUpdateMetadata($element);
         }
 
         if (property_exists($element, 'isProvisionalDraft') && $element->isProvisionalDraft) {
-            return true;
+            return $this->removeElementFromIndexAndUpdateMetadata($element);
         }
 
         $elementType = get_class($element);
         if ($elementType::hasTitles() && empty($element->title)) {
-            return true;
+            return $this->removeElementFromIndexAndUpdateMetadata($element);
         }
 
         $db = Craft::$app->getDb();
@@ -936,6 +940,7 @@ class MySqlSearchAdapter extends BaseSearchAdapter
 
         $siteId = $element->siteId;
         $elementId = $element->id;
+        $oldDocLength = $this->getDocumentLength("$siteId:$elementId");
 
         // --- Clean up old data (bulk deletes) ---
         $db->createCommand()->delete($this->tablePrefix . 'terms}}', [
@@ -1019,7 +1024,7 @@ class MySqlSearchAdapter extends BaseSearchAdapter
 
         // --- Metadata ---
         $this->addDocumentToIndex($siteId, $elementId);
-        $this->updateTotalLength($docLen);
+        $this->updateTotalLength($docLen - $oldDocLength);
 
         if (!$this->bulkMode) {
             $this->updateTotalDocCount();
@@ -1075,8 +1080,8 @@ class MySqlSearchAdapter extends BaseSearchAdapter
             // Clear n-grams for this site
             $this->clearNgrams($siteId);
 
-            // Reset totals
-            $this->resetTotalLength();
+            // Refresh totals across all remaining sites
+            $this->refreshTotalLength();
             $this->updateTotalDocCount();
 
             Craft::info("Search index cleared (bulk) for site ID: $siteId", __METHOD__);

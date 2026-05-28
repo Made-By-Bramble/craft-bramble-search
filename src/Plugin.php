@@ -208,6 +208,10 @@ class Plugin extends BasePlugin
                     'key' => 'bramble-search',
                     'info' => Craft::t('bramble-search', 'Triggers a queued rebuild of the search index.'),
                     'action' => function() {
+                        if (!(Craft::$app->getSearch() instanceof BaseSearchAdapter)) {
+                            throw new \RuntimeException('Bramble Search is not active as the Craft search service.');
+                        }
+
                         Craft::$app->getQueue()->push(new RebuildIndexJob([
                             'siteId' => Craft::$app->getSites()->currentSite->id,
                         ]));
@@ -588,12 +592,12 @@ class Plugin extends BasePlugin
             return;
         }
 
-        // Always queue indexing for enabled, non-draft elements
+        // Always queue indexing for saved, non-draft elements
         // queueIndexElement handles deduplication via the searchindexqueue table,
         // so it's safe to call even if indexing was already queued by Craft's native system
         // This ensures elements are indexed even when Craft's condition (dirty fields/attributes)
         // isn't met, which commonly happens with new elements
-        if ($element->id && $element->siteId && $element->enabled) {
+        if ($element->id && $element->siteId) {
             // Get all searchable field handles
             $fieldHandles = [];
             $fieldLayout = $element->getFieldLayout();

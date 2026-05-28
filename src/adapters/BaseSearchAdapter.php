@@ -129,26 +129,30 @@ abstract class BaseSearchAdapter extends Search
      */
     public function indexElementAttributes(ElementInterface $element, array|null $fieldHandles = null): bool
     {
-        // Skip elements without ID, site ID, or that are disabled
-        if (!$element->id || !$element->siteId || !$element->enabled) {
+        // Skip elements without ID or site ID
+        if (!$element->id || !$element->siteId) {
             return true;
+        }
+
+        if (!$element->enabled || !$element->getEnabledForSite()) {
+            return $this->removeElementFromIndexAndUpdateMetadata($element);
         }
 
         // Skip drafts and revisions
         if (ElementHelper::isDraftOrRevision($element)) {
-            return true;
+            return $this->removeElementFromIndexAndUpdateMetadata($element);
         }
 
         // Skip provisional drafts
         if (property_exists($element, 'isProvisionalDraft') && $element->isProvisionalDraft) {
-            return true;
+            return $this->removeElementFromIndexAndUpdateMetadata($element);
         }
 
         // Skip elements that should have titles but don't (e.g., section entries in Craft 5)
         // Only apply this check to element types that explicitly support titles
         $elementType = get_class($element);
         if ($elementType::hasTitles() && empty($element->title)) {
-            return true;
+            return $this->removeElementFromIndexAndUpdateMetadata($element);
         }
 
         // Prepare log data
@@ -207,6 +211,8 @@ abstract class BaseSearchAdapter extends Search
         $logData['termFrequencies'] = $termFreqs;
         $logData['documentLength'] = $docLen;
 
+        $oldDocLength = $this->getDocumentLength("{$element->siteId}:{$element->id}");
+
         // Get old terms to clean up
         $oldTerms = $this->getDocumentTerms($element->siteId, $element->id);
         $logData['oldTerms'] = $oldTerms;
@@ -242,7 +248,7 @@ abstract class BaseSearchAdapter extends Search
         // Update metadata
         $this->addDocumentToIndex($element->siteId, $element->id);
         $this->updateTotalDocCount();
-        $this->updateTotalLength($docLen);
+        $this->updateTotalLength($docLen - $oldDocLength);
 
         // Log the indexing operation with all collected data
         Craft::getLogger()->log(
@@ -250,6 +256,28 @@ abstract class BaseSearchAdapter extends Search
             Logger::LEVEL_TRACE,
             'bramble-search'
         );
+
+        return true;
+    }
+
+    /**
+     * Remove an element that should no longer be indexed and keep metadata totals in sync.
+     */
+    protected function removeElementFromIndexAndUpdateMetadata(ElementInterface $element): bool
+    {
+        if (!$element->id || !$element->siteId) {
+            return true;
+        }
+
+        $oldDocLength = $this->getDocumentLength("{$element->siteId}:{$element->id}");
+        if (!$this->deleteElementFromIndex($element->id, $element->siteId)) {
+            return false;
+        }
+
+        if ($oldDocLength > 0) {
+            $this->updateTotalLength(-$oldDocLength);
+        }
+        $this->updateTotalDocCount();
 
         return true;
     }
@@ -1086,8 +1114,9 @@ abstract class BaseSearchAdapter extends Search
                 $this->deleteElementFromIndex($elementId, $docSiteId);
             }
 
-            // Reset the total length
-            $this->resetTotalLength();
+            if ($totalLengthToRemove > 0) {
+                $this->updateTotalLength(-$totalLengthToRemove);
+            }
 
             // Clear all terms that no longer have documents
             $this->cleanupOrphanedTerms();
@@ -1209,7 +1238,7 @@ abstract class BaseSearchAdapter extends Search
     public function cleanupOrphanedTerms(): void
     {
         $allTerms = $this->getAllTerms();
-        $currentSiteId = Craft::$app->getSites()->getCurrentSite()->id ?? 1;
+        $siteIds = Craft::$app->getSites()->getAllSiteIds(true);
 
         foreach ($allTerms as $term) {
             $docs = $this->getTermDocuments($term);
@@ -1217,8 +1246,10 @@ abstract class BaseSearchAdapter extends Search
             if (empty($docs)) {
                 $this->removeTermFromIndex($term);
                 
-                // Also remove n-grams for this orphaned term
-                $this->removeTermNgrams($term, $currentSiteId);
+                // Also remove n-grams for this globally orphaned term
+                foreach ($siteIds as $siteId) {
+                    $this->removeTermNgrams($term, $siteId);
+                }
             }
         }
     }

@@ -3,8 +3,11 @@
 namespace MadeByBramble\BrambleSearch\jobs;
 
 use Craft;
+use craft\base\Batchable;
+use craft\base\Element;
 use craft\base\ElementInterface;
 use craft\queue\BaseBatchedJob;
+use MadeByBramble\BrambleSearch\adapters\BaseSearchAdapter;
 
 /**
  * Rebuild Index Job
@@ -15,6 +18,8 @@ use craft\queue\BaseBatchedJob;
  */
 class RebuildIndexJob extends BaseBatchedJob
 {
+    private const LOCK_TTL = 21600;
+
     /**
      * The site ID to rebuild the index for
      */
@@ -41,15 +46,30 @@ class RebuildIndexJob extends BaseBatchedJob
             throw new \Exception("Site with ID {$this->siteId} not found");
         }
 
-        // Enable bulk mode to skip per-element updateTotalDocCount
-        $searchService = Craft::$app->getSearch();
-        if (property_exists($searchService, 'bulkMode')) {
-            $searchService->bulkMode = true;
-        }
+        $searchService = $this->getSearchAdapter();
+        $this->acquireRebuildLock($site->id);
 
-        // Clear the existing index for this site before rebuilding
-        Craft::info("Starting index rebuild for site ID: {$site->id}", __METHOD__);
-        $this->clearIndex($site->id);
+        try {
+            // Enable bulk mode to skip per-element updateTotalDocCount
+            $this->setBulkMode($searchService, true);
+
+            // Clear the existing index for this site before rebuilding
+            Craft::info("Starting index rebuild for site ID: {$site->id}", __METHOD__);
+            $this->clearIndex($site->id);
+        } catch (\Throwable $e) {
+            $this->releaseRebuildLock($site->id);
+            throw $e;
+        }
+    }
+
+    protected function beforeBatch(): void
+    {
+        $this->setBulkMode($this->getSearchAdapter(), true);
+    }
+
+    protected function afterBatch(): void
+    {
+        $this->setBulkMode($this->getSearchAdapter(), false);
     }
 
     /**
@@ -58,7 +78,7 @@ class RebuildIndexJob extends BaseBatchedJob
      *
      * @return \craft\base\Batchable The batcher containing queries for all element types
      */
-    public function loadData(): \craft\base\Batchable
+    public function loadData(): Batchable
     {
         // Get the site
         $site = Craft::$app->getSites()->getSiteById($this->siteId);
@@ -76,7 +96,7 @@ class RebuildIndexJob extends BaseBatchedJob
             /** @var class-string<ElementInterface> $elementType */
             $query = $elementType::find()
                 ->site($site)
-                ->status(null)
+                ->status(Element::STATUS_ENABLED)
                 ->drafts(false)
                 ->revisions(false)
                 ->provisionalDrafts(false)
@@ -102,9 +122,20 @@ class RebuildIndexJob extends BaseBatchedJob
      * @param ElementInterface $item The element to index
      * @return void
      */
-    public function processItem($item): void
+    public function processItem(mixed $item): void
     {
-        $this->indexElement($item);
+        if (!($item instanceof ElementInterface)) {
+            $this->setBulkMode($this->getSearchAdapter(), false);
+            $this->releaseRebuildLock($this->siteId);
+            throw new \RuntimeException('Rebuild index batch contained a non-element item.');
+        }
+
+        if (!$this->indexElement($item)) {
+            $elementType = get_class($item);
+            $this->setBulkMode($this->getSearchAdapter(), false);
+            $this->releaseRebuildLock($this->siteId);
+            throw new \RuntimeException("Failed to index {$elementType} {$item->id} for site {$item->siteId}");
+        }
     }
 
     /**
@@ -115,7 +146,7 @@ class RebuildIndexJob extends BaseBatchedJob
      */
     protected function after(): void
     {
-        $searchService = Craft::$app->getSearch();
+        $searchService = $this->getSearchAdapter();
 
         try {
             // Recalculate metadata once after all batches
@@ -127,9 +158,8 @@ class RebuildIndexJob extends BaseBatchedJob
             }
         } finally {
             // Always reset bulk mode, even if metadata refresh fails
-            if (property_exists($searchService, 'bulkMode')) {
-                $searchService->bulkMode = false;
-            }
+            $this->setBulkMode($searchService, false);
+            $this->releaseRebuildLock($this->siteId);
         }
 
         Craft::info("Index rebuild completed for site ID: {$this->siteId}", __METHOD__);
@@ -206,16 +236,47 @@ class RebuildIndexJob extends BaseBatchedJob
     {
         Craft::info("Clearing search index for site ID: $siteId", __METHOD__);
 
-        // Get the search service
+        $searchService = $this->getSearchAdapter();
+
+        if (!$searchService->clearIndex($siteId)) {
+            throw new \RuntimeException("Failed to clear Bramble Search index for site ID: $siteId");
+        }
+    }
+
+    protected function getSearchAdapter(): BaseSearchAdapter
+    {
         $searchService = Craft::$app->getSearch();
 
-        // Check if the search service is one of our adapters
-        if (method_exists($searchService, 'clearIndex')) {
-            // If our search service has a clearIndex method, use it
-            $searchService->clearIndex($siteId);
-        } else {
-            // Otherwise, log a warning
-            Craft::warning("Search service does not support clearIndex method. Index may not be fully cleared.", __METHOD__);
+        if (!($searchService instanceof BaseSearchAdapter)) {
+            throw new \RuntimeException('Bramble Search is not active as the Craft search service.');
         }
+
+        return $searchService;
+    }
+
+    protected function setBulkMode(BaseSearchAdapter $searchService, bool $enabled): void
+    {
+        if (property_exists($searchService, 'bulkMode')) {
+            $searchService->bulkMode = $enabled;
+        }
+    }
+
+    protected function acquireRebuildLock(int $siteId): void
+    {
+        if (!Craft::$app->getCache()->add($this->rebuildLockKey($siteId), time(), self::LOCK_TTL)) {
+            throw new \RuntimeException("A Bramble Search index rebuild is already running for site ID: $siteId");
+        }
+    }
+
+    protected function releaseRebuildLock(?int $siteId): void
+    {
+        if ($siteId !== null) {
+            Craft::$app->getCache()->delete($this->rebuildLockKey($siteId));
+        }
+    }
+
+    protected function rebuildLockKey(int $siteId): string
+    {
+        return "bramble-search:rebuild:$siteId";
     }
 }

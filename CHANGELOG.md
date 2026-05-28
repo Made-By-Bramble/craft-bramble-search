@@ -1,5 +1,12 @@
 # Release Notes for Bramble Search
 
+## 1.0.15
+- Fixed full-site rebuilds to fail loudly unless Bramble Search is the active search adapter, prevent overlapping rebuilds for the same site, and keep MySQL bulk indexing enabled across queued batches.
+- Fixed rebuild coverage to index every enabled, searchable element across all registered element types for the target site, including Commerce and third-party plugin elements.
+- Fixed lifecycle indexing so disabled elements, drafts, revisions, provisional drafts, and title-empty elements are removed from the index instead of leaving stale documents behind.
+- Fixed document length metadata updates when elements are re-indexed or a single site is cleared, preserving other sites across all storage adapters.
+- Added regression coverage for cross-site metadata preservation during site-level index clears.
+
 ## 1.0.14
 - Improved fuzzy search robustness with supplemental fuzzy results, edit-distance precision filtering, partial-prefix matches, and confidence scoring so exact matches remain preferred.
 - Fixed exact title indexing so title terms are always indexed directly, including stop words such as `Why`.

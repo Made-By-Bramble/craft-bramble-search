@@ -214,6 +214,20 @@ final class AdapterFeatureTest extends TestCase
 
         self::assertArrayHasKey('100-1', $matches);
     }
+
+    public function testClearIndexPreservesOtherSiteDocumentLengthMetadata(): void
+    {
+        $adapter = new InMemorySearchAdapter();
+        $adapter->addSearchTerm('lavender', 1, 100);
+        $adapter->addSearchTerm('oil', 1, 100);
+        $adapter->addSearchTerm('orchid', 2, 200);
+
+        $adapter->clearIndex(1);
+
+        self::assertSame(1, $adapter->publicTotalLength());
+        self::assertSame(['2:200'], $adapter->publicSiteDocuments(2));
+        self::assertSame([], $adapter->publicSiteDocuments(1));
+    }
 }
 
 final class TestableCraftCacheSearchAdapter extends CraftCacheSearchAdapter
@@ -270,6 +284,7 @@ final class InMemorySearchAdapter extends BaseSearchAdapter
     private array $terms = [];
     private array $titleTerms = [];
     private array $ngrams = [];
+    private int $totalLength = 0;
 
     public function addSearchTerm(string $term, int $siteId, int $elementId, bool $titleTerm = false): void
     {
@@ -284,6 +299,7 @@ final class InMemorySearchAdapter extends BaseSearchAdapter
         $this->documents[$docId]['length']++;
         $this->terms[$term][$docId] = 1;
         $this->ngrams[$siteId][$term] = $this->generateNgrams($term);
+        $this->totalLength++;
 
         if ($titleTerm) {
             $this->titleTerms[$docId][$term] = true;
@@ -303,6 +319,16 @@ final class InMemorySearchAdapter extends BaseSearchAdapter
     public function publicBuildIndexedTermFrequencies(string $text, string $title): array
     {
         return $this->buildIndexedTermFrequencies($text, $this->tokenize($title));
+    }
+
+    public function publicTotalLength(): int
+    {
+        return $this->getTotalLength();
+    }
+
+    public function publicSiteDocuments(int $siteId): array
+    {
+        return $this->getSiteDocuments($siteId);
     }
 
     protected function getDocumentTerms(int $siteId, int $elementId): array
@@ -345,6 +371,7 @@ final class InMemorySearchAdapter extends BaseSearchAdapter
 
     protected function updateTotalLength(int $docLen): void
     {
+        $this->totalLength = max(0, $this->totalLength + $docLen);
     }
 
     protected function getTotalDocCount(): int
@@ -354,7 +381,7 @@ final class InMemorySearchAdapter extends BaseSearchAdapter
 
     protected function getTotalLength(): int
     {
-        return max(1, array_sum(array_map(fn(array $document): int => $document['length'], $this->documents)));
+        return $this->totalLength;
     }
 
     protected function getTermDocuments(string $term): array
