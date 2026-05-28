@@ -5,6 +5,7 @@ namespace MadeByBramble\BrambleSearch\adapters;
 use Craft;
 use craft\base\ElementInterface;
 use craft\db\Query;
+use craft\db\QueryAbortedException;
 use craft\elements\db\ElementQuery;
 use craft\helpers\ElementHelper;
 use craft\search\SearchQuery;
@@ -444,6 +445,11 @@ abstract class BaseSearchAdapter extends Search
             }
         }
 
+        $filteredScores = $this->filterScoresByElementQuery($filteredScores, $elementQuery);
+        if (empty($filteredScores)) {
+            return [];
+        }
+
         // Sort by score (highest first)
         arsort($filteredScores);
 
@@ -456,6 +462,53 @@ abstract class BaseSearchAdapter extends Search
         }
 
         return $results;
+    }
+
+    /**
+     * Filters scored search matches through the original element query criteria.
+     *
+     * Craft paginates `orderBy('score')` results after searchElements() returns,
+     * so IDs that cannot be returned by the caller's query must be removed here.
+     *
+     * @param array<string,float> $scores Scores keyed by internal doc ID (siteId:elementId)
+     * @param ElementQuery $elementQuery The original element query
+     * @return array<string,float>
+     */
+    protected function filterScoresByElementQuery(array $scores, ElementQuery $elementQuery): array
+    {
+        if (empty($scores)) {
+            return [];
+        }
+
+        $elementIds = [];
+        foreach (array_keys($scores) as $docId) {
+            [, $elementId] = explode(':', $docId, 2);
+            $elementIds[] = (int)$elementId;
+        }
+        $elementIds = array_values(array_unique($elementIds));
+
+        $criteriaQuery = clone $elementQuery;
+        $criteriaQuery
+            ->search(null)
+            ->offset(null)
+            ->limit(null)
+            ->orderBy([]);
+        $criteriaQuery->andWhere(['elements.id' => $elementIds]);
+
+        try {
+            $allowedIds = array_fill_keys(array_map('intval', $criteriaQuery->ids()), true);
+        } catch (QueryAbortedException) {
+            return [];
+        }
+
+        return array_filter(
+            $scores,
+            function(string $docId) use ($allowedIds): bool {
+                [, $elementId] = explode(':', $docId, 2);
+                return isset($allowedIds[(int)$elementId]);
+            },
+            ARRAY_FILTER_USE_KEY
+        );
     }
 
     // =========================================================================

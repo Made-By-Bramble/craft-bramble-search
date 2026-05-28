@@ -190,6 +190,18 @@ final class AdapterFeatureTest extends TestCase
         self::assertSame('200-1', array_key_first($matches));
     }
 
+    public function testSearchElementsFiltersMatchesThroughTheElementQueryCriteria(): void
+    {
+        $adapter = new InMemorySearchAdapter();
+        $adapter->addTitle('Powder Asset', 1, 100);
+        $adapter->addSearchTerm('powder', 1, 200);
+        $adapter->allowOnlyDocIds(['1:200']);
+
+        $matches = $adapter->searchElements(Entry::find()->siteId(1)->search('powder')->orderBy('score')->limit(1));
+
+        self::assertSame(['200-1'], array_keys($matches));
+    }
+
     public function testTitleTermsAreIndexedEvenWhenSearchableTextDoesNotContainTitle(): void
     {
         $adapter = new InMemorySearchAdapter();
@@ -284,6 +296,7 @@ final class InMemorySearchAdapter extends BaseSearchAdapter
     private array $terms = [];
     private array $titleTerms = [];
     private array $ngrams = [];
+    private ?array $allowedDocIds = null;
     private int $totalLength = 0;
 
     public function addSearchTerm(string $term, int $siteId, int $elementId, bool $titleTerm = false): void
@@ -329,6 +342,11 @@ final class InMemorySearchAdapter extends BaseSearchAdapter
     public function publicSiteDocuments(int $siteId): array
     {
         return $this->getSiteDocuments($siteId);
+    }
+
+    public function allowOnlyDocIds(array $docIds): void
+    {
+        $this->allowedDocIds = array_fill_keys($docIds, true);
     }
 
     protected function getDocumentTerms(int $siteId, int $elementId): array
@@ -407,6 +425,15 @@ final class InMemorySearchAdapter extends BaseSearchAdapter
     protected function getAllTerms(): array
     {
         return array_keys($this->terms);
+    }
+
+    protected function filterScoresByElementQuery(array $scores, \craft\elements\db\ElementQuery $elementQuery): array
+    {
+        if ($this->allowedDocIds === null) {
+            return $scores;
+        }
+
+        return array_intersect_key($scores, $this->allowedDocIds);
     }
 
     protected function storeTitleTerms(int $siteId, int $elementId, array $titleTerms): void

@@ -1,5 +1,9 @@
 # Release Notes for Bramble Search
 
+## 1.0.16
+- Fixed score-ordered element searches to preserve the caller's element query criteria before Craft paginates results, restoring Commerce product search displays when higher-scoring matches from other element types exist.
+- Added regression coverage for filtering Bramble Search matches through the active element query before score pagination.
+
 ## 1.0.15
 - Fixed full-site rebuilds to fail loudly unless Bramble Search is the active search adapter, prevent overlapping rebuilds for the same site, and keep MySQL bulk indexing enabled across queued batches.
 - Fixed rebuild coverage to index every enabled, searchable element across all registered element types for the target site, including Commerce and third-party plugin elements.
