@@ -1,5 +1,10 @@
 # Release Notes for Bramble Search
 
+## 1.0.13
+- Fixed title stop words so terms like `Why` are retained in title indexes and can be found by title-only searches.
+- Fixed fuzzy fallback so exact matches on another site do not prevent fuzzy matching on the active element query site.
+- Added Craft 5 driver matrix coverage for title stop-word searches and site-scoped fuzzy fallback across MySQL, file, Craft cache, Redis, and MongoDB storage drivers.
+
 ## 1.0.12
 - Fixed Composer installs by making the MongoDB library an optional suggested package instead of a default requirement.
 

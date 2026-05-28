@@ -163,7 +163,6 @@ abstract class BaseSearchAdapter extends Search
         // Process title for special handling
         $title = $element->title ?? '';
         $titleTokens = $this->tokenize($title);
-        $titleTokens = $this->filterStopWords($titleTokens);
         $titleTerms = array_flip($titleTokens); // Convert to associative array for faster lookups
 
         $logData['titleTokens'] = $titleTokens;
@@ -202,6 +201,7 @@ abstract class BaseSearchAdapter extends Search
 
         $tokens = $this->tokenize($text);
         $tokens = $this->filterStopWords($tokens);
+        $tokens = array_merge($tokens, $this->getStopWords($titleTokens));
         $termFreqs = array_count_values($tokens);
         $docLen = count($tokens);
 
@@ -287,10 +287,9 @@ abstract class BaseSearchAdapter extends Search
     {
         $siteId = $elementQuery->siteId ?? Craft::$app->sites->currentSite->id;
         $searchQuery = $this->normalizeSearchQueryToString($elementQuery->search);
-        $tokens = $this->tokenize($searchQuery);
-        $tokens = $this->filterStopWords($tokens);
+        $tokens = $this->getSearchTokens($searchQuery);
 
-        // If no valid tokens after filtering stop words, return empty results
+        // If no searchable tokens were provided, return empty results
         if (empty($tokens)) {
             return [];
         }
@@ -315,15 +314,11 @@ abstract class BaseSearchAdapter extends Search
             $termMatches[$termIndex] = [];
 
             // Try exact match first
-            $termDocs = $this->getTermDocuments($term);
+            $termDocs = $this->filterDocumentsBySite($this->getTermDocuments($term), (int)$siteId);
 
             if (!empty($termDocs)) {
                 $docFreq = count($termDocs);
                 foreach ($termDocs as $docId => $freq) {
-                    if (!str_starts_with($docId, "$siteId:")) {
-                        continue;
-                    }
-
                     $termMatches[$termIndex][$docId] = true;
                     $matchedTerms[$docId][$term] = true;
                     $allDocuments[$docId] = true;
@@ -337,17 +332,13 @@ abstract class BaseSearchAdapter extends Search
                 // Fuzzy fallback if no exact matches
                 $fuzzyTerms = $this->findFuzzyMatches($term, siteId: (int)$siteId);
                 foreach ($fuzzyTerms as $fuzzy) {
-                    $fuzzyDocs = $this->getTermDocuments($fuzzy);
+                    $fuzzyDocs = $this->filterDocumentsBySite($this->getTermDocuments($fuzzy), (int)$siteId);
                     if (empty($fuzzyDocs)) {
                         continue;
                     }
 
                     $docFreq = count($fuzzyDocs);
                     foreach ($fuzzyDocs as $docId => $freq) {
-                        if (!str_starts_with($docId, "$siteId:")) {
-                            continue;
-                        }
-
                         $termMatches[$termIndex][$docId] = true;
                         $matchedTerms[$docId][$term] = true;
                         $allDocuments[$docId] = true;
@@ -594,7 +585,7 @@ abstract class BaseSearchAdapter extends Search
     {
         $text = strtolower($text);
         $text = preg_replace('/[^\p{L}\p{N}]+/u', ' ', $text);
-        return array_filter(explode(' ', $text));
+        return array_values(array_filter(explode(' ', $text)));
     }
 
     /**
@@ -605,7 +596,53 @@ abstract class BaseSearchAdapter extends Search
      */
     protected function filterStopWords(array $tokens): array
     {
-        return array_filter($tokens, fn($t) => !in_array($t, $this->stopWords));
+        return array_values(array_filter($tokens, fn($t) => !in_array($t, $this->stopWords, true)));
+    }
+
+    /**
+     * Return only stop words from an array of tokens.
+     *
+     * @param array $tokens Array of tokens to filter
+     * @return array Stop word tokens
+     */
+    protected function getStopWords(array $tokens): array
+    {
+        return array_values(array_filter($tokens, fn($t) => in_array($t, $this->stopWords, true)));
+    }
+
+    /**
+     * Tokenize a search string, preserving stop words only when they are the whole query.
+     *
+     * Stop words are normally ignored for broad relevance, but title fields index them so
+     * title-only searches like "Why" should not be reduced to an empty query.
+     *
+     * @param string $text The search query
+     * @return array Search tokens
+     */
+    protected function getSearchTokens(string $text): array
+    {
+        $tokens = $this->tokenize($text);
+        $filteredTokens = $this->filterStopWords($tokens);
+
+        return !empty($filteredTokens) ? $filteredTokens : $tokens;
+    }
+
+    /**
+     * Filter document matches to the active site before deciding whether fuzzy fallback is needed.
+     *
+     * @param array $documents Document frequencies keyed by doc ID
+     * @param int $siteId Active site ID
+     * @return array Site-scoped document frequencies
+     */
+    protected function filterDocumentsBySite(array $documents, int $siteId): array
+    {
+        $sitePrefix = "$siteId:";
+
+        return array_filter(
+            $documents,
+            fn($freq, $docId) => str_starts_with((string)$docId, $sitePrefix),
+            ARRAY_FILTER_USE_BOTH
+        );
     }
 
     /**
@@ -688,8 +725,7 @@ abstract class BaseSearchAdapter extends Search
         // This is a simplified implementation
         // For a more accurate implementation, we would need to store position information
         // For now, we'll just check if all the terms are present
-        $tokens = $this->tokenize($phrase);
-        $tokens = $this->filterStopWords($tokens);
+        $tokens = $this->getSearchTokens($phrase);
 
         [$siteId, $elementId] = explode(':', $docId);
         $docTerms = $this->getDocumentTerms((int)$siteId, (int)$elementId);

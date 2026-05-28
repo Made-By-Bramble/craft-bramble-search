@@ -902,7 +902,6 @@ class MySqlSearchAdapter extends BaseSearchAdapter
         // --- Tokenize title ---
         $title = $element->title ?? '';
         $titleTokens = $this->tokenize($title);
-        $titleTokens = $this->filterStopWords($titleTokens);
         $titleTerms = array_flip($titleTokens);
 
         // --- Build full text from searchable attributes + fields ---
@@ -934,6 +933,7 @@ class MySqlSearchAdapter extends BaseSearchAdapter
 
         $tokens = $this->tokenize($text);
         $tokens = $this->filterStopWords($tokens);
+        $tokens = array_merge($tokens, $this->getStopWords($titleTokens));
         $termFreqs = array_count_values($tokens);
         $docLen = count($tokens);
 

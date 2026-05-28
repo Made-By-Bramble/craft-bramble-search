@@ -14,6 +14,11 @@ use PHPUnit\Framework\TestCase;
 
 final class AdapterFeatureTest extends TestCase
 {
+    public static function setUpBeforeClass(): void
+    {
+        Craft::setAlias('@bramble_search', dirname(__DIR__) . '/src');
+    }
+
     public function testGeneratedNgramsArePhpLists(): void
     {
         $adapter = new TestableCraftCacheSearchAdapter();
@@ -60,6 +65,29 @@ final class AdapterFeatureTest extends TestCase
         $matches = $adapter->searchElements($query);
 
         self::assertArrayHasKey('200-2', $matches);
+    }
+
+    public function testFuzzySearchFallsBackWhenExactMatchesOnlyExistOutsideTheElementQuerySite(): void
+    {
+        $adapter = new InMemorySearchAdapter();
+        $adapter->addSearchTerm('antibiotic', 1, 100);
+        $adapter->addSearchTerm('antibioti', 2, 200);
+
+        $query = Entry::find()->siteId(1)->search('antibioti');
+        $matches = $adapter->searchElements($query);
+
+        self::assertArrayHasKey('100-1', $matches);
+    }
+
+    public function testStopWordOnlySearchCanMatchLongQuestionTitle(): void
+    {
+        $adapter = new InMemorySearchAdapter();
+        $adapter->addTitle('Why do you sell the supplements you sell?', 1, 100);
+
+        $query = Entry::find()->siteId(1)->search('why');
+        $matches = $adapter->searchElements($query);
+
+        self::assertArrayHasKey('100-1', $matches);
     }
 }
 
@@ -118,17 +146,33 @@ final class InMemorySearchAdapter extends BaseSearchAdapter
     private array $titleTerms = [];
     private array $ngrams = [];
 
-    public function addSearchTerm(string $term, int $siteId, int $elementId): void
+    public function addSearchTerm(string $term, int $siteId, int $elementId, bool $titleTerm = false): void
     {
         $docId = "$siteId:$elementId";
-        $this->documents[$docId] = [
+        $this->documents[$docId] ??= [
             'siteId' => $siteId,
             'elementId' => $elementId,
-            'terms' => [$term => 1],
-            'length' => 1,
+            'terms' => [],
+            'length' => 0,
         ];
+        $this->documents[$docId]['terms'][$term] = ($this->documents[$docId]['terms'][$term] ?? 0) + 1;
+        $this->documents[$docId]['length']++;
         $this->terms[$term][$docId] = 1;
         $this->ngrams[$siteId][$term] = $this->generateNgrams($term);
+
+        if ($titleTerm) {
+            $this->titleTerms[$docId][$term] = true;
+        }
+    }
+
+    public function addTitle(string $title, int $siteId, int $elementId): void
+    {
+        $titleTokens = $this->tokenize($title);
+        $indexedTerms = array_merge($this->filterStopWords($titleTokens), $this->getStopWords($titleTokens));
+
+        foreach ($indexedTerms as $term) {
+            $this->addSearchTerm($term, $siteId, $elementId, true);
+        }
     }
 
     protected function getDocumentTerms(int $siteId, int $elementId): array

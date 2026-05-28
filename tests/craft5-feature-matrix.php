@@ -406,6 +406,35 @@ function matrix_run_driver(string $driver, string $token, array $entriesBySite, 
     $fuzzy = matrix_search_ids($adapter, 'lavendr', $site1);
     matrix_assert(in_array($entriesBySite[$site1]['lavender']->id . "-$site1", $fuzzy, true), "$driver fuzzy search failed", ['ids' => $fuzzy]);
 
+    $offsiteExactDocs = matrix_reflect($adapter, 'getTermDocuments', 'antibioti');
+    matrix_assert(
+        isset($offsiteExactDocs[$site2 . ':' . $entriesBySite[$site2]['antibioti']->id])
+            && !isset($offsiteExactDocs[$site1 . ':' . $entriesBySite[$site1]['antibiotic']->id]),
+        "$driver fuzzy fallback fixture did not create the expected off-site exact term",
+        ['docs' => $offsiteExactDocs]
+    );
+
+    $fuzzyWithOffsiteExact = matrix_search_ids($adapter, 'antibioti', $site1);
+    matrix_assert(
+        in_array($entriesBySite[$site1]['antibiotic']->id . "-$site1", $fuzzyWithOffsiteExact, true),
+        "$driver fuzzy search skipped fallback when an exact match existed on another site",
+        ['ids' => $fuzzyWithOffsiteExact]
+    );
+
+    $whyTerms = matrix_reflect($adapter, 'getDocumentTerms', $site1, $entriesBySite[$site1]['why']->id);
+    $whyTitleTerms = matrix_reflect($adapter, 'getTitleTerms', $site1 . ':' . $entriesBySite[$site1]['why']->id);
+    matrix_assert(isset($whyTerms['why']) && isset($whyTitleTerms['why']), "$driver title stop word was not indexed", [
+        'terms' => $whyTerms,
+        'titleTerms' => $whyTitleTerms,
+    ]);
+
+    $titleStopWord = matrix_search_ids($adapter, 'why', $site1);
+    matrix_assert(
+        $titleStopWord === [$entriesBySite[$site1]['why']->id . "-$site1"],
+        "$driver title stop-word search failed",
+        ['ids' => $titleStopWord]
+    );
+
     $none = matrix_search_ids($adapter, 'zzzzzzzzzzzz', $site1);
     matrix_assert($none === [], "$driver no-result search failed", ['ids' => $none]);
 
@@ -503,6 +532,8 @@ function matrix_run_driver(string $driver, string $token, array $entriesBySite, 
     matrix_pass("$driver driver matrix", [
         'exact' => $exact,
         'fuzzy' => $fuzzy,
+        'fuzzyWithOffsiteExact' => $fuzzyWithOffsiteExact,
+        'titleStopWord' => $titleStopWord,
         'count' => $count,
         'fields' => count($fields),
         'keywordFields' => count($keywordFields),
@@ -556,12 +587,15 @@ try {
             'lavender' => matrix_create_entry($section, $site1, "Beta Lavender Beacon Pageprobe $token"),
             'cedar' => matrix_create_entry($section, $site1, "Gamma Cedar Pageprobe $token"),
             'delete' => matrix_create_entry($section, $site1, "Delta Deleteprobe Pageprobe $token"),
+            'antibiotic' => matrix_create_entry($section, $site1, "Antibiotic Oil $token"),
+            'why' => matrix_create_entry($section, $site1, "Why do you sell the supplements you sell? $token"),
         ],
         $site2 => [
             'orchid' => matrix_create_entry($section, $site2, "Alpha Orchid Vitesse Pageprobe $token"),
             'lavender' => matrix_create_entry($section, $site2, "Beta Lavande Balise Pageprobe $token"),
             'cedar' => matrix_create_entry($section, $site2, "Gamma Cedre Pageprobe $token"),
             'delete' => matrix_create_entry($section, $site2, "Delta Supprimer Pageprobe $token"),
+            'antibioti' => matrix_create_entry($section, $site2, "Antibioti Exact $token"),
         ],
     ];
     matrix_pass('fixture entries', ['token' => $token, 'site1' => $site1, 'site2' => $site2]);
