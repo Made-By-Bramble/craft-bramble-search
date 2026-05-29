@@ -240,6 +240,23 @@ final class AdapterFeatureTest extends TestCase
         self::assertSame(['2:200'], $adapter->publicSiteDocuments(2));
         self::assertSame([], $adapter->publicSiteDocuments(1));
     }
+
+    public function testPruneIndexForSiteRemovesOnlyStaleDocumentsAfterRollingRebuild(): void
+    {
+        $adapter = new InMemorySearchAdapter();
+        $adapter->addTitle('Fresh Powder', 1, 100);
+        $adapter->addTitle('Old Powder', 1, 101);
+        $adapter->addTitle('Other Site Powder', 2, 200);
+
+        self::assertArrayHasKey('101-1', $adapter->searchElements(Entry::find()->siteId(1)->search('powder')));
+
+        self::assertTrue($adapter->pruneIndexForSite(1, [100]));
+
+        self::assertSame(['1:100'], $adapter->publicSiteDocuments(1));
+        self::assertSame(['2:200'], $adapter->publicSiteDocuments(2));
+        self::assertSame(['100-1'], array_keys($adapter->searchElements(Entry::find()->siteId(1)->search('powder'))));
+        self::assertSame(['200-2'], array_keys($adapter->searchElements(Entry::find()->siteId(2)->search('powder'))));
+    }
 }
 
 final class TestableCraftCacheSearchAdapter extends CraftCacheSearchAdapter

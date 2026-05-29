@@ -1,5 +1,11 @@
 # Release Notes for Bramble Search
 
+## 1.0.17
+- Changed full-site rebuilds to run as rolling rebuilds across all storage drivers, keeping the existing index searchable while current elements are re-indexed.
+- Prevented duplicate Bramble Search rebuild jobs from being queued while a rebuild for the same site is already waiting or running.
+- Added stale-document pruning after rolling rebuilds complete so removed or no-longer-searchable elements are cleaned up without a pre-rebuild purge.
+- Updated rebuild guidance to use `clear-caches/bramble-search` rather than broad cache clears that can remove cache-backed indexes.
+
 ## 1.0.16
 - Fixed score-ordered element searches to preserve the caller's element query criteria before Craft paginates results, restoring Commerce product search displays when higher-scoring matches from other element types exist.
 - Added regression coverage for filtering Bramble Search matches through the active element query before score pagination.

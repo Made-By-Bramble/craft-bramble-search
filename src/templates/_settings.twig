@@ -274,7 +274,7 @@
 {{ forms.field({
     id: 'rebuild-instructions',
     fieldClass: 'first',
-}, '<p class="light">' ~ "If you need to rebuild the entire search index because you cleared the cache manually or changed the storage driver, you have two options:"|t('bramble-search') ~ '</p>
+}, '<p class="light">' ~ "If you need to rebuild the entire search index, use the Bramble Search cache option. It queues a rolling rebuild so the current index remains available while the new pass runs."|t('bramble-search') ~ '</p>
     <div class="meta" style="margin-bottom:12px;">
 
     <div class="field">
@@ -291,13 +291,13 @@
             <label>' ~ "Via the Command Line"|t('bramble-search') ~ '</label>
         </div>
         <div class="input">
-            <p>' ~ "Run the command"|t('bramble-search') ~ ' <code>./craft clear-caches/all</code> ' ~ "or"|t('bramble-search') ~ ' <code>./craft clear-caches/bramble-search</code>.</p>
+            <p>' ~ "Run the command"|t('bramble-search') ~ ' <code>./craft clear-caches/bramble-search</code>.</p>
         </div>
     </div>
 
     </div>
 
-    <small class="light">' ~ "Note: Rebuilding the index may take some time depending on the size of your site."|t('bramble-search') ~ '</small>') }}
+    <small class="light">' ~ "Note: Rebuilding the index may take some time depending on the size of your site. Avoid clearing the underlying storage while a rebuild is running."|t('bramble-search') ~ '</small>') }}
 
 {% js %}
 document.addEventListener('DOMContentLoaded', function() {

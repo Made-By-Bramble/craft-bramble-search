@@ -3,7 +3,7 @@
 namespace MadeByBramble\BrambleSearch\jobs;
 
 use craft\base\Batchable;
-use craft\elements\db\ElementQuery;
+use craft\elements\db\ElementQueryInterface;
 
 /**
  * MultiElementTypeBatcher
@@ -14,7 +14,7 @@ use craft\elements\db\ElementQuery;
 class MultiElementTypeBatcher implements Batchable
 {
     /**
-     * @var ElementQuery[] Array of element queries to process
+     * @var ElementQueryInterface[] Array of element queries to process
      */
     private array $queries;
 
@@ -26,7 +26,7 @@ class MultiElementTypeBatcher implements Batchable
     /**
      * Constructor
      *
-     * @param ElementQuery[] $queries Array of element queries to process
+     * @param ElementQueryInterface[] $queries Array of element queries to process
      */
     public function __construct(array $queries)
     {

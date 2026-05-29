@@ -6,6 +6,8 @@ use Craft;
 use craft\base\Batchable;
 use craft\base\Element;
 use craft\base\ElementInterface;
+use craft\elements\db\ElementQueryInterface;
+use craft\models\Site;
 use craft\queue\BaseBatchedJob;
 use MadeByBramble\BrambleSearch\adapters\BaseSearchAdapter;
 
@@ -33,7 +35,7 @@ class RebuildIndexJob extends BaseBatchedJob
 
     /**
      * Lifecycle hook: runs once before all batches are processed
-     * Clears the existing index for the site before rebuilding
+     * Starts a rolling rebuild for the site without clearing the live index
      *
      * @return void
      */
@@ -53,9 +55,7 @@ class RebuildIndexJob extends BaseBatchedJob
             // Enable bulk mode to skip per-element updateTotalDocCount
             $this->setBulkMode($searchService, true);
 
-            // Clear the existing index for this site before rebuilding
-            Craft::info("Starting index rebuild for site ID: {$site->id}", __METHOD__);
-            $this->clearIndex($site->id);
+            Craft::info("Starting rolling index rebuild for site ID: {$site->id}", __METHOD__);
         } catch (\Throwable $e) {
             $this->releaseRebuildLock($site->id);
             throw $e;
@@ -87,11 +87,21 @@ class RebuildIndexJob extends BaseBatchedJob
             throw new \Exception("Site with ID {$this->siteId} not found");
         }
 
-        // Get all registered element types
+        // Return a MultiElementTypeBatcher that will handle batch processing for all element types
+        return new MultiElementTypeBatcher($this->elementQueries($site));
+    }
+
+    /**
+     * Build the element queries that define a complete site index.
+     *
+     * @param Site $site
+     * @return array<int,ElementQueryInterface>
+     */
+    protected function elementQueries(Site $site): array
+    {
         $elementTypes = Craft::$app->getElements()->getAllElementTypes();
         $queries = [];
 
-        // Build queries for each element type
         foreach ($elementTypes as $elementType) {
             /** @var class-string<ElementInterface> $elementType */
             $query = $elementType::find()
@@ -111,8 +121,7 @@ class RebuildIndexJob extends BaseBatchedJob
             $queries[] = $query;
         }
 
-        // Return a MultiElementTypeBatcher that will handle batch processing for all element types
-        return new MultiElementTypeBatcher($queries);
+        return $queries;
     }
 
     /**
@@ -149,6 +158,15 @@ class RebuildIndexJob extends BaseBatchedJob
         $searchService = $this->getSearchAdapter();
 
         try {
+            $site = Craft::$app->getSites()->getSiteById($this->siteId);
+            if (!$site) {
+                throw new \Exception("Site with ID {$this->siteId} not found");
+            }
+
+            if (!$searchService->pruneIndexForSite($site->id, $this->currentElementIds($site))) {
+                throw new \RuntimeException("Failed to prune Bramble Search index for site ID: {$site->id}");
+            }
+
             // Recalculate metadata once after all batches
             if (method_exists($searchService, 'refreshTotalDocCount')) {
                 $searchService->refreshTotalDocCount();
@@ -163,6 +181,28 @@ class RebuildIndexJob extends BaseBatchedJob
         }
 
         Craft::info("Index rebuild completed for site ID: {$this->siteId}", __METHOD__);
+    }
+
+    /**
+     * Return the element IDs that should remain in the completed site index.
+     *
+     * @param Site $site
+     * @return array<int>
+     */
+    protected function currentElementIds(Site $site): array
+    {
+        $ids = [];
+
+        foreach ($this->elementQueries($site) as $query) {
+            $query->limit(null);
+            $query->offset(null);
+
+            foreach ($query->ids() as $id) {
+                $ids[] = (int)$id;
+            }
+        }
+
+        return array_values(array_unique($ids));
     }
 
     /**
@@ -223,24 +263,6 @@ class RebuildIndexJob extends BaseBatchedJob
         }
 
         return $fieldHandles;
-    }
-
-    /**
-     * Clear the search index for a specific site
-     *
-     * Uses the search service's clearIndex method if available
-     *
-     * @param int $siteId The site ID to clear the index for
-     */
-    protected function clearIndex(int $siteId): void
-    {
-        Craft::info("Clearing search index for site ID: $siteId", __METHOD__);
-
-        $searchService = $this->getSearchAdapter();
-
-        if (!$searchService->clearIndex($siteId)) {
-            throw new \RuntimeException("Failed to clear Bramble Search index for site ID: $siteId");
-        }
     }
 
     protected function getSearchAdapter(): BaseSearchAdapter

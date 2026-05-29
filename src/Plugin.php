@@ -6,11 +6,14 @@ use Craft;
 use craft\base\Plugin as BasePlugin;
 use craft\console\Application as ConsoleApplication;
 use craft\controllers\ElementIndexesController;
+use craft\db\Query;
 use craft\elements\db\ElementQuery;
 use craft\events\RegisterCacheOptionsEvent;
 use craft\helpers\App;
 use craft\helpers\Component;
 use craft\helpers\ElementHelper;
+use craft\helpers\Queue as QueueHelper;
+use craft\queue\Queue as CraftQueue;
 use craft\search\SearchQuery;
 use craft\services\ElementSources;
 use craft\utilities\ClearCaches;
@@ -206,15 +209,13 @@ class Plugin extends BasePlugin
                 $options['bramble-search'] = [
                     'label' => 'Bramble Search',
                     'key' => 'bramble-search',
-                    'info' => Craft::t('bramble-search', 'Triggers a queued rebuild of the search index.'),
+                    'info' => Craft::t('bramble-search', 'Triggers a queued rolling rebuild of the search index.'),
                     'action' => function() {
                         if (!(Craft::$app->getSearch() instanceof BaseSearchAdapter)) {
                             throw new \RuntimeException('Bramble Search is not active as the Craft search service.');
                         }
 
-                        Craft::$app->getQueue()->push(new RebuildIndexJob([
-                            'siteId' => Craft::$app->getSites()->currentSite->id,
-                        ]));
+                        $this->queueRebuildIndexJob(Craft::$app->getSites()->currentSite->id);
                     },
                 ];
                 $event->options = $options;
@@ -243,6 +244,130 @@ class Plugin extends BasePlugin
             \craft\services\Elements::EVENT_AFTER_SAVE_ELEMENT,
             [$this, 'handleElementSave']
         );
+    }
+
+    /**
+     * Queues a rebuild job unless one is already waiting or running for the site.
+     *
+     * @param int $siteId
+     * @return void
+     */
+    protected function queueRebuildIndexJob(int $siteId): void
+    {
+        $mutexName = "bramble-search:rebuild-index-queue:$siteId";
+        $mutex = Craft::$app->getMutex();
+
+        if (!$mutex->acquire($mutexName, 5)) {
+            Craft::warning(
+                "Bramble Search rebuild queue lock could not be acquired for site ID: $siteId; skipping duplicate queue request.",
+                'bramble-search'
+            );
+            return;
+        }
+
+        try {
+            if ($this->hasQueuedRebuildIndexJob($siteId)) {
+                Craft::info(
+                    "Bramble Search rebuild is already queued or running for site ID: $siteId; skipping duplicate queue request.",
+                    'bramble-search'
+                );
+
+                $request = Craft::$app->getRequest();
+                if ($request instanceof \craft\web\Request && $request->getIsCpRequest()) {
+                    Craft::$app->getSession()->setNotice(Craft::t(
+                        'bramble-search',
+                        'Bramble Search rebuild is already queued or running.'
+                    ));
+                }
+
+                return;
+            }
+
+            QueueHelper::push(new RebuildIndexJob([
+                'siteId' => $siteId,
+            ]));
+        } finally {
+            $mutex->release($mutexName);
+        }
+    }
+
+    /**
+     * Checks whether a Bramble Search rebuild job is already waiting or running.
+     *
+     * @param int $siteId
+     * @return bool
+     */
+    protected function hasQueuedRebuildIndexJob(int $siteId): bool
+    {
+        $queue = Craft::$app->getQueue();
+        if (!($queue instanceof CraftQueue)) {
+            return false;
+        }
+
+        $rows = (new Query())
+            ->select(['id', 'job'])
+            ->from($queue->tableName)
+            ->where([
+                'channel' => $this->queueChannel($queue),
+                'fail' => false,
+            ])
+            ->all($queue->db);
+
+        foreach ($rows as $row) {
+            [$job, $error] = $queue->unserializeMessage($this->queueJobData($row['job']));
+            if ($error !== null || !($job instanceof RebuildIndexJob)) {
+                continue;
+            }
+
+            if ($job->siteId === null || (int)$job->siteId === $siteId) {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    /**
+     * Returns the queue channel value Craft uses for the queue component.
+     *
+     * @param CraftQueue $queue
+     * @return string
+     */
+    protected function queueChannel(CraftQueue $queue): string
+    {
+        if ($queue->channel !== null) {
+            return $queue->channel;
+        }
+
+        foreach (Craft::$app->getComponents(false) as $id => $component) {
+            if ($component === $queue) {
+                return (string)$id;
+            }
+        }
+
+        return 'queue';
+    }
+
+    /**
+     * Normalizes queue job data before passing it to Yii's queue serializer.
+     *
+     * @param mixed $job
+     * @return string
+     */
+    protected function queueJobData(mixed $job): string
+    {
+        if (is_resource($job)) {
+            $job = stream_get_contents($job);
+
+            if (is_string($job) && str_starts_with($job, 'x')) {
+                $hex = substr($job, 1);
+                if (ctype_xdigit($hex)) {
+                    $job = hex2bin($hex);
+                }
+            }
+        }
+
+        return (string)$job;
     }
 
     /**

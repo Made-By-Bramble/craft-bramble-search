@@ -1189,6 +1189,75 @@ abstract class BaseSearchAdapter extends Search
     }
 
     /**
+     * Remove indexed documents for a site that were not present in the latest rebuild pass.
+     *
+     * Rebuild jobs call this after all current elements have been indexed so searches can
+     * continue using the previous index while the new one is being built.
+     *
+     * @param int $siteId The site ID to prune
+     * @param array<int> $activeElementIds Element IDs that should remain indexed
+     * @return bool Whether the operation was successful
+     */
+    public function pruneIndexForSite(int $siteId, array $activeElementIds): bool
+    {
+        try {
+            $activeDocIds = [];
+            foreach ($activeElementIds as $elementId) {
+                $elementId = (int)$elementId;
+                if ($elementId > 0) {
+                    $activeDocIds["$siteId:$elementId"] = true;
+                }
+            }
+
+            $removed = 0;
+            $totalLengthToRemove = 0;
+
+            foreach ($this->getSiteDocuments($siteId) as $docId) {
+                if (isset($activeDocIds[$docId])) {
+                    continue;
+                }
+
+                [$docSiteId, $elementId] = explode(':', $docId, 2);
+                if ((int)$docSiteId !== $siteId) {
+                    continue;
+                }
+
+                $totalLengthToRemove += $this->getDocumentLength($docId);
+                if (!$this->deleteElementFromIndex((int)$elementId, $siteId)) {
+                    return false;
+                }
+
+                $removed++;
+            }
+
+            if ($totalLengthToRemove > 0) {
+                $this->updateTotalLength(-$totalLengthToRemove);
+            }
+
+            if ($removed > 0) {
+                $this->cleanupOrphanedTerms();
+            }
+
+            $this->updateTotalDocCount();
+
+            Craft::info(
+                sprintf(
+                    'Search index pruned for site ID: %d; removed %d stale document%s',
+                    $siteId,
+                    $removed,
+                    $removed === 1 ? '' : 's'
+                ),
+                __METHOD__
+            );
+
+            return true;
+        } catch (\Throwable $e) {
+            Craft::error("Error pruning search index: " . $e->getMessage(), __METHOD__);
+            return false;
+        }
+    }
+
+    /**
      * Delete an element from the index completely
      *
      * Removes all references to the element from the search index,
