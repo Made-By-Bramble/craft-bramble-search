@@ -379,6 +379,23 @@ final class AdapterFeatureTest extends TestCase
         self::assertSame(['100-1'], array_keys($adapter->searchElements(Entry::find()->siteId(1)->search('powder'))));
         self::assertSame(['200-2'], array_keys($adapter->searchElements(Entry::find()->siteId(2)->search('powder'))));
     }
+
+    public function testDeleteElementIndexRemovesDeletedElementImmediately(): void
+    {
+        $adapter = new InMemorySearchAdapter();
+        $adapter->addTitle('Old Powder', 1, 101);
+
+        $element = new Entry();
+        $element->id = 101;
+        $element->siteId = 1;
+
+        self::assertSame(['1:101'], $adapter->publicSiteDocuments(1));
+        self::assertTrue($adapter->deleteElementIndex($element));
+
+        self::assertSame([], $adapter->publicSiteDocuments(1));
+        self::assertSame(0, $adapter->publicTotalLength());
+        self::assertSame([], $adapter->searchElements(Entry::find()->siteId(1)->search('powder')));
+    }
 }
 
 final class TestableCraftCacheSearchAdapter extends CraftCacheSearchAdapter

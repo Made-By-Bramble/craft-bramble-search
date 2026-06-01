@@ -11,6 +11,24 @@ use PHPUnit\Framework\TestCase;
 
 final class RebuildIndexJobTest extends TestCase
 {
+    public function testRebuildJobRetriesExpiredOrFailedAttempts(): void
+    {
+        $job = new FailingBatchSetupRebuildIndexJob(['siteId' => 1]);
+
+        self::assertSame(1800, $job->getTtr());
+        self::assertTrue($job->canRetry(1, new \RuntimeException('transient')));
+        self::assertTrue($job->canRetry(2, new \RuntimeException('transient')));
+        self::assertFalse($job->canRetry(3, new \RuntimeException('transient')));
+    }
+
+    public function testExpiredRebuildLockDetectionUsesJobTtrBuffer(): void
+    {
+        $job = new FailingBatchSetupRebuildIndexJob(['siteId' => 1]);
+
+        self::assertFalse($job->publicIsExpiredRebuildLock(time()));
+        self::assertTrue($job->publicIsExpiredRebuildLock(time() - 1900));
+    }
+
     public function testFailedBatchReleasesOwnedRebuildLock(): void
     {
         $job = new FailingBatchSetupRebuildIndexJob([
@@ -72,6 +90,11 @@ final class FailingBatchSetupRebuildIndexJob extends RebuildIndexJob
     {
         $this->releasedSiteId = $siteId;
         $this->rebuildLockAcquired = false;
+    }
+
+    public function publicIsExpiredRebuildLock(mixed $lockValue): bool
+    {
+        return $this->isExpiredRebuildLock($lockValue);
     }
 }
 

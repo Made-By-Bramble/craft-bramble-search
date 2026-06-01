@@ -86,30 +86,56 @@ class MySqlSearchAdapter extends BaseSearchAdapter
         $table = $this->tablePrefix . 'metadata}}';
         $now = new \DateTime();
         $dateTime = $now->format('Y-m-d H:i:s');
+        $mutex = Craft::$app->getMutex();
+        $mutexName = "bramble-search:metadata:$key";
 
-        $this->withDeadlockRetry(function() use ($db, $table, $key, $value, $dateTime) {
-            $affected = $db->createCommand()
-                ->update($table, [
-                    'value' => $value,
-                    'dateUpdated' => $dateTime,
-                ], [
-                    'key' => $key,
-                ])
-                ->execute();
+        if (!$mutex->acquire($mutexName, 5)) {
+            throw new \RuntimeException("Unable to acquire Bramble Search metadata lock for $key.");
+        }
 
-            // Row does not exist yet (first indexing run) — insert it
-            if ($affected === 0) {
-                $db->createCommand()
-                    ->insert($table, [
-                        'key' => $key,
-                        'value' => $value,
-                        'dateCreated' => $dateTime,
-                        'dateUpdated' => $dateTime,
-                        'uid' => StringHelper::UUID(),
-                    ])
-                    ->execute();
-            }
-        });
+        try {
+            $this->withDeadlockRetry(function() use ($db, $table, $key, $value, $dateTime) {
+                $db->transaction(function() use ($db, $table, $key, $value, $dateTime) {
+                    $ids = (new Query())
+                        ->select(['id'])
+                        ->from($table)
+                        ->where(['key' => $key])
+                        ->orderBy(['id' => SORT_ASC])
+                        ->column($db);
+
+                    if (empty($ids)) {
+                        $db->createCommand()
+                            ->insert($table, [
+                                'key' => $key,
+                                'value' => $value,
+                                'dateCreated' => $dateTime,
+                                'dateUpdated' => $dateTime,
+                                'uid' => StringHelper::UUID(),
+                            ])
+                            ->execute();
+                        return;
+                    }
+
+                    $keepId = (int)array_shift($ids);
+                    if (!empty($ids)) {
+                        $db->createCommand()
+                            ->delete($table, ['id' => array_map('intval', $ids)])
+                            ->execute();
+                    }
+
+                    $db->createCommand()
+                        ->update($table, [
+                            'value' => $value,
+                            'dateUpdated' => $dateTime,
+                        ], [
+                            'id' => $keepId,
+                        ])
+                        ->execute();
+                });
+            });
+        } finally {
+            $mutex->release($mutexName);
+        }
     }
 
     // =========================================================================
@@ -294,16 +320,29 @@ class MySqlSearchAdapter extends BaseSearchAdapter
     {
         $now = new \DateTime();
         $dateTime = $now->format('Y-m-d H:i:s');
+        $docId = "{$siteId}:{$elementId}";
 
-        Craft::$app->getDb()->createCommand()
-            ->insert($this->tablePrefix . 'metadata}}', [
-                'key' => 'doc',
-                'value' => "{$siteId}:{$elementId}",
-                'dateCreated' => $dateTime,
-                'dateUpdated' => $dateTime,
-                'uid' => StringHelper::UUID(),
-            ])
-            ->execute();
+        $this->withDeadlockRetry(function() use ($docId, $dateTime) {
+            $db = Craft::$app->getDb();
+            $db->transaction(function() use ($db, $docId, $dateTime) {
+                $db->createCommand()
+                    ->delete($this->tablePrefix . 'metadata}}', [
+                        'key' => 'doc',
+                        'value' => $docId,
+                    ])
+                    ->execute();
+
+                $db->createCommand()
+                    ->insert($this->tablePrefix . 'metadata}}', [
+                        'key' => 'doc',
+                        'value' => $docId,
+                        'dateCreated' => $dateTime,
+                        'dateUpdated' => $dateTime,
+                        'uid' => StringHelper::UUID(),
+                    ])
+                    ->execute();
+            });
+        });
     }
 
     /**
@@ -336,11 +375,12 @@ class MySqlSearchAdapter extends BaseSearchAdapter
     protected function updateTotalDocCount(): void
     {
         $count = (new Query())
+            ->select(new Expression('COUNT(DISTINCT [[value]])'))
             ->from($this->tablePrefix . 'metadata}}')
             ->where(['key' => 'doc'])
-            ->count();
+            ->scalar();
 
-        $this->upsertSingletonMeta('totalDocs', (string)$count);
+        $this->upsertSingletonMeta('totalDocs', (string)((int)$count));
     }
 
     /**
@@ -356,31 +396,57 @@ class MySqlSearchAdapter extends BaseSearchAdapter
         $table = $this->tablePrefix . 'metadata}}';
         $now = new \DateTime();
         $dateTime = $now->format('Y-m-d H:i:s');
+        $mutex = Craft::$app->getMutex();
+        $mutexName = 'bramble-search:metadata:totalLength';
 
-        $this->withDeadlockRetry(function() use ($db, $table, $docLen, $dateTime) {
-            // Atomic increment — no read-then-write race condition
-            $affected = $db->createCommand()
-                ->update($table, [
-                    'value' => new Expression('CAST([[value]] AS SIGNED) + :docLen', [':docLen' => $docLen]),
-                    'dateUpdated' => $dateTime,
-                ], [
-                    'key' => 'totalLength',
-                ])
-                ->execute();
+        if (!$mutex->acquire($mutexName, 5)) {
+            throw new \RuntimeException('Unable to acquire Bramble Search metadata lock for totalLength.');
+        }
 
-            // Row does not exist yet (first indexing run) — insert it
-            if ($affected === 0) {
-                $db->createCommand()
-                    ->insert($table, [
-                        'key' => 'totalLength',
-                        'value' => (string)$docLen,
-                        'dateCreated' => $dateTime,
-                        'dateUpdated' => $dateTime,
-                        'uid' => StringHelper::UUID(),
-                    ])
-                    ->execute();
-            }
-        });
+        try {
+            $this->withDeadlockRetry(function() use ($db, $table, $docLen, $dateTime) {
+                $db->transaction(function() use ($db, $table, $docLen, $dateTime) {
+                    $rows = (new Query())
+                        ->select(['id', 'value'])
+                        ->from($table)
+                        ->where(['key' => 'totalLength'])
+                        ->orderBy(['dateUpdated' => SORT_DESC, 'id' => SORT_DESC])
+                        ->all($db);
+
+                    if (empty($rows)) {
+                        $db->createCommand()
+                            ->insert($table, [
+                                'key' => 'totalLength',
+                                'value' => (string)max(0, $docLen),
+                                'dateCreated' => $dateTime,
+                                'dateUpdated' => $dateTime,
+                                'uid' => StringHelper::UUID(),
+                            ])
+                            ->execute();
+                        return;
+                    }
+
+                    $keep = array_shift($rows);
+                    if (!empty($rows)) {
+                        $db->createCommand()
+                            ->delete($table, ['id' => array_map(fn(array $row): int => (int)$row['id'], $rows)])
+                            ->execute();
+                    }
+
+                    $totalLength = max(0, (int)$keep['value'] + $docLen);
+                    $db->createCommand()
+                        ->update($table, [
+                            'value' => (string)$totalLength,
+                            'dateUpdated' => $dateTime,
+                        ], [
+                            'id' => (int)$keep['id'],
+                        ])
+                        ->execute();
+                });
+            });
+        } finally {
+            $mutex->release($mutexName);
+        }
     }
 
     /**
@@ -394,6 +460,7 @@ class MySqlSearchAdapter extends BaseSearchAdapter
             ->select(['value'])
             ->from($this->tablePrefix . 'metadata}}')
             ->where(['key' => 'totalDocs'])
+            ->orderBy(['dateUpdated' => SORT_DESC, 'id' => SORT_DESC])
             ->scalar();
 
         // Handle false return
@@ -415,6 +482,7 @@ class MySqlSearchAdapter extends BaseSearchAdapter
             ->select(['value'])
             ->from($this->tablePrefix . 'metadata}}')
             ->where(['key' => 'totalLength'])
+            ->orderBy(['dateUpdated' => SORT_DESC, 'id' => SORT_DESC])
             ->scalar();
 
         // Handle false return
@@ -670,25 +738,20 @@ class MySqlSearchAdapter extends BaseSearchAdapter
     {
         $results = (new Query())
             ->select(['value'])
+            ->distinct()
             ->from($this->tablePrefix . 'metadata}}')
-            ->where(['key' => 'doc'])
+            ->where([
+                'AND',
+                ['key' => 'doc'],
+                ['LIKE', 'value', "$siteId:%", false],
+            ])
             ->column();
 
         if (empty($results)) {
             return [];
         }
 
-        // Filter documents by site ID
-        $sitePrefix = "$siteId:";
-        $siteDocs = [];
-
-        foreach ($results as $docId) {
-            if (strpos($docId, $sitePrefix) === 0) {
-                $siteDocs[] = $docId;
-            }
-        }
-
-        return $siteDocs;
+        return array_values(array_map('strval', $results));
     }
 
     /**
@@ -714,6 +777,98 @@ class MySqlSearchAdapter extends BaseSearchAdapter
     protected function resetTotalLength(): void
     {
         $this->upsertSingletonMeta('totalLength', '0');
+    }
+
+    /**
+     * Remove stale indexed documents for a site using bulk SQL operations.
+     *
+     * @param int $siteId The site ID to prune
+     * @param array<int> $activeElementIds Element IDs that should remain indexed
+     * @return bool Whether the operation was successful
+     */
+    public function pruneIndexForSite(int $siteId, array $activeElementIds): bool
+    {
+        try {
+            $activeDocIds = [];
+            foreach ($activeElementIds as $elementId) {
+                $elementId = (int)$elementId;
+                if ($elementId > 0) {
+                    $activeDocIds["$siteId:$elementId"] = true;
+                }
+            }
+
+            $staleDocIds = array_values(array_diff($this->getSiteDocuments($siteId), array_keys($activeDocIds)));
+            if (empty($staleDocIds)) {
+                $this->updateTotalDocCount();
+                Craft::info("Search index pruned for site ID: $siteId; removed 0 stale documents", __METHOD__);
+                return true;
+            }
+
+            $db = Craft::$app->getDb();
+            $staleElementIds = array_values(array_unique(array_map(
+                fn(string $docId): int => (int)explode(':', $docId, 2)[1],
+                $staleDocIds
+            )));
+
+            $totalLength = (new Query())
+                ->from($this->tablePrefix . 'documents}}')
+                ->where([
+                    'siteId' => $siteId,
+                    'elementId' => $staleElementIds,
+                    'term' => '_length',
+                ])
+                ->sum('frequency');
+
+            foreach (array_chunk($staleDocIds, 500) as $docIdChunk) {
+                $db->createCommand()
+                    ->delete($this->tablePrefix . 'terms}}', ['docId' => $docIdChunk])
+                    ->execute();
+
+                $db->createCommand()
+                    ->delete($this->tablePrefix . 'metadata}}', [
+                        'key' => 'doc',
+                        'value' => $docIdChunk,
+                    ])
+                    ->execute();
+            }
+
+            foreach (array_chunk($staleElementIds, 500) as $elementIdChunk) {
+                $db->createCommand()
+                    ->delete($this->tablePrefix . 'documents}}', [
+                        'siteId' => $siteId,
+                        'elementId' => $elementIdChunk,
+                    ])
+                    ->execute();
+
+                $db->createCommand()
+                    ->delete($this->tablePrefix . 'titles}}', [
+                        'siteId' => $siteId,
+                        'elementId' => $elementIdChunk,
+                    ])
+                    ->execute();
+            }
+
+            if ($totalLength) {
+                $this->updateTotalLength(-(int)$totalLength);
+            }
+
+            $this->updateTotalDocCount();
+
+            Craft::info(
+                sprintf(
+                    'Search index pruned for site ID: %d; removed %d stale document%s',
+                    $siteId,
+                    count($staleDocIds),
+                    count($staleDocIds) === 1 ? '' : 's'
+                ),
+                __METHOD__
+            );
+
+            return true;
+        } catch (\Throwable $e) {
+            Craft::error("Error pruning search index: " . $e->getMessage(), __METHOD__);
+            return false;
+        }
     }
 
     // =========================================================================
@@ -915,13 +1070,13 @@ class MySqlSearchAdapter extends BaseSearchAdapter
      * @param array|null $fieldHandles The field handles to index
      * @return bool Whether the indexing was successful
      */
-    public function indexElementAttributes(ElementInterface $element, array|null $fieldHandles = null): bool
+    protected function indexElementAttributesUnlocked(ElementInterface $element, array|null $fieldHandles = null): bool
     {
         if (!$element->id || !$element->siteId) {
             return true;
         }
 
-        if (!$element->enabled || !$element->getEnabledForSite()) {
+        if (($element->dateDeleted ?? null) !== null || !$element->enabled || !$element->getEnabledForSite()) {
             return $this->removeElementFromIndexAndUpdateMetadata($element);
         }
 

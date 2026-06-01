@@ -1,5 +1,12 @@
 # Release Notes for Bramble Search
 
+## 1.1.0
+- Added a metadata repair migration that collapses duplicate document metadata and recalculates total document and token counts from the current index.
+- Made rebuild jobs retryable with a bounded TTR and stale lock recovery so interrupted queue workers do not permanently block future rebuilds.
+- Pruned stale MySQL index documents in bulk after rolling rebuilds and protected metadata singleton updates against duplicate rows.
+- Removed deleted elements from the index immediately on element delete events and restored Craft-compatible per-element index locking.
+- Added regression coverage for deleted element cleanup, retryable rebuild jobs, and expired rebuild lock recovery.
+
 ## 1.0.19
 - Fixed rolling rebuild failures so jobs that own the site-level rebuild lock release it when any batch lifecycle step fails.
 - Cleared stale rebuild locks before queueing a new rebuild when Craft's queue has no waiting or running rebuild job for the site.

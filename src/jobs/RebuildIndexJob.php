@@ -10,6 +10,7 @@ use craft\elements\db\ElementQueryInterface;
 use craft\models\Site;
 use craft\queue\BaseBatchedJob;
 use MadeByBramble\BrambleSearch\adapters\BaseSearchAdapter;
+use yii\queue\RetryableJobInterface;
 
 /**
  * Rebuild Index Job
@@ -18,9 +19,12 @@ use MadeByBramble\BrambleSearch\adapters\BaseSearchAdapter;
  * Uses Craft's batched job system to automatically split processing across
  * multiple job executions, preventing timeouts on large sites.
  */
-class RebuildIndexJob extends BaseBatchedJob
+class RebuildIndexJob extends BaseBatchedJob implements RetryableJobInterface
 {
     private const LOCK_TTL = 21600;
+    private const JOB_TTR = 1800;
+    private const MAX_ATTEMPTS = 3;
+    private const LOCK_STALE_BUFFER = 60;
 
     /**
      * The site ID to rebuild the index for
@@ -37,6 +41,22 @@ class RebuildIndexJob extends BaseBatchedJob
      * Whether this queued rebuild owns the site-level rebuild lock.
      */
     public bool $rebuildLockAcquired = false;
+
+    /**
+     * @inheritdoc
+     */
+    public function getTtr()
+    {
+        return self::JOB_TTR;
+    }
+
+    /**
+     * @inheritdoc
+     */
+    public function canRetry($attempt, $error)
+    {
+        return $attempt < self::MAX_ATTEMPTS;
+    }
 
     /**
      * @inheritdoc
@@ -332,11 +352,54 @@ class RebuildIndexJob extends BaseBatchedJob
 
     protected function acquireRebuildLock(int $siteId): void
     {
-        if (!Craft::$app->getCache()->add($this->rebuildLockKey($siteId), time(), self::LOCK_TTL)) {
+        $cache = Craft::$app->getCache();
+        $key = $this->rebuildLockKey($siteId);
+
+        if (!$this->storeRebuildLock($key)) {
+            $lockValue = $cache->get($key);
+            if ($this->isExpiredRebuildLock($lockValue)) {
+                $cache->delete($key);
+                if ($this->storeRebuildLockAfterClear($key)) {
+                    Craft::warning(
+                        "Cleared expired Bramble Search rebuild lock for site ID: $siteId.",
+                        __METHOD__
+                    );
+                    $this->rebuildLockAcquired = true;
+                    return;
+                }
+            }
+
             throw new \RuntimeException("A Bramble Search index rebuild is already running for site ID: $siteId");
         }
 
         $this->rebuildLockAcquired = true;
+    }
+
+    protected function storeRebuildLock(string $key): bool
+    {
+        return Craft::$app->getCache()->add($key, time(), self::LOCK_TTL);
+    }
+
+    protected function storeRebuildLockAfterClear(string $key): bool
+    {
+        return Craft::$app->getCache()->add($key, time(), self::LOCK_TTL);
+    }
+
+    protected function isExpiredRebuildLock(mixed $lockValue): bool
+    {
+        $timestamp = null;
+
+        if (is_numeric($lockValue)) {
+            $timestamp = (int)$lockValue;
+        } elseif (is_array($lockValue) && isset($lockValue['time']) && is_numeric($lockValue['time'])) {
+            $timestamp = (int)$lockValue['time'];
+        }
+
+        if ($timestamp === null) {
+            return false;
+        }
+
+        return time() - $timestamp > (self::JOB_TTR + self::LOCK_STALE_BUFFER);
     }
 
     protected function releaseRebuildLock(?int $siteId): void

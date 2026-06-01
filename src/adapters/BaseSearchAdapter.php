@@ -129,12 +129,69 @@ abstract class BaseSearchAdapter extends Search
      */
     public function indexElementAttributes(ElementInterface $element, array|null $fieldHandles = null): bool
     {
+        return $this->withElementIndexLock(
+            $element,
+            fn() => $this->indexElementAttributesUnlocked($element, $fieldHandles)
+        );
+    }
+
+    /**
+     * Remove an element from the index while preserving metadata consistency.
+     *
+     * @param ElementInterface $element The element to remove
+     * @return bool Whether the removal was successful
+     */
+    public function deleteElementIndex(ElementInterface $element): bool
+    {
+        return $this->withElementIndexLock(
+            $element,
+            fn() => $this->removeElementFromIndexAndUpdateMetadata($element)
+        );
+    }
+
+    /**
+     * Run an element index mutation under Craft's normal searchindex mutex.
+     *
+     * @param ElementInterface $element The element being mutated
+     * @param callable $callback Mutation callback
+     * @return bool Whether the mutation was successful
+     */
+    protected function withElementIndexLock(ElementInterface $element, callable $callback): bool
+    {
+        if (!$element->id || !$element->siteId) {
+            return true;
+        }
+
+        $mutex = Craft::$app->getMutex();
+        $lockKey = "searchindex:$element->id:$element->siteId";
+
+        if (!$mutex->acquire($lockKey)) {
+            // Match Craft's behavior: assume the concurrent writer has the freshest state.
+            return true;
+        }
+
+        try {
+            return (bool)$callback();
+        } finally {
+            $mutex->release($lockKey);
+        }
+    }
+
+    /**
+     * Index an element's attributes after the caller has acquired the element lock.
+     *
+     * @param ElementInterface $element The element to index
+     * @param array|null $fieldHandles Specific field handles to index, or null for all
+     * @return bool Whether the indexing was successful
+     */
+    protected function indexElementAttributesUnlocked(ElementInterface $element, array|null $fieldHandles = null): bool
+    {
         // Skip elements without ID or site ID
         if (!$element->id || !$element->siteId) {
             return true;
         }
 
-        if (!$element->enabled || !$element->getEnabledForSite()) {
+        if (($element->dateDeleted ?? null) !== null || !$element->enabled || !$element->getEnabledForSite()) {
             return $this->removeElementFromIndexAndUpdateMetadata($element);
         }
 

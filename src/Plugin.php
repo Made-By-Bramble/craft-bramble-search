@@ -56,7 +56,7 @@ class Plugin extends BasePlugin
      *
      * @var string
      */
-    public string $schemaVersion = '1.0.1';
+    public string $schemaVersion = '1.0.2';
 
     /**
      * Indicates that the plugin has Control Panel settings.
@@ -243,6 +243,16 @@ class Plugin extends BasePlugin
         Craft::$app->getElements()->on(
             \craft\services\Elements::EVENT_AFTER_SAVE_ELEMENT,
             [$this, 'handleElementSave']
+        );
+
+        Craft::$app->getElements()->on(
+            \craft\services\Elements::EVENT_AFTER_DELETE_ELEMENT,
+            [$this, 'handleElementDelete']
+        );
+
+        Craft::$app->getElements()->on(
+            \craft\services\Elements::EVENT_AFTER_DELETE_FOR_SITE,
+            [$this, 'handleElementDelete']
         );
     }
 
@@ -747,6 +757,28 @@ class Plugin extends BasePlugin
             // Queue the indexing (this will use the queue for web requests)
             $searchService->queueIndexElement($element, $fieldHandles);
         }
+    }
+
+    /**
+     * Handles element deletion events so Bramble Search does not retain stale documents.
+     *
+     * @param \craft\events\ElementEvent $event The element event
+     * @return void
+     */
+    public function handleElementDelete(\craft\events\ElementEvent $event): void
+    {
+        $element = $event->element;
+
+        if (!$element->id || !$element->siteId) {
+            return;
+        }
+
+        $searchService = Craft::$app->getSearch();
+        if (!($searchService instanceof BaseSearchAdapter)) {
+            return;
+        }
+
+        $searchService->deleteElementIndex($element);
     }
 
     /**
