@@ -70,7 +70,6 @@ abstract class BaseSearchAdapter extends Search
      */
     protected int $fuzzySearchMaxCandidates = 100;
 
-
     // =========================================================================
     // INITIALIZATION METHODS
     // =========================================================================
@@ -313,7 +312,9 @@ abstract class BaseSearchAdapter extends Search
     {
         $siteId = $elementQuery->siteId ?? Craft::$app->sites->currentSite->id;
         $searchQuery = $this->normalizeSearchQueryToString($elementQuery->search);
-        $tokens = $this->getSearchTokens($searchQuery);
+        $rawTokens = $this->tokenize($searchQuery);
+        $isTypeaheadQuery = $this->isSearchAsYouTypeQuery($searchQuery, $rawTokens);
+        $tokens = $this->getSearchTokens($searchQuery, $isTypeaheadQuery);
 
         // If no searchable tokens were provided, return empty results
         if (empty($tokens)) {
@@ -329,15 +330,15 @@ abstract class BaseSearchAdapter extends Search
         $termMatches = [];
         // Track scores for each document
         $docScores = [];
-        // Track which terms matched for each document (for exact phrase matching)
-        $matchedTerms = [];
         // Collect all matching documents and their term data for batch processing
         $allDocuments = [];
         $termData = []; // [termIndex][docId] = ['freq' => freq, 'docFreq' => docFreq, 'actualTerm' => term]
+        $lastTokenIndex = array_key_last($tokens);
 
         // First pass: collect all documents matching each term
         foreach ($tokens as $termIndex => $term) {
             $termMatches[$termIndex] = [];
+            $isTypeaheadTerm = $isTypeaheadQuery && $termIndex === $lastTokenIndex;
 
             // Try exact match first
             $termDocs = $this->filterDocumentsBySite($this->getTermDocuments($term), (int)$siteId);
@@ -346,7 +347,6 @@ abstract class BaseSearchAdapter extends Search
                 $docFreq = count($termDocs);
                 foreach ($termDocs as $docId => $freq) {
                     $termMatches[$termIndex][$docId] = true;
-                    $matchedTerms[$docId][$term] = true;
                     $allDocuments[$docId] = true;
                     $termData[$termIndex][$docId] = [
                         'freq' => $freq,
@@ -354,6 +354,53 @@ abstract class BaseSearchAdapter extends Search
                         'actualTerm' => $term,
                         'confidence' => 1.0,
                     ];
+                }
+            }
+
+            if ($isTypeaheadTerm) {
+                $priorDocIds = $termIndex > 0 ? $this->getDocsMatchingPreviousTerms($termMatches, $termIndex) : null;
+                $completedTerms = array_slice($tokens, 0, $termIndex);
+                $prefixTerms = $this->findTypeaheadMatchScores($term, (int)$siteId, $priorDocIds, $completedTerms);
+
+                foreach ($prefixTerms as $prefixTerm => $confidence) {
+                    if ($prefixTerm === $term) {
+                        continue;
+                    }
+
+                    $prefixDocs = $this->filterDocumentsBySite($this->getTermDocuments($prefixTerm), (int)$siteId);
+                    if (empty($prefixDocs)) {
+                        continue;
+                    }
+
+                    $docFreq = count($prefixDocs);
+                    foreach ($prefixDocs as $docId => $freq) {
+                        if ($this->shouldSkipNonTitleTypeaheadMatch($term, $prefixTerm, (string)$docId)) {
+                            continue;
+                        }
+
+                        $docConfidence = $confidence;
+                        if (!$this->isTermInTitle($prefixTerm, (string)$docId)) {
+                            $docConfidence *= $this->getNonTitleTypeaheadConfidenceMultiplier($term);
+                        }
+
+                        $matchData = [
+                            'freq' => $freq,
+                            'docFreq' => $docFreq,
+                            'actualTerm' => $prefixTerm,
+                            'confidence' => $docConfidence,
+                        ];
+
+                        if (
+                            isset($termData[$termIndex][$docId])
+                            && !$this->shouldReplaceSearchTermMatch($docId, $termData[$termIndex][$docId], $matchData)
+                        ) {
+                            continue;
+                        }
+
+                        $termMatches[$termIndex][$docId] = true;
+                        $allDocuments[$docId] = true;
+                        $termData[$termIndex][$docId] = $matchData;
+                    }
                 }
             }
 
@@ -381,7 +428,6 @@ abstract class BaseSearchAdapter extends Search
                     }
 
                     $termMatches[$termIndex][$docId] = true;
-                    $matchedTerms[$docId][$term] = true;
                     $allDocuments[$docId] = true;
                     $termData[$termIndex][$docId] = [
                         'freq' => $freq,
@@ -435,12 +481,28 @@ abstract class BaseSearchAdapter extends Search
             $filteredScores[$docId] = $docScores[$docId];
         }
 
-        // Apply exact match boosting for multi-term queries
-        if (count($tokens) > 1) {
-            foreach ($filteredScores as $docId => $score) {
-                // Check if the document contains the exact phrase
-                if ($this->containsExactPhrase($docId, $searchQuery)) {
+        foreach (array_keys($filteredScores) as $docId) {
+            if (
+                $this->shouldBoostExactTitleTermSet($tokens, $isTypeaheadQuery)
+                && $this->containsExactTitleTermSet($docId, $tokens)
+            ) {
+                $filteredScores[$docId] *= $this->exactMatchBoostFactor * $this->titleBoostFactor;
+                $filteredScores[$docId] += $this->exactMatchBoostFactor * $this->titleBoostFactor * max(1, $totalDocs) * 10;
+                continue;
+            }
+
+            if (count($tokens) > 1) {
+                if (
+                    $isTypeaheadQuery
+                    ? $this->containsTypeaheadPhrase($docId, $tokens)
+                    : $this->containsExactPhrase($docId, $searchQuery)
+                ) {
                     $filteredScores[$docId] *= $this->exactMatchBoostFactor;
+                }
+
+                if ($this->containsTightTitleMatch($docId, $tokens, $isTypeaheadQuery)) {
+                    $filteredScores[$docId] *= $this->exactMatchBoostFactor * $this->titleBoostFactor;
+                    $filteredScores[$docId] += $this->exactMatchBoostFactor * $this->titleBoostFactor * max(1, $totalDocs);
                 }
             }
         }
@@ -462,6 +524,80 @@ abstract class BaseSearchAdapter extends Search
         }
 
         return $results;
+    }
+
+    /**
+     * Decide whether the final query token should be treated as an in-progress prefix.
+     *
+     * This follows the search-as-you-type model used by engines such as Elasticsearch's
+     * match_bool_prefix: completed words are normal terms and the final typed word is a prefix.
+     *
+     * @param string $searchQuery The raw search query
+     * @param array $tokens Tokenized search terms
+     * @return bool Whether the query should use final-token prefix matching
+     */
+    protected function isSearchAsYouTypeQuery(string $searchQuery, array $tokens): bool
+    {
+        return !empty($tokens) && preg_match('/\s$/u', $searchQuery) !== 1;
+    }
+
+    /**
+     * Intersect all term matches before the current token.
+     *
+     * @param array $termMatches Term match maps keyed by token index
+     * @param int $currentTermIndex Current token index
+     * @return array|null Prior matching document IDs, or null when no prior tokens exist
+     */
+    protected function getDocsMatchingPreviousTerms(array $termMatches, int $currentTermIndex): ?array
+    {
+        if ($currentTermIndex <= 0) {
+            return null;
+        }
+
+        $validDocs = null;
+        for ($i = 0; $i < $currentTermIndex; $i++) {
+            $docs = array_keys($termMatches[$i] ?? []);
+
+            if ($validDocs === null) {
+                $validDocs = $docs;
+            } else {
+                $validDocs = array_values(array_intersect($validDocs, $docs));
+            }
+
+            if (empty($validDocs)) {
+                return [];
+            }
+        }
+
+        return $validDocs;
+    }
+
+    /**
+     * Prefer title-backed or higher-confidence expanded terms for a document.
+     *
+     * @param string $docId Document ID
+     * @param array $current Current match data
+     * @param array $candidate Candidate match data
+     * @return bool Whether the candidate should replace the current match
+     */
+    protected function shouldReplaceSearchTermMatch(string $docId, array $current, array $candidate): bool
+    {
+        if (($current['confidence'] ?? 1.0) >= 1.0) {
+            return false;
+        }
+
+        $currentInTitle = $this->isTermInTitle((string)$current['actualTerm'], $docId);
+        $candidateInTitle = $this->isTermInTitle((string)$candidate['actualTerm'], $docId);
+
+        if ($candidateInTitle !== $currentInTitle) {
+            return $candidateInTitle;
+        }
+
+        if (($candidate['confidence'] ?? 0.0) !== ($current['confidence'] ?? 0.0)) {
+            return ($candidate['confidence'] ?? 0.0) > ($current['confidence'] ?? 0.0);
+        }
+
+        return ($candidate['docFreq'] ?? PHP_INT_MAX) < ($current['docFreq'] ?? PHP_INT_MAX);
     }
 
     /**
@@ -615,6 +751,209 @@ abstract class BaseSearchAdapter extends Search
     }
 
     /**
+     * Find candidate terms for the final in-progress search word.
+     *
+     * When prior query terms already narrowed the result set, inspect those documents
+     * first. This keeps one-character prefixes useful without expanding the whole index.
+     *
+     * @param string $prefix Current final query token
+     * @param int $siteId Site to search within
+     * @param array|null $candidateDocIds Optional prior-matching documents
+     * @param array $excludedTerms Completed query terms that should not satisfy the final prefix
+     * @return array Matching terms keyed to confidence scores
+     */
+    protected function findTypeaheadMatchScores(
+        string $prefix,
+        int $siteId,
+        ?array $candidateDocIds = null,
+        array $excludedTerms = [],
+    ): array {
+        if ($prefix === '') {
+            return [];
+        }
+
+        $excluded = array_fill_keys($excludedTerms, true);
+        $matches = [];
+
+        if ($candidateDocIds !== null) {
+            foreach ($candidateDocIds as $docId) {
+                [$docSiteId, $elementId] = explode(':', (string)$docId, 2);
+                if ((int)$docSiteId !== $siteId) {
+                    continue;
+                }
+
+                foreach (array_keys($this->getDocumentTerms($siteId, (int)$elementId)) as $term) {
+                    if (isset($excluded[$term]) || !str_starts_with((string)$term, $prefix)) {
+                        continue;
+                    }
+
+                    $matches[$term] = max(
+                        $matches[$term] ?? 0.0,
+                        $this->calculateTypeaheadConfidence($prefix, (string)$term)
+                    );
+                }
+            }
+        } else {
+            foreach ($this->getTermsByPrefix($prefix, $siteId, $this->fuzzySearchMaxCandidates) as $term => $confidence) {
+                if (isset($excluded[$term])) {
+                    continue;
+                }
+
+                $matches[$term] = max((float)$confidence, $this->calculateTypeaheadConfidence($prefix, (string)$term));
+            }
+        }
+
+        if (empty($matches) && mb_strlen($prefix, 'UTF-8') >= 3) {
+            $matches = $this->mergeFuzzyTypeaheadMatches($prefix, $siteId, $candidateDocIds, $excluded, $matches);
+        }
+
+        arsort($matches);
+
+        $limit = $candidateDocIds !== null
+            ? max($this->fuzzySearchMaxCandidates, 1000)
+            : $this->fuzzySearchMaxCandidates;
+
+        return array_slice($matches, 0, $limit, true);
+    }
+
+    /**
+     * Add fuzzy prefix candidates for the final in-progress token.
+     *
+     * @param string $prefix Current final query token
+     * @param int $siteId Site to search within
+     * @param array|null $candidateDocIds Optional prior-matching documents
+     * @param array $excluded Completed terms keyed to true
+     * @param array $matches Existing prefix matches
+     * @return array Matches with fuzzy prefix candidates merged in
+     */
+    protected function mergeFuzzyTypeaheadMatches(
+        string $prefix,
+        int $siteId,
+        ?array $candidateDocIds,
+        array $excluded,
+        array $matches,
+    ): array {
+        if ($candidateDocIds !== null) {
+            foreach ($candidateDocIds as $docId) {
+                [$docSiteId, $elementId] = explode(':', (string)$docId, 2);
+                if ((int)$docSiteId !== $siteId) {
+                    continue;
+                }
+
+                foreach (array_keys($this->getDocumentTerms($siteId, (int)$elementId)) as $term) {
+                    if (isset($excluded[$term]) || isset($matches[$term])) {
+                        continue;
+                    }
+
+                    $confidence = $this->calculateFuzzyTypeaheadConfidence($prefix, (string)$term);
+                    if ($confidence > 0) {
+                        $matches[$term] = $confidence;
+                    }
+                }
+            }
+
+            return $matches;
+        }
+
+        foreach ($this->findFuzzyMatchScores($prefix, siteId: $siteId) as $term => $confidence) {
+            if (isset($excluded[$term]) || isset($matches[$term])) {
+                continue;
+            }
+
+            $termConfidence = $this->calculateFuzzyTypeaheadConfidence($prefix, (string)$term);
+            if ($termConfidence > 0) {
+                $matches[$term] = min((float)$confidence, $termConfidence);
+            }
+        }
+
+        return $matches;
+    }
+
+    /**
+     * Calculate a confidence multiplier for final-token prefix completion.
+     *
+     * @param string $prefix Current final query token
+     * @param string $candidate Indexed candidate term
+     * @return float Score multiplier between 0 and 1
+     */
+    protected function calculateTypeaheadConfidence(string $prefix, string $candidate): float
+    {
+        if ($prefix === $candidate) {
+            return 1.0;
+        }
+
+        $coverage = mb_strlen($prefix, 'UTF-8') / max(1, mb_strlen($candidate, 'UTF-8'));
+
+        return max(0.6, min(0.95, 0.6 + ($coverage * 0.35)));
+    }
+
+    /**
+     * Calculate confidence for typo-tolerant final-token prefix completion.
+     *
+     * @param string $prefix Current final query token
+     * @param string $candidate Indexed candidate term
+     * @return float Score multiplier, or 0 when the candidate is too distant
+     */
+    protected function calculateFuzzyTypeaheadConfidence(string $prefix, string $candidate): float
+    {
+        $prefixLength = mb_strlen($prefix, 'UTF-8');
+        if ($prefixLength < 3 || $prefixLength >= mb_strlen($candidate, 'UTF-8')) {
+            return 0.0;
+        }
+
+        $candidatePrefix = mb_substr($candidate, 0, $prefixLength, 'UTF-8');
+        $maxDistance = $prefixLength <= 4 ? 1 : 2;
+        $distance = levenshtein($prefix, $candidatePrefix);
+
+        if ($distance > $maxDistance) {
+            return 0.0;
+        }
+
+        $editSimilarity = 1 - ($distance / max(1, $prefixLength));
+        $coverage = $prefixLength / max(1, mb_strlen($candidate, 'UTF-8'));
+
+        return max(0.25, min(0.55, (0.35 * $coverage) + (0.65 * $editSimilarity)));
+    }
+
+    /**
+     * Reduce broad final-token prefix matches when the completed term is not in the title.
+     *
+     * @param string $prefix Current final query token
+     * @return float Confidence multiplier
+     */
+    protected function getNonTitleTypeaheadConfidenceMultiplier(string $prefix): float
+    {
+        $prefixLength = mb_strlen($prefix, 'UTF-8');
+
+        if ($prefixLength <= 1) {
+            return 0.12;
+        }
+
+        if ($prefixLength === 2) {
+            return 0.25;
+        }
+
+        if ($prefixLength <= 4) {
+            return 0.45;
+        }
+
+        return 0.7;
+    }
+
+    /**
+     * Ignore one-character typeahead matches that only appear outside the title.
+     *
+     * @param string $prefix Current final query token
+     * @param string $candidate Indexed candidate term
+     * @param string $docId Document ID
+     * @return bool Whether the candidate should be skipped for this document
+     */
+    protected function shouldSkipNonTitleTypeaheadMatch(string $prefix, string $candidate, string $docId): bool
+    {
+        return mb_strlen($prefix, 'UTF-8') <= 1 && !$this->isTermInTitle($candidate, $docId);
+    }
+
+    /**
      * Decide whether to look for fuzzy candidates for a search term.
      *
      * Long exact terms may still be typos that exist elsewhere in the index, so fuzzy
@@ -729,7 +1068,7 @@ abstract class BaseSearchAdapter extends Search
             return max(0.2, $baseThreshold * 0.8);
         } elseif ($termLength <= 6) {
             // 5-6 character terms need room for common adjacent-letter transpositions
-            return max(0.25, $baseThreshold * 0.8);
+            return max(0.1, $baseThreshold * 0.4);
         }
         
         // 5+ character terms: use full threshold
@@ -849,18 +1188,33 @@ abstract class BaseSearchAdapter extends Search
     }
 
     /**
-     * Tokenize a search string, preserving stop words only when they are the whole query.
+     * Tokenize a search string, preserving stop words only when they are needed.
      *
      * Stop words are normally ignored for broad relevance, but title fields index them so
-     * title-only searches like "Why" should not be reduced to an empty query.
+     * title-only searches like "Why" should not be reduced to an empty query. Typeahead
+     * queries also keep completed stop words when they are the only completed terms, so
+     * "your p" can narrow to title-backed "Your Pregnancy..." results instead of becoming
+     * a global search for "p".
      *
      * @param string $text The search query
+     * @param bool $isTypeaheadQuery Whether the final token should be treated as a prefix
      * @return array Search tokens
      */
-    protected function getSearchTokens(string $text): array
+    protected function getSearchTokens(string $text, bool $isTypeaheadQuery = false): array
     {
         $tokens = $this->tokenize($text);
         $filteredTokens = $this->filterStopWords($tokens);
+
+        if ($isTypeaheadQuery && count($tokens) > 1) {
+            $finalToken = (string)array_pop($tokens);
+            $completedTokens = $tokens;
+            $filteredCompletedTokens = $this->filterStopWords($completedTokens);
+
+            return [
+                ...(!empty($filteredCompletedTokens) ? $filteredCompletedTokens : $completedTokens),
+                $finalToken,
+            ];
+        }
 
         return !empty($filteredTokens) ? $filteredTokens : $tokens;
     }
@@ -881,6 +1235,43 @@ abstract class BaseSearchAdapter extends Search
             fn($freq, $docId) => str_starts_with((string)$docId, $sitePrefix),
             ARRAY_FILTER_USE_BOTH
         );
+    }
+
+    /**
+     * Find indexed terms that start with a prefix.
+     *
+     * Storage adapters can override this for a native prefix lookup. The fallback
+     * filters the existing term dictionary and confirms terms exist on the active site.
+     *
+     * @param string $prefix Prefix to match
+     * @param int $siteId Active site ID
+     * @param int $limit Maximum terms to return
+     * @return array Matching terms keyed to confidence scores
+     */
+    protected function getTermsByPrefix(string $prefix, int $siteId, int $limit = 100): array
+    {
+        $matches = [];
+
+        foreach ($this->getAllTerms() as $term) {
+            $term = (string)$term;
+            if (!str_starts_with($term, $prefix)) {
+                continue;
+            }
+
+            if (empty($this->filterDocumentsBySite($this->getTermDocuments($term), $siteId))) {
+                continue;
+            }
+
+            $matches[$term] = $this->calculateTypeaheadConfidence($prefix, $term);
+
+            if (count($matches) >= $limit) {
+                break;
+            }
+        }
+
+        arsort($matches);
+
+        return $matches;
     }
 
     /**
@@ -951,8 +1342,10 @@ abstract class BaseSearchAdapter extends Search
     }
 
     /**
-     * Check if a document contains the exact search phrase
-     * Used for exact match boosting in search results
+     * Check whether the document contains all phrase terms for exact-match boosting.
+     *
+     * The index stores term frequencies, not positions, so this is a term-presence
+     * approximation rather than an ordered phrase check.
      *
      * @param string $docId The document ID (siteId:elementId)
      * @param string $phrase The phrase to check
@@ -960,9 +1353,6 @@ abstract class BaseSearchAdapter extends Search
      */
     protected function containsExactPhrase(string $docId, string $phrase): bool
     {
-        // This is a simplified implementation
-        // For a more accurate implementation, we would need to store position information
-        // For now, we'll just check if all the terms are present
         $tokens = $this->getSearchTokens($phrase);
 
         [$siteId, $elementId] = explode(':', $docId);
@@ -975,6 +1365,199 @@ abstract class BaseSearchAdapter extends Search
         }
 
         return true;
+    }
+
+    /**
+     * Check if a document satisfies a final-token prefix phrase approximation.
+     *
+     * @param string $docId The document ID (siteId:elementId)
+     * @param array $tokens Search tokens
+     * @return bool Whether completed terms and final prefix are present
+     */
+    protected function containsTypeaheadPhrase(string $docId, array $tokens): bool
+    {
+        if (count($tokens) < 2) {
+            return false;
+        }
+
+        $titleTerms = $this->getTitleTerms($docId);
+        $finalPrefix = (string)array_pop($tokens);
+        $completedTerms = array_fill_keys($tokens, true);
+
+        foreach ($tokens as $token) {
+            if (!isset($titleTerms[$token])) {
+                return false;
+            }
+        }
+
+        foreach (array_keys($titleTerms) as $term) {
+            if (isset($completedTerms[$term])) {
+                continue;
+            }
+
+            if (str_starts_with((string)$term, $finalPrefix)) {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    /**
+     * Check whether the query closely matches the document title terms.
+     *
+     * @param string $docId The document ID (siteId:elementId)
+     * @param array $tokens Search tokens
+     * @param bool $isTypeaheadQuery Whether the final token is a prefix
+     * @return bool Whether the title is a tight query match
+     */
+    protected function containsTightTitleMatch(string $docId, array $tokens, bool $isTypeaheadQuery): bool
+    {
+        if (empty($tokens)) {
+            return false;
+        }
+
+        $titleTerms = $this->getComparableTitleTerms($docId, $this->containsStopWord($tokens));
+        if (empty($titleTerms)) {
+            return false;
+        }
+
+        $originalTokenCount = count($tokens);
+        $completedTerms = $tokens;
+        $finalPrefix = null;
+
+        if ($isTypeaheadQuery) {
+            $finalPrefix = (string)array_pop($completedTerms);
+        }
+
+        foreach ($completedTerms as $token) {
+            if (!isset($titleTerms[$token])) {
+                return false;
+            }
+        }
+
+        if ($finalPrefix !== null) {
+            $matchedFinalPrefix = false;
+            foreach (array_keys($titleTerms) as $term) {
+                if (isset($titleTerms[$term]) && in_array($term, $completedTerms, true)) {
+                    continue;
+                }
+
+                if (str_starts_with((string)$term, $finalPrefix)) {
+                    $matchedFinalPrefix = true;
+                    break;
+                }
+            }
+
+            if (!$matchedFinalPrefix) {
+                return false;
+            }
+        }
+
+        $allowedExtraTitleTerms = $isTypeaheadQuery ? 2 : 0;
+
+        return count($titleTerms) <= $originalTokenCount + $allowedExtraTitleTerms;
+    }
+
+    /**
+     * Check whether the query terms exactly match the comparable title term set.
+     *
+     * @param string $docId The document ID (siteId:elementId)
+     * @param array $tokens Search tokens
+     * @return bool Whether the title term set exactly matches the query terms
+     */
+    protected function containsExactTitleTermSet(string $docId, array $tokens): bool
+    {
+        $titleTerms = $this->getComparableTitleTerms($docId);
+        $queryTerms = [];
+
+        foreach ($tokens as $token) {
+            $token = (string)$token;
+            if (preg_match('/^\d+$/', $token)) {
+                continue;
+            }
+            if (in_array($token, $this->stopWords, true)) {
+                continue;
+            }
+
+            $queryTerms[$token] = true;
+        }
+
+        if (empty($titleTerms) || count($titleTerms) !== count($queryTerms)) {
+            return false;
+        }
+
+        foreach (array_keys($queryTerms) as $term) {
+            if (!isset($titleTerms[$term])) {
+                return false;
+            }
+        }
+
+        return true;
+    }
+
+    /**
+     * Decide whether the exact-title boost is appropriate for this query.
+     *
+     * A one-character typeahead query such as "p" should still autocomplete broadly;
+     * longer exact title queries should beat longer title supersets.
+     *
+     * @param array $tokens Search tokens
+     * @param bool $isTypeaheadQuery Whether the final token is a prefix
+     * @return bool Whether exact title term sets should receive the strongest boost
+     */
+    protected function shouldBoostExactTitleTermSet(array $tokens, bool $isTypeaheadQuery): bool
+    {
+        if (!$isTypeaheadQuery || count($tokens) > 1) {
+            return true;
+        }
+
+        $token = (string)reset($tokens);
+
+        return mb_strlen($token, 'UTF-8') > 1;
+    }
+
+    /**
+     * Get title terms suitable for title tightness checks.
+     *
+     * @param string $docId The document ID (siteId:elementId)
+     * @param bool $preserveStopWords Whether stop words should remain comparable
+     * @return array Comparable title terms keyed to true
+     */
+    protected function getComparableTitleTerms(string $docId, bool $preserveStopWords = false): array
+    {
+        $terms = [];
+
+        foreach (array_keys($this->getTitleTerms($docId)) as $term) {
+            $term = (string)$term;
+            if (preg_match('/^\d+$/', $term)) {
+                continue;
+            }
+            if (!$preserveStopWords && in_array($term, $this->stopWords, true)) {
+                continue;
+            }
+
+            $terms[$term] = true;
+        }
+
+        return $terms;
+    }
+
+    /**
+     * Check whether any query token is a stop word.
+     *
+     * @param array $tokens Search tokens
+     * @return bool Whether the token set contains a stop word
+     */
+    protected function containsStopWord(array $tokens): bool
+    {
+        foreach ($tokens as $token) {
+            if (in_array((string)$token, $this->stopWords, true)) {
+                return true;
+            }
+        }
+
+        return false;
     }
 
     // =========================================================================

@@ -648,7 +648,7 @@ class MongoDbSearchAdapter extends BaseSearchAdapter
             ]],
             ['$match' => ['jaccard_similarity' => ['$gte' => $threshold]]],
             ['$sort' => ['jaccard_similarity' => -1, 'match_count' => -1]],
-            ['$limit' => 100],
+            ['$limit' => max(100, $this->fuzzySearchMaxCandidates * 5)],
         ];
 
         $cursor = $this->database->selectCollection('ngrams')->aggregate($pipeline);

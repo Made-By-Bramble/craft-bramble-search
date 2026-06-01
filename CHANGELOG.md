@@ -1,5 +1,11 @@
 # Release Notes for Bramble Search
 
+## 1.0.18
+- Fixed search-as-you-type results so completed words constrain the search normally while the final typed word is matched as a prefix.
+- Improved typeahead relevance with title-aware prefix scoring, exact title boosts, and better handling for completed stop words in partial queries.
+- Expanded fuzzy candidate collection across MySQL, Redis, and MongoDB adapters so fuzzy and prefix searches have enough candidates before final ranking.
+- Added regression coverage for prefix lookup fallbacks, typo-tolerant typeahead searches, exact title relevance, and short autocomplete queries.
+
 ## 1.0.17
 - Changed full-site rebuilds to run as rolling rebuilds across all storage drivers, keeping the existing index searchable while current elements are re-indexed.
 - Prevented duplicate Bramble Search rebuild jobs from being queued while a rebuild for the same site is already waiting or running.

@@ -526,8 +526,7 @@ class RedisSearchAdapter extends BaseSearchAdapter
         // Sort by similarity score (descending)
         arsort($results);
 
-        // Return top 100 candidates
-        return array_slice($results, 0, 100, true);
+        return array_slice($results, 0, max(100, $this->fuzzySearchMaxCandidates * 5), true);
     }
 
     /**

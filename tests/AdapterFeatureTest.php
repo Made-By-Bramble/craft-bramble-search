@@ -39,6 +39,19 @@ final class AdapterFeatureTest extends TestCase
         self::assertArrayHasKey('lavender', $matches);
     }
 
+    public function testCraftCacheAdapterFindsTermsByPrefix(): void
+    {
+        $adapter = new TestableCraftCacheSearchAdapter();
+        $adapter->setTestPrefix('bramble_search_test:' . bin2hex(random_bytes(4)) . ':');
+        $adapter->addSearchTerm('synergy', 1, 100);
+        $adapter->addSearchTerm('system', 2, 200);
+
+        $matches = $adapter->publicGetTermsByPrefix('s', 1);
+
+        self::assertArrayHasKey('synergy', $matches);
+        self::assertArrayNotHasKey('system', $matches);
+    }
+
     public function testFileAdapterFindsFuzzyTermsByNgramSimilarity(): void
     {
         $adapter = new TestableFileSearchAdapter();
@@ -51,6 +64,25 @@ final class AdapterFeatureTest extends TestCase
             $matches = $adapter->publicGetTermsByNgramSimilarity('lavendr', 1);
 
             self::assertArrayHasKey('lavender', $matches);
+        } finally {
+            FileHelper::removeDirectory($baseDir);
+        }
+    }
+
+    public function testFileAdapterFindsTermsByPrefix(): void
+    {
+        $adapter = new TestableFileSearchAdapter();
+        $baseDir = Craft::getAlias('@runtime') . '/bramble-search-test-' . bin2hex(random_bytes(4));
+        $adapter->setBaseDir($baseDir);
+
+        try {
+            $adapter->addSearchTerm('synergy', 1, 100);
+            $adapter->addSearchTerm('system', 2, 200);
+
+            $matches = $adapter->publicGetTermsByPrefix('s', 1);
+
+            self::assertArrayHasKey('synergy', $matches);
+            self::assertArrayNotHasKey('system', $matches);
         } finally {
             FileHelper::removeDirectory($baseDir);
         }
@@ -144,7 +176,7 @@ final class AdapterFeatureTest extends TestCase
         $adapter->addTitle('Caterpillar Study', 1, 300);
 
         $antibiotiMatches = $adapter->searchElements(Entry::find()->siteId(1)->search('antibioti'));
-        $catMatches = $adapter->searchElements(Entry::find()->siteId(1)->search('cat'));
+        $catMatches = $adapter->searchElements(Entry::find()->siteId(1)->search('cat '));
 
         self::assertArrayHasKey('100-1', $antibiotiMatches);
         self::assertArrayNotHasKey('200-1', $antibiotiMatches);
@@ -177,6 +209,49 @@ final class AdapterFeatureTest extends TestCase
         self::assertSame(['100-1'], array_keys($matches));
     }
 
+    public function testSearchAsYouTypeUsesTheFinalTokenAsAPrefix(): void
+    {
+        $adapter = new InMemorySearchAdapter();
+        $adapter->addTitle('Smooth Synergy Fifty Caps', 1, 100);
+        $adapter->addTitle('Antrodia Mushroom Capsules', 1, 110);
+        $adapter->addTitle('Reishi Mushroom Organic Powder', 1, 120);
+        $adapter->addTitle('Synergy Complex', 1, 130);
+        $adapter->addTitle('Smooth Mag Powder', 1, 140);
+        $adapter->addSearchTerm('sleep', 1, 140);
+
+        $matches = $adapter->searchElements(Entry::find()->siteId(1)->search('Smooth S'));
+
+        self::assertSame('100-1', array_key_first($matches));
+        self::assertArrayNotHasKey('130-1', $matches);
+    }
+
+    public function testSearchAsYouTypeKeepsCompletedTermsFuzzyAndFinalTermPrefix(): void
+    {
+        $adapter = new InMemorySearchAdapter();
+        $adapter->addTitle('Smooth Synergy Fifty Caps', 1, 100);
+        $adapter->addTitle('Antrodia Mushroom Capsules', 1, 110);
+        $adapter->addTitle('Reishi Mushroom Organic Powder', 1, 120);
+
+        $matches = $adapter->searchElements(Entry::find()->siteId(1)->search('Smoooth Syn'));
+
+        self::assertSame('100-1', array_key_first($matches));
+    }
+
+    public function testSearchAsYouTypeRelevanceImprovesWithMoreSpecificPrefixes(): void
+    {
+        $adapter = new InMemorySearchAdapter();
+        $adapter->addTitle('Smooth Synergy', 1, 100);
+        $adapter->addTitle('Smooth Skin Balm', 1, 110);
+        $adapter->addTitle('Synergy Smooth', 1, 120);
+        $adapter->addTitle('Smoothing Shampoo', 1, 130);
+
+        $matches = $adapter->searchElements(Entry::find()->siteId(1)->search('Smooth Sy'));
+
+        self::assertSame('100-1', array_key_first($matches));
+        self::assertArrayNotHasKey('110-1', $matches);
+        self::assertArrayNotHasKey('130-1', $matches);
+    }
+
     public function testExactMatchesRemainPreferredOverFuzzySupplements(): void
     {
         $adapter = new InMemorySearchAdapter();
@@ -188,6 +263,53 @@ final class AdapterFeatureTest extends TestCase
         self::assertArrayHasKey('100-1', $matches);
         self::assertArrayHasKey('200-1', $matches);
         self::assertSame('200-1', array_key_first($matches));
+    }
+
+    public function testExactCompactTitleMatchesBeatLongerTitleSupersets(): void
+    {
+        $adapter = new InMemorySearchAdapter();
+        $adapter->addTitle('Radiance Serum', 1, 100);
+        $adapter->addTitle('Supernatural Radiance Serum Rich Aura', 1, 200);
+        $adapter->addTitle('Parasite X Dewormer', 1, 300);
+        $adapter->addTitle('Parasite X Dewormer Children', 1, 400);
+
+        $radianceMatches = $adapter->searchElements(Entry::find()->siteId(1)->search('Radiance Serum'));
+        $parasiteMatches = $adapter->searchElements(Entry::find()->siteId(1)->search('Parasite X Dewormer'));
+
+        self::assertSame('100-1', array_key_first($radianceMatches));
+        self::assertSame('300-1', array_key_first($parasiteMatches));
+    }
+
+    public function testSingleTermExactTitleBeatsLongerPrefixTitleMatches(): void
+    {
+        $adapter = new InMemorySearchAdapter();
+        $adapter->addTitle('Juicy', 1, 100);
+        $adapter->addTitle('NINI Organics Juicy Multi C Bio Brightening Serum', 1, 200);
+        $adapter->addTitle('Clean', 1, 300);
+        $adapter->addTitle('Natural Multi Purpose Cleaner Lemon', 1, 400);
+
+        $juicyMatches = $adapter->searchElements(Entry::find()->siteId(1)->search('Juicy'));
+        $cleanMatches = $adapter->searchElements(Entry::find()->siteId(1)->search('Clean'));
+
+        self::assertSame('100-1', array_key_first($juicyMatches));
+        self::assertSame('300-1', array_key_first($cleanMatches));
+    }
+
+    public function testTypeaheadPreservesCompletedStopWordWhenItIsTheOnlyCompletedTerm(): void
+    {
+        $adapter = new InMemorySearchAdapter();
+        $adapter->addTitle('Your Pregnancy Nutrition Guide', 1, 100);
+        $adapter->addTitle('Prenatal Multivitamin Complex', 1, 200);
+        $adapter->addTitle('Bowen Technique Prepayment', 1, 300);
+        $adapter->addTitle('P and P International Post', 1, 400);
+
+        $singleLetterMatches = $adapter->searchElements(Entry::find()->siteId(1)->search('your p'));
+        $prefixMatches = $adapter->searchElements(Entry::find()->siteId(1)->search('your pre'));
+
+        self::assertSame('100-1', array_key_first($singleLetterMatches));
+        self::assertSame('100-1', array_key_first($prefixMatches));
+        self::assertArrayNotHasKey('200-1', $singleLetterMatches);
+        self::assertArrayNotHasKey('300-1', $prefixMatches);
     }
 
     public function testSearchElementsFiltersMatchesThroughTheElementQueryCriteria(): void
@@ -281,6 +403,11 @@ final class TestableCraftCacheSearchAdapter extends CraftCacheSearchAdapter
     {
         return $this->getTermsByNgramSimilarity($this->generateNgrams($term), $siteId, 0.2);
     }
+
+    public function publicGetTermsByPrefix(string $prefix, int $siteId): array
+    {
+        return $this->getTermsByPrefix($prefix, $siteId);
+    }
 }
 
 final class TestableFileSearchAdapter extends FileSearchAdapter
@@ -304,6 +431,11 @@ final class TestableFileSearchAdapter extends FileSearchAdapter
     public function publicGetTermsByNgramSimilarity(string $term, int $siteId): array
     {
         return $this->getTermsByNgramSimilarity($this->generateNgrams($term), $siteId, 0.2);
+    }
+
+    public function publicGetTermsByPrefix(string $prefix, int $siteId): array
+    {
+        return $this->getTermsByPrefix($prefix, $siteId);
     }
 }
 
@@ -342,7 +474,7 @@ final class InMemorySearchAdapter extends BaseSearchAdapter
         $indexedTerms = array_keys($this->buildIndexedTermFrequencies('', $titleTokens));
 
         foreach ($indexedTerms as $term) {
-            $this->addSearchTerm($term, $siteId, $elementId, true);
+            $this->addSearchTerm((string)$term, $siteId, $elementId, true);
         }
     }
 

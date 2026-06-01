@@ -514,6 +514,44 @@ class MySqlSearchAdapter extends BaseSearchAdapter
     }
 
     /**
+     * Get indexed terms that start with a prefix from MySQL.
+     *
+     * @param string $prefix Prefix to match
+     * @param int $siteId Active site ID
+     * @param int $limit Maximum terms to return
+     * @return array Matching terms keyed to confidence scores
+     */
+    protected function getTermsByPrefix(string $prefix, int $siteId, int $limit = 100): array
+    {
+        $terms = (new Query())
+            ->select(['term'])
+            ->distinct()
+            ->from($this->tablePrefix . 'terms}}')
+            ->where([
+                'AND',
+                ['LIKE', 'term', $prefix . '%', false],
+                ['LIKE', 'docId', "$siteId:%", false],
+            ])
+            ->orderBy(['term' => SORT_ASC])
+            ->limit($limit)
+            ->column();
+
+        if (empty($terms)) {
+            return [];
+        }
+
+        $matches = [];
+        foreach ($terms as $term) {
+            $term = (string)$term;
+            $matches[$term] = $this->calculateTypeaheadConfidence($prefix, $term);
+        }
+
+        arsort($matches);
+
+        return $matches;
+    }
+
+    /**
      * Remove a term from the index in MySQL
      *
      * @param string $term The term to remove
@@ -776,7 +814,7 @@ class MySqlSearchAdapter extends BaseSearchAdapter
             ->groupBy(['n.term', 'i.ngram_count'])
             ->having('jaccard_similarity >= :threshold')
             ->orderBy(['match_count' => SORT_DESC, 'jaccard_similarity' => SORT_DESC])
-            ->limit(100)
+            ->limit(max(100, $this->fuzzySearchMaxCandidates * 5))
             ->params([
                 ':searchCount' => $searchCount,
                 ':threshold' => $threshold,
@@ -903,12 +941,10 @@ class MySqlSearchAdapter extends BaseSearchAdapter
         $db = Craft::$app->getDb();
         $now = (new \DateTime())->format('Y-m-d H:i:s');
 
-        // --- Tokenize title ---
         $title = $element->title ?? '';
         $titleTokens = $this->tokenize($title);
         $titleTerms = array_flip($titleTokens);
 
-        // --- Build full text from searchable attributes + fields ---
         $text = '';
         foreach (ElementHelper::searchableAttributes($element) as $attribute) {
             $value = $element->getSearchKeywords($attribute);
@@ -942,7 +978,6 @@ class MySqlSearchAdapter extends BaseSearchAdapter
         $elementId = $element->id;
         $oldDocLength = $this->getDocumentLength("$siteId:$elementId");
 
-        // --- Clean up old data (bulk deletes) ---
         $db->createCommand()->delete($this->tablePrefix . 'terms}}', [
             'docId' => "$siteId:$elementId",
         ])->execute();
@@ -950,13 +985,9 @@ class MySqlSearchAdapter extends BaseSearchAdapter
         $this->deleteTitleTerms($siteId, $elementId);
         $this->removeDocumentFromIndex($siteId, $elementId);
 
-        // --- Store document ---
         $this->storeDocument($siteId, $elementId, $termFreqs, $docLen);
-
-        // --- Store title terms ---
         $this->storeTitleTerms($siteId, $elementId, $titleTerms);
 
-        // --- Batch insert all term-document associations ---
         if (!empty($termFreqs)) {
             $termBatch = [];
             foreach ($termFreqs as $term => $freq) {
@@ -976,7 +1007,6 @@ class MySqlSearchAdapter extends BaseSearchAdapter
             )->execute();
         }
 
-        // --- Batch n-grams: collect all new terms, generate ngrams, batch insert ---
         $ngramBatch = [];
         $ngramIndexBatch = [];
         foreach (array_keys($termFreqs) as $term) {
@@ -1022,7 +1052,6 @@ class MySqlSearchAdapter extends BaseSearchAdapter
             }
         }
 
-        // --- Metadata ---
         $this->addDocumentToIndex($siteId, $elementId);
         $this->updateTotalLength($docLen - $oldDocLength);
 
