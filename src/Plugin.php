@@ -283,6 +283,16 @@ class Plugin extends BasePlugin
                 return;
             }
 
+            if (
+                Craft::$app->getQueue() instanceof CraftQueue &&
+                RebuildIndexJob::clearRebuildLockForSite($siteId)
+            ) {
+                Craft::warning(
+                    "Cleared stale Bramble Search rebuild lock for site ID: $siteId before queueing a new rebuild.",
+                    'bramble-search'
+                );
+            }
+
             QueueHelper::push(new RebuildIndexJob([
                 'siteId' => $siteId,
             ]));

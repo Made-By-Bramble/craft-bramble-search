@@ -1,5 +1,10 @@
 # Release Notes for Bramble Search
 
+## 1.0.19
+- Fixed rolling rebuild failures so jobs that own the site-level rebuild lock release it when any batch lifecycle step fails.
+- Cleared stale rebuild locks before queueing a new rebuild when Craft's queue has no waiting or running rebuild job for the site.
+- Added regression coverage for failed rebuild batches releasing only their own rebuild lock.
+
 ## 1.0.18
 - Fixed search-as-you-type results so completed words constrain the search normally while the final typed word is matched as a prefix.
 - Improved typeahead relevance with title-aware prefix scoring, exact title boosts, and better handling for completed stop words in partial queries.

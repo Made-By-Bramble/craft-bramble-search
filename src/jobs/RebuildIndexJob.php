@@ -34,6 +34,24 @@ class RebuildIndexJob extends BaseBatchedJob
     public int $batchSize = 100;
 
     /**
+     * Whether this queued rebuild owns the site-level rebuild lock.
+     */
+    public bool $rebuildLockAcquired = false;
+
+    /**
+     * @inheritdoc
+     */
+    public function execute($queue): void
+    {
+        try {
+            parent::execute($queue);
+        } catch (\Throwable $e) {
+            $this->cleanupFailedRebuild($e);
+            throw $e;
+        }
+    }
+
+    /**
      * Lifecycle hook: runs once before all batches are processed
      * Starts a rolling rebuild for the site without clearing the live index
      *
@@ -134,15 +152,11 @@ class RebuildIndexJob extends BaseBatchedJob
     public function processItem(mixed $item): void
     {
         if (!($item instanceof ElementInterface)) {
-            $this->setBulkMode($this->getSearchAdapter(), false);
-            $this->releaseRebuildLock($this->siteId);
             throw new \RuntimeException('Rebuild index batch contained a non-element item.');
         }
 
         if (!$this->indexElement($item)) {
             $elementType = get_class($item);
-            $this->setBulkMode($this->getSearchAdapter(), false);
-            $this->releaseRebuildLock($this->siteId);
             throw new \RuntimeException("Failed to index {$elementType} {$item->id} for site {$item->siteId}");
         }
     }
@@ -283,21 +297,63 @@ class RebuildIndexJob extends BaseBatchedJob
         }
     }
 
+    protected function cleanupFailedRebuild(\Throwable $error): void
+    {
+        try {
+            $this->setBulkMode($this->getSearchAdapter(), false);
+        } catch (\Throwable $cleanupError) {
+            Craft::warning(
+                "Unable to reset Bramble Search bulk mode after rebuild failure: {$cleanupError->getMessage()}",
+                __METHOD__
+            );
+        }
+
+        if ($this->rebuildLockAcquired) {
+            try {
+                $this->releaseRebuildLock($this->siteId);
+            } catch (\Throwable $cleanupError) {
+                Craft::warning(
+                    "Unable to release Bramble Search rebuild lock after failure: {$cleanupError->getMessage()}",
+                    __METHOD__
+                );
+            }
+        }
+
+        Craft::error(
+            "Index rebuild failed for site ID: {$this->siteId}: {$error->getMessage()}",
+            __METHOD__
+        );
+    }
+
+    public static function clearRebuildLockForSite(int $siteId): bool
+    {
+        return Craft::$app->getCache()->delete(self::rebuildLockKeyForSite($siteId));
+    }
+
     protected function acquireRebuildLock(int $siteId): void
     {
         if (!Craft::$app->getCache()->add($this->rebuildLockKey($siteId), time(), self::LOCK_TTL)) {
             throw new \RuntimeException("A Bramble Search index rebuild is already running for site ID: $siteId");
         }
+
+        $this->rebuildLockAcquired = true;
     }
 
     protected function releaseRebuildLock(?int $siteId): void
     {
         if ($siteId !== null) {
-            Craft::$app->getCache()->delete($this->rebuildLockKey($siteId));
+            self::clearRebuildLockForSite($siteId);
         }
+
+        $this->rebuildLockAcquired = false;
     }
 
     protected function rebuildLockKey(int $siteId): string
+    {
+        return self::rebuildLockKeyForSite($siteId);
+    }
+
+    protected static function rebuildLockKeyForSite(int $siteId): string
     {
         return "bramble-search:rebuild:$siteId";
     }
