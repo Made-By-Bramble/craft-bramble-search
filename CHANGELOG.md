@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+## 1.2.1
+- Republished release after restoring the immutable `1.2.0` tag reference on Packagist.
+- Removed client-specific E2E validation assets from the distributed package.
+
 ## 1.2.0
 - Fixed Craft-compatible indexing when `fieldHandles` is `null`, partial, or `[]` so custom field content is never dropped during incremental updates.
 - Added `SearchQuery` parsing for OR groups, exclude terms, attribute scoping, and `$query->customFields` filtering via stored term sources.
