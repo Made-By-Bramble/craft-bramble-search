@@ -1,6 +1,8 @@
 # Release Notes for Bramble Search
 
 ## Unreleased
+
+## 1.2.0
 - Fixed Craft-compatible indexing when `fieldHandles` is `null`, partial, or `[]` so custom field content is never dropped during incremental updates.
 - Added `SearchQuery` parsing for OR groups, exclude terms, attribute scoping, and `$query->customFields` filtering via stored term sources.
 - Forwarded Craft search events, normalized keywords with `craft\helpers\Search::normalizeKeywords()`, and implemented Bramble orphan cleanup plus Commerce cart purge index cleanup.
