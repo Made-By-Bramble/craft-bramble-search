@@ -6,7 +6,12 @@ namespace MadeByBrambleTest\BrambleSearch;
 
 use Craft;
 use craft\elements\Entry;
+use craft\fieldlayoutelements\CustomField;
+use craft\fields\PlainText;
 use craft\helpers\FileHelper;
+use craft\helpers\StringHelper;
+use craft\models\FieldLayout;
+use craft\models\FieldLayoutTab;
 use MadeByBramble\BrambleSearch\adapters\BaseSearchAdapter;
 use MadeByBramble\BrambleSearch\adapters\CraftCacheSearchAdapter;
 use MadeByBramble\BrambleSearch\adapters\FileSearchAdapter;
@@ -396,6 +401,73 @@ final class AdapterFeatureTest extends TestCase
         self::assertSame(0, $adapter->publicTotalLength());
         self::assertSame([], $adapter->searchElements(Entry::find()->siteId(1)->search('powder')));
     }
+
+    public function testNullFieldHandlesIndexesAllSearchableFields(): void
+    {
+        $adapter = new InMemorySearchAdapter();
+        $entry = IndexableTestEntry::withFields([
+            'body' => 'bodyneedle content',
+            'summary' => 'summaryneedle phrase',
+        ]);
+
+        self::assertTrue($adapter->indexElementAttributes($entry, null));
+        self::assertArrayHasKey($entry->id . '-1', $adapter->searchElements(Entry::find()->siteId(1)->search('summaryneedle')));
+    }
+
+    public function testPartialFieldHandlesPreservesOtherFields(): void
+    {
+        $adapter = new InMemorySearchAdapter();
+        $entry = IndexableTestEntry::withFields([
+            'body' => 'bodyneedle token',
+            'summary' => 'summaryneedle token',
+        ]);
+
+        self::assertTrue($adapter->indexElementAttributes($entry, ['body', 'summary']));
+        self::assertTrue($adapter->indexElementAttributes($entry, ['body']));
+
+        self::assertArrayHasKey($entry->id . '-1', $adapter->searchElements(Entry::find()->siteId(1)->search('summaryneedle')));
+    }
+
+    public function testEmptyFieldHandlesPreservesCustomFields(): void
+    {
+        $adapter = new InMemorySearchAdapter();
+        $entry = IndexableTestEntry::withFields([
+            'body' => 'bodypreserve needle',
+            'summary' => 'summarypreserve needle',
+        ]);
+
+        self::assertTrue($adapter->indexElementAttributes($entry, ['body', 'summary']));
+        $entry->title = 'Renamed Preserve Needle';
+        self::assertTrue($adapter->indexElementAttributes($entry, []));
+
+        self::assertArrayHasKey($entry->id . '-1', $adapter->searchElements(Entry::find()->siteId(1)->search('summarypreserve')));
+        self::assertArrayHasKey($entry->id . '-1', $adapter->searchElements(Entry::find()->siteId(1)->search('renamed')));
+    }
+
+    public function testOrSearchQueryMatchesEitherTerm(): void
+    {
+        $adapter = new InMemorySearchAdapter();
+        $adapter->addSearchTerm('alpha', 1, 100);
+        $adapter->addSearchTerm('beta', 1, 200);
+
+        $query = new \craft\search\SearchQuery('alpha OR beta');
+        $matches = $adapter->searchElements(Entry::find()->siteId(1)->search($query));
+
+        self::assertArrayHasKey('100-1', $matches);
+        self::assertArrayHasKey('200-1', $matches);
+    }
+
+    public function testExcludeSearchQueryRemovesMatches(): void
+    {
+        $adapter = new InMemorySearchAdapter();
+        $adapter->addSearchTerm('alpha', 1, 100);
+        $adapter->addSearchTerm('beta', 1, 200);
+
+        $matches = $adapter->searchElements(Entry::find()->siteId(1)->search('alpha -beta'));
+
+        self::assertArrayHasKey('100-1', $matches);
+        self::assertArrayNotHasKey('200-1', $matches);
+    }
 }
 
 final class TestableCraftCacheSearchAdapter extends CraftCacheSearchAdapter
@@ -462,6 +534,7 @@ final class InMemorySearchAdapter extends BaseSearchAdapter
     private array $terms = [];
     private array $titleTerms = [];
     private array $ngrams = [];
+    private array $termSources = [];
     private ?array $allowedDocIds = null;
     private int $totalLength = 0;
 
@@ -617,6 +690,27 @@ final class InMemorySearchAdapter extends BaseSearchAdapter
         unset($this->titleTerms["$siteId:$elementId"]);
     }
 
+    /**
+     * @param array<string, list<string>> $termSources
+     */
+    protected function storeDocumentTermSources(int $siteId, int $elementId, array $termSources): void
+    {
+        $this->termSources["$siteId:$elementId"] = $termSources;
+    }
+
+    /**
+     * @return array<string, list<string>>
+     */
+    protected function getDocumentTermSources(int $siteId, int $elementId): array
+    {
+        return $this->termSources["$siteId:$elementId"] ?? [];
+    }
+
+    protected function deleteDocumentTermSources(int $siteId, int $elementId): void
+    {
+        unset($this->termSources["$siteId:$elementId"]);
+    }
+
     protected function getSiteDocuments(int $siteId): array
     {
         return array_values(array_filter(
@@ -672,5 +766,54 @@ final class InMemorySearchAdapter extends BaseSearchAdapter
     protected function removeTermNgrams(string $term, int $siteId): void
     {
         unset($this->ngrams[$siteId][$term]);
+    }
+}
+
+final class IndexableTestEntry extends Entry
+{
+    public ?FieldLayout $testFieldLayout = null;
+    public array $testFieldValues = [];
+
+    public static function withFields(array $values, int $id = 9001): self
+    {
+        $fields = [];
+        foreach (array_keys($values) as $handle) {
+            $fields[] = new PlainText([
+                'name' => ucfirst($handle),
+                'handle' => $handle,
+                'uid' => StringHelper::UUID(),
+                'searchable' => true,
+            ]);
+        }
+
+        $layout = new FieldLayout(['type' => self::class]);
+        $elements = array_map(
+            static fn(PlainText $field): CustomField => new CustomField($field),
+            $fields
+        );
+        $tab = new FieldLayoutTab(['name' => 'Content']);
+        $tab->setLayout($layout);
+        $tab->setElements($elements);
+        $layout->setTabs([$tab]);
+
+        $entry = new self();
+        $entry->id = $id;
+        $entry->siteId = 1;
+        $entry->enabled = true;
+        $entry->title = 'Indexable Test Entry';
+        $entry->testFieldValues = $values;
+        $entry->testFieldLayout = $layout;
+
+        return $entry;
+    }
+
+    public function getFieldLayout(): ?FieldLayout
+    {
+        return $this->testFieldLayout;
+    }
+
+    public function getFieldValue(string $fieldHandle): mixed
+    {
+        return $this->testFieldValues[$fieldHandle] ?? null;
     }
 }

@@ -1100,15 +1100,22 @@ class MySqlSearchAdapter extends BaseSearchAdapter
         $titleTokens = $this->tokenize($title);
         $titleTerms = array_flip($titleTokens);
 
+        $fieldHandles = $this->resolveFieldHandlesForIndexing($element, $fieldHandles);
+        $attributesOnly = $fieldHandles === [];
+        $termSources = [];
+
         $text = '';
         foreach (ElementHelper::searchableAttributes($element) as $attribute) {
-            $value = $element->getSearchKeywords($attribute);
+            $value = $this->normalizeIndexKeywords($element, $element->getSearchKeywords($attribute), $attribute);
             if (!empty($value)) {
                 $text .= ' ' . $value;
+                foreach ($this->tokenize($value) as $sourceTerm) {
+                    $termSources[$sourceTerm][] = "attr:$attribute";
+                }
             }
         }
 
-        if ($fieldHandles !== null) {
+        if (!$attributesOnly) {
             foreach ($fieldHandles as $handle) {
                 $fieldLayout = $element->getFieldLayout();
                 $field = $fieldLayout?->getFieldByHandle($handle);
@@ -1118,12 +1125,23 @@ class MySqlSearchAdapter extends BaseSearchAdapter
 
                 $fieldValue = $element->getFieldValue($handle);
                 if ($fieldValue) {
-                    $keywords = $field->getSearchKeywords($fieldValue, $element);
+                    $keywords = $this->normalizeIndexKeywords(
+                        $element,
+                        $field->getSearchKeywords($fieldValue, $element),
+                        null,
+                        (int)$field->id
+                    );
                     if (!empty($keywords)) {
                         $text .= ' ' . $keywords;
+                        foreach ($this->tokenize($keywords) as $sourceTerm) {
+                            $termSources[$sourceTerm][] = "field:$handle";
+                        }
                     }
                 }
             }
+        } else {
+            $termSources = $this->mergeTermSourcesWithExistingFieldTerms($element->siteId, $element->id, $termSources);
+            $text .= $this->getExistingFieldTextFromIndex($element->siteId, $element->id);
         }
 
         $termFreqs = $this->buildIndexedTermFrequencies($text, $titleTokens);
@@ -1142,6 +1160,7 @@ class MySqlSearchAdapter extends BaseSearchAdapter
 
         $this->storeDocument($siteId, $elementId, $termFreqs, $docLen);
         $this->storeTitleTerms($siteId, $elementId, $titleTerms);
+        $this->storeDocumentTermSources($siteId, $elementId, $termSources);
 
         if (!empty($termFreqs)) {
             $termBatch = [];
@@ -1273,6 +1292,88 @@ class MySqlSearchAdapter extends BaseSearchAdapter
         } catch (\Throwable $e) {
             Craft::error("Error clearing search index: " . $e->getMessage(), __METHOD__);
             return false;
+        }
+    }
+
+    /**
+     * @param array<string, list<string>> $termSources
+     */
+    protected function storeDocumentTermSources(int $siteId, int $elementId, array $termSources): void
+    {
+        $key = "term_sources:$siteId:$elementId";
+        Craft::$app->getDb()->createCommand()
+            ->delete($this->tablePrefix . 'metadata}}', ['key' => $key])
+            ->execute();
+
+        if ($termSources === []) {
+            return;
+        }
+
+        $now = (new \DateTime())->format('Y-m-d H:i:s');
+        Craft::$app->getDb()->createCommand()
+            ->insert($this->tablePrefix . 'metadata}}', [
+                'key' => $key,
+                'value' => json_encode($termSources, JSON_THROW_ON_ERROR),
+                'dateCreated' => $now,
+                'dateUpdated' => $now,
+                'uid' => StringHelper::UUID(),
+            ])
+            ->execute();
+    }
+
+    /**
+     * @return array<string, list<string>>
+     */
+    protected function getDocumentTermSources(int $siteId, int $elementId): array
+    {
+        $value = (new Query())
+            ->select(['value'])
+            ->from($this->tablePrefix . 'metadata}}')
+            ->where(['key' => "term_sources:$siteId:$elementId"])
+            ->scalar();
+
+        if (!$value) {
+            return [];
+        }
+
+        return json_decode((string)$value, true, 512, JSON_THROW_ON_ERROR) ?: [];
+    }
+
+    protected function deleteDocumentTermSources(int $siteId, int $elementId): void
+    {
+        Craft::$app->getDb()->createCommand()
+            ->delete($this->tablePrefix . 'metadata}}', [
+                'key' => "term_sources:$siteId:$elementId",
+            ])
+            ->execute();
+    }
+
+    protected function deleteOrphanedIndexesFromAdapter(): void
+    {
+        $db = Craft::$app->getDb();
+        $metadataTable = $this->tablePrefix . 'metadata}}';
+        $elementsSitesTable = '{{%elements_sites}}';
+
+        $docIds = (new Query())
+            ->select(['value'])
+            ->from($metadataTable)
+            ->where(['key' => 'doc'])
+            ->column();
+
+        foreach ($docIds as $docId) {
+            if (!is_string($docId) || !str_contains($docId, ':')) {
+                continue;
+            }
+
+            [$siteId, $elementId] = explode(':', $docId, 2);
+            $exists = (new Query())
+                ->from($elementsSitesTable)
+                ->where(['elementId' => (int)$elementId, 'siteId' => (int)$siteId])
+                ->exists($db);
+
+            if (!$exists) {
+                $this->deleteElementFromIndex((int)$elementId, (int)$siteId);
+            }
         }
     }
 }

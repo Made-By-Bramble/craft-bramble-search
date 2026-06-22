@@ -258,8 +258,7 @@ class RebuildIndexJob extends BaseBatchedJob implements RetryableJobInterface
     protected function indexElement(ElementInterface $element): bool
     {
         try {
-            // Get all field handles that can be indexed
-            $fieldHandles = $this->getIndexableFieldHandles($element);
+            $fieldHandles = $this->getSearchAdapter()->getSearchableFieldHandles($element);
 
             // Use the search service to index the element
             return Craft::$app->getSearch()->indexElementAttributes($element, $fieldHandles);
@@ -268,35 +267,6 @@ class RebuildIndexJob extends BaseBatchedJob implements RetryableJobInterface
             Craft::error("Error indexing {$elementType} {$element->id}: {$e->getMessage()}", __METHOD__);
             return false;
         }
-    }
-
-    /**
-     * Get the field handles that can be indexed for an element
-     *
-     * Filters fields based on their searchable property
-     *
-     * @param ElementInterface $element The element to get field handles for
-     * @return array List of searchable field handles
-     */
-    protected function getIndexableFieldHandles(ElementInterface $element): array
-    {
-        $fieldHandles = [];
-        $fieldLayout = $element->getFieldLayout();
-
-        if (!$fieldLayout) {
-            return $fieldHandles;
-        }
-
-        foreach ($fieldLayout->getCustomFields() as $field) {
-            // Skip fields that shouldn't be indexed
-            if (!$field->searchable) {
-                continue;
-            }
-
-            $fieldHandles[] = $field->handle;
-        }
-
-        return $fieldHandles;
     }
 
     protected function getSearchAdapter(): BaseSearchAdapter

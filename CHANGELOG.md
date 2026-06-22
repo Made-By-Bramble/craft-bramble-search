@@ -1,5 +1,13 @@
 # Release Notes for Bramble Search
 
+## Unreleased
+- Fixed Craft-compatible indexing when `fieldHandles` is `null`, partial, or `[]` so custom field content is never dropped during incremental updates.
+- Added `SearchQuery` parsing for OR groups, exclude terms, attribute scoping, and `$query->customFields` filtering via stored term sources.
+- Forwarded Craft search events, normalized keywords with `craft\helpers\Search::normalizeKeywords()`, and implemented Bramble orphan cleanup plus Commerce cart purge index cleanup.
+- Added filter-only `createDbQuery()` fast path and conditional fuzzy fallback when exact matches exceed 50 documents per term.
+- Fixed `createDbQuery()` Commerce product subqueries to select `elementId`/`siteId` from `elements_sites`, and aligned filter-only matching with scored search typeahead handling so exclude queries stay consistent with base-term results.
+- Added regression tests, benchmark harness (`tests/benchmarks/search-benchmark.php`), and therapy-organics E2E checklist.
+
 ## 1.1.0
 - Added a metadata repair migration that collapses duplicate document metadata and recalculates total document and token counts from the current index.
 - Made rebuild jobs retryable with a bounded TTR and stale lock recovery so interrupted queue workers do not permanently block future rebuilds.
