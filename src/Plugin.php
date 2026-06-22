@@ -254,6 +254,41 @@ class Plugin extends BasePlugin
             \craft\services\Elements::EVENT_AFTER_DELETE_FOR_SITE,
             [$this, 'handleElementDelete']
         );
+
+        $this->registerCommerceEventHandlers();
+    }
+
+    /**
+     * Register Commerce-specific cleanup hooks when Commerce is installed.
+     */
+    protected function registerCommerceEventHandlers(): void
+    {
+        if (!class_exists(\craft\commerce\services\Carts::class)) {
+            return;
+        }
+
+        Event::on(
+            \craft\commerce\services\Carts::class,
+            \craft\commerce\services\Carts::EVENT_BEFORE_PURGE_INACTIVE_CARTS,
+            function(\craft\commerce\events\CartPurgeEvent $event): void {
+                $searchService = Craft::$app->getSearch();
+                if (!($searchService instanceof BaseSearchAdapter)) {
+                    return;
+                }
+
+                $cartIds = (clone $event->inactiveCartsQuery)->column();
+                foreach ($cartIds as $cartId) {
+                    $order = \craft\commerce\elements\Order::find()
+                        ->id((int)$cartId)
+                        ->siteId('*')
+                        ->status(null)
+                        ->one();
+                    if ($order?->id && $order->siteId) {
+                        $searchService->deleteElementIndex($order);
+                    }
+                }
+            }
+        );
     }
 
     /**
@@ -737,24 +772,13 @@ class Plugin extends BasePlugin
             return;
         }
 
-        // Always queue indexing for saved, non-draft elements
-        // queueIndexElement handles deduplication via the searchindexqueue table,
-        // so it's safe to call even if indexing was already queued by Craft's native system
-        // This ensures elements are indexed even when Craft's condition (dirty fields/attributes)
-        // isn't met, which commonly happens with new elements
-        if ($element->id && $element->siteId) {
-            // Get all searchable field handles
-            $fieldHandles = [];
-            $fieldLayout = $element->getFieldLayout();
-            if ($fieldLayout) {
-                foreach ($fieldLayout->getCustomFields() as $field) {
-                    if ($field->searchable) {
-                        $fieldHandles[] = $field->handle;
-                    }
-                }
-            }
+        // Only queue indexing for new elements. Craft handles updates once field-handle semantics are aligned.
+        if (!$isNew) {
+            return;
+        }
 
-            // Queue the indexing (this will use the queue for web requests)
+        if ($element->id && $element->siteId) {
+            $fieldHandles = Craft::$app->getSearch()->getSearchableFieldHandles($element);
             $searchService->queueIndexElement($element, $fieldHandles);
         }
     }

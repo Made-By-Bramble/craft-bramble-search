@@ -328,6 +328,30 @@ When enabled, Bramble Search will:
 
 > ⚠️ **Important**: After enabling the plugin, you must build your search index using the Clear Caches utility in the Control Panel or by running `./craft clear-caches/bramble-search`.
 
+### Craft search compatibility
+
+Bramble Search stores indexes in `bramble_search_*` tables (or the configured adapter) and does **not** write to Craft's native `searchindex` table while enabled.
+
+| Capability | Support |
+|------------|---------|
+| Plain-text `->search('terms')` | Full support with BM25 + fuzzy + AND logic |
+| `orderBy('score')` / relevancy sorting | Full support (float scores; GraphQL exposes integers) |
+| `SearchQuery` OR groups | Supported |
+| Exclude terms (`-term`) | Supported |
+| Attribute scoping (`title:term`, `title::exact`) | Supported when term sources are stored |
+| `$query->customFields` | Supported when term sources are stored |
+| Multi-site `siteId` arrays / `*` | Supported |
+| Craft search events (`beforeSearch`, `beforeIndexKeywords`, etc.) | Forwarded from Bramble adapter |
+| Filter-only queries (no score ordering) | Uses fast `createDbQuery()` path |
+
+**Intentional differences from Craft native search:**
+
+- Multiple terms use **AND** logic by default (Craft scoring uses OR within groups)
+- Scores are floats internally; GraphQL `searchScore` truncates to integers
+- Commerce cart purge cleans Bramble index via Commerce event hook when Commerce is installed
+
+Run `./vendor/bin/phpunit` and `php tests/craft5-feature-matrix.php` after upgrades.
+
 ## 📄 License
 
 Bramble Search is licensed under a proprietary license. See the LICENSE.md file for details.

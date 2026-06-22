@@ -531,6 +531,34 @@ function matrix_run_driver(string $driver, string $token, array $entriesBySite, 
     $boostResults = matrix_search_ids($adapter, "boostneedle$token", $site1);
     matrix_assert($boostResults[0] === $boostTitle->id . "-$site1", "$driver title boost ordering failed", ['ids' => $boostResults]);
 
+    $partialEntry = new MatrixFieldCoverageEntry();
+    $partialEntry->id = 892000 + crc32($driver) % 10000;
+    $partialEntry->siteId = $site1;
+    $partialEntry->enabled = true;
+    $partialEntry->title = "Partial $token";
+    $partialEntry->matrixFieldLayout = matrix_field_layout([
+        new PlainText(['name' => 'Body', 'handle' => 'body', 'uid' => StringHelper::UUID(), 'searchable' => true]),
+        new PlainText(['name' => 'Summary', 'handle' => 'summary', 'uid' => StringHelper::UUID(), 'searchable' => true]),
+    ]);
+    $partialEntry->matrixFieldValues = [
+        'body' => "partialbody$token",
+        'summary' => "partialsummary$token",
+    ];
+    $adapter->indexElementAttributes($partialEntry, ['body', 'summary']);
+    $adapter->indexElementAttributes($partialEntry, ['body']);
+    matrix_assert(
+        matrix_search_ids($adapter, "partialsummary$token", $site1) === [$partialEntry->id . "-$site1"],
+        "$driver partial field re-index dropped untouched fields"
+    );
+
+    $nullEntry = clone $partialEntry;
+    $nullEntry->id = 893000 + crc32($driver) % 10000;
+    $adapter->indexElementAttributes($nullEntry, null);
+    matrix_assert(
+        matrix_search_ids($adapter, "partialsummary$token", $site1) !== [],
+        "$driver null fieldHandles skipped custom fields"
+    );
+
     matrix_pass("$driver driver matrix", [
         'exact' => $exact,
         'fuzzy' => $fuzzy,
