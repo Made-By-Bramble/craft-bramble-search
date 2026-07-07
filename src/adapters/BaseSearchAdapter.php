@@ -14,7 +14,6 @@ use craft\helpers\Search as SearchHelper;
 use craft\search\SearchQuery;
 use craft\services\Search;
 use MadeByBramble\BrambleSearch\helpers\SearchQueryParser;
-use yii\db\Expression;
 use yii\log\Logger;
 
 /**
@@ -75,6 +74,19 @@ abstract class BaseSearchAdapter extends Search
      */
     protected int $fuzzySearchMaxCandidates = 100;
 
+    /**
+     * Whether front-end site searches treat the final token as an in-progress prefix.
+     * The control panel's live element index search always does.
+     */
+    protected bool $siteSearchAsYouType = false;
+
+    /**
+     * Request-scoped read caches, cleared whenever the index is mutated
+     */
+    private array $memoTermDocs = [];
+    private array $memoTitleTerms = [];
+    private array $memoDocTerms = [];
+
     // =========================================================================
     // INITIALIZATION METHODS
     // =========================================================================
@@ -115,6 +127,7 @@ abstract class BaseSearchAdapter extends Search
             $this->ngramSizes = $settings->ngramSizes ?? [2, 3];
             $this->ngramSimilarityThreshold = $settings->ngramSimilarityThreshold ?? 0.4;
             $this->fuzzySearchMaxCandidates = $settings->fuzzySearchMaxCandidates ?? 100;
+            $this->siteSearchAsYouType = $settings->siteSearchAsYouType ?? false;
         }
     }
 
@@ -195,6 +208,8 @@ abstract class BaseSearchAdapter extends Search
         if (!$element->id || !$element->siteId) {
             return true;
         }
+
+        $this->clearSearchMemo();
 
         if (($element->dateDeleted ?? null) !== null || !$element->enabled || !$element->getEnabledForSite()) {
             return $this->removeElementFromIndexAndUpdateMetadata($element);
@@ -354,6 +369,8 @@ abstract class BaseSearchAdapter extends Search
             return true;
         }
 
+        $this->clearSearchMemo();
+
         $oldDocLength = $this->getDocumentLength("{$element->siteId}:{$element->id}");
         if (!$this->deleteElementFromIndex($element->id, $element->siteId)) {
             return false;
@@ -491,6 +508,149 @@ abstract class BaseSearchAdapter extends Search
      * @param ElementQuery $elementQuery The element query containing search parameters
      * @return array Element IDs and their relevance scores
      */
+    /**
+     * Clear the request-scoped read caches. Called whenever the index is mutated.
+     */
+    protected function clearSearchMemo(): void
+    {
+        $this->memoTermDocs = [];
+        $this->memoTitleTerms = [];
+        $this->memoDocTerms = [];
+    }
+
+    /**
+     * Memoized getTermDocuments()
+     */
+    protected function termDocumentsCached(string $term): array
+    {
+        return $this->memoTermDocs[$term] ??= $this->getTermDocuments($term);
+    }
+
+    /**
+     * Memoized getTitleTerms()
+     */
+    protected function titleTermsCached(string $docId): array
+    {
+        return $this->memoTitleTerms[$docId] ??= $this->getTitleTerms($docId);
+    }
+
+    /**
+     * Memoized getDocumentTerms()
+     */
+    protected function documentTermsCached(int $siteId, int $elementId): array
+    {
+        return $this->memoDocTerms["$siteId:$elementId"] ??= $this->getDocumentTerms($siteId, $elementId);
+    }
+
+    /**
+     * Prefetch term documents into the request cache.
+     *
+     * @param array<string> $terms
+     */
+    protected function warmTermDocuments(array $terms): void
+    {
+        $missing = [];
+        foreach ($terms as $term) {
+            $term = (string)$term;
+            if (!array_key_exists($term, $this->memoTermDocs)) {
+                $missing[] = $term;
+            }
+        }
+
+        foreach ($this->getTermDocumentsBatch($missing) as $term => $docs) {
+            $this->memoTermDocs[$term] = $docs;
+        }
+    }
+
+    /**
+     * Prefetch title terms into the request cache.
+     *
+     * @param array<string> $docIds Document IDs (siteId:elementId)
+     */
+    protected function warmTitleTerms(array $docIds): void
+    {
+        $missing = [];
+        foreach ($docIds as $docId) {
+            $docId = (string)$docId;
+            if (!array_key_exists($docId, $this->memoTitleTerms)) {
+                $missing[] = $docId;
+            }
+        }
+
+        foreach ($this->getTitleTermsBatch($missing) as $docId => $titleTerms) {
+            $this->memoTitleTerms[$docId] = $titleTerms;
+        }
+    }
+
+    /**
+     * Prefetch document terms into the request cache.
+     *
+     * @param array<string> $docIds Document IDs (siteId:elementId)
+     */
+    protected function warmDocumentTerms(array $docIds): void
+    {
+        $missing = [];
+        foreach ($docIds as $docId) {
+            $docId = (string)$docId;
+            if (!array_key_exists($docId, $this->memoDocTerms)) {
+                $missing[] = $docId;
+            }
+        }
+
+        foreach ($this->getDocumentTermsBatch($missing) as $docId => $terms) {
+            $this->memoDocTerms[$docId] = $terms;
+        }
+    }
+
+    /**
+     * Fetch documents for multiple terms. Adapters can override with a batched implementation.
+     *
+     * @param array<string> $terms
+     * @return array<string, array> term => documents
+     */
+    protected function getTermDocumentsBatch(array $terms): array
+    {
+        $results = [];
+        foreach ($terms as $term) {
+            $results[$term] = $this->getTermDocuments((string)$term);
+        }
+
+        return $results;
+    }
+
+    /**
+     * Fetch title terms for multiple documents. Adapters can override with a batched implementation.
+     *
+     * @param array<string> $docIds Document IDs (siteId:elementId)
+     * @return array<string, array> docId => title terms
+     */
+    protected function getTitleTermsBatch(array $docIds): array
+    {
+        $results = [];
+        foreach ($docIds as $docId) {
+            $results[$docId] = $this->getTitleTerms((string)$docId);
+        }
+
+        return $results;
+    }
+
+    /**
+     * Fetch terms for multiple documents. Adapters can override with a batched implementation.
+     *
+     * @param array<string> $docIds Document IDs (siteId:elementId)
+     * @return array<string, array> docId => terms
+     */
+    protected function getDocumentTermsBatch(array $docIds): array
+    {
+        $results = [];
+        foreach ($docIds as $docId) {
+            [$siteId, $elementId] = explode(':', (string)$docId, 2);
+            $results[$docId] = $this->getDocumentTerms((int)$siteId, (int)$elementId);
+        }
+
+        return $results;
+    }
+
     public function searchElements(ElementQuery $elementQuery): array
     {
         $parsed = SearchQueryParser::parse($elementQuery->search);
@@ -578,7 +738,7 @@ abstract class BaseSearchAdapter extends Search
         ElementQuery $elementQuery,
         int $siteId,
         array $parsed,
-        string $searchQuery
+        string $searchQuery,
     ): array {
         $rawTokens = $this->tokenize($searchQuery);
         $isTypeaheadQuery = $this->isSearchAsYouTypeQuery($searchQuery, $rawTokens);
@@ -647,6 +807,7 @@ abstract class BaseSearchAdapter extends Search
         }
 
         $documentLengths = $this->getDocumentLengthsBatch(array_keys($allDocuments));
+        $this->warmTitleTerms(array_keys($allDocuments));
         foreach ($groupTermData as $groupIndex => $documents) {
             foreach ($documents as $docId => $data) {
                 if (!in_array($docId, $validDocs, true)) {
@@ -667,6 +828,9 @@ abstract class BaseSearchAdapter extends Search
         }
 
         $tokens = $this->flattenParsedTerms($parsed);
+        if (!$isTypeaheadQuery && count($tokens) > 1) {
+            $this->warmDocumentTerms($validDocs);
+        }
         foreach ($validDocs as $docId) {
             if (!isset($docScores[$docId])) {
                 continue;
@@ -712,7 +876,23 @@ abstract class BaseSearchAdapter extends Search
      */
     protected function isSearchAsYouTypeQuery(string $searchQuery, array $tokens): bool
     {
-        return !empty($tokens) && preg_match('/\s$/u', $searchQuery) !== 1;
+        if (empty($tokens) || preg_match('/\s$/u', $searchQuery) === 1) {
+            return false;
+        }
+
+        if ($this->siteSearchAsYouType) {
+            return true;
+        }
+
+        // Front-end site searches are submitted queries; final-token prefix expansion
+        // is for the control panel's live element index search.
+        if (!isset(Craft::$app)) { // @phpstan-ignore isset.property (unset before bootstrap in unit tests)
+            return true;
+        }
+
+        $request = Craft::$app->getRequest();
+
+        return !($request instanceof \craft\web\Request) || $request->getIsCpRequest();
     }
 
     /**
@@ -885,7 +1065,7 @@ abstract class BaseSearchAdapter extends Search
         ElementInterface $element,
         string $keywords,
         ?string $attribute = null,
-        ?int $fieldId = null
+        ?int $fieldId = null,
     ): string {
         if ($attribute !== null) {
             $attribute = strtolower($attribute);
@@ -926,7 +1106,7 @@ abstract class BaseSearchAdapter extends Search
     protected function mergeTermSourcesWithExistingFieldTerms(
         int $siteId,
         int $elementId,
-        array $attributeSources
+        array $attributeSources,
     ): array {
         $merged = $attributeSources;
         foreach ($this->getDocumentTermSources($siteId, $elementId) as $term => $origins) {
@@ -1043,7 +1223,7 @@ abstract class BaseSearchAdapter extends Search
         array $parsed,
         int $siteId,
         ElementQuery $elementQuery,
-        bool $scored
+        bool $scored,
     ): array {
         if ($scored) {
             return array_keys($this->searchElementsForSite($elementQuery, $siteId, $parsed, $parsed['rawQuery']));
@@ -1113,7 +1293,7 @@ abstract class BaseSearchAdapter extends Search
         bool $isTypeaheadTerm,
         array $completedTerms,
         array $groupMatches,
-        int $groupIndex
+        int $groupIndex,
     ): array {
         $term = (string)$termSpec['term'];
         $tokens = $this->getSearchTokens($term, $isTypeaheadTerm);
@@ -1123,7 +1303,7 @@ abstract class BaseSearchAdapter extends Search
 
         $term = $tokens[0];
         $matches = [];
-        $termDocs = $this->filterDocumentsBySite($this->getTermDocuments($term), $siteId);
+        $termDocs = $this->filterDocumentsBySite($this->termDocumentsCached($term), $siteId);
 
         if (!empty($termDocs)) {
             $docFreq = count($termDocs);
@@ -1142,11 +1322,23 @@ abstract class BaseSearchAdapter extends Search
 
         if ($isTypeaheadTerm) {
             $priorDocIds = $groupIndex > 0 ? $this->getDocsMatchingPreviousGroups($groupMatches, $groupIndex) : null;
-            foreach ($this->findTypeaheadMatchScores($term, $siteId, $priorDocIds, $completedTerms) as $prefixTerm => $confidence) {
-                if ($prefixTerm === $term) {
-                    continue;
-                }
-                foreach ($this->filterDocumentsBySite($this->getTermDocuments($prefixTerm), $siteId) as $docId => $freq) {
+            $typeaheadScores = $this->findTypeaheadMatchScores($term, $siteId, $priorDocIds, $completedTerms);
+            unset($typeaheadScores[$term]);
+
+            $this->warmTermDocuments(array_keys($typeaheadScores));
+            $typeaheadDocs = [];
+            $typeaheadDocIds = [];
+            foreach (array_keys($typeaheadScores) as $prefixTerm) {
+                $docs = $this->filterDocumentsBySite($this->termDocumentsCached((string)$prefixTerm), $siteId);
+                $typeaheadDocs[$prefixTerm] = $docs;
+                $typeaheadDocIds += $docs;
+            }
+            $this->warmTitleTerms(array_keys($typeaheadDocIds));
+
+            foreach ($typeaheadScores as $prefixTerm => $confidence) {
+                $prefixTerm = (string)$prefixTerm;
+                $docFreq = count($typeaheadDocs[$prefixTerm]);
+                foreach ($typeaheadDocs[$prefixTerm] as $docId => $freq) {
                     if ($this->shouldSkipNonTitleTypeaheadMatch($term, $prefixTerm, (string)$docId)) {
                         continue;
                     }
@@ -1156,7 +1348,7 @@ abstract class BaseSearchAdapter extends Search
                     }
                     $matchData = [
                         'freq' => $freq,
-                        'docFreq' => count($this->filterDocumentsBySite($this->getTermDocuments($prefixTerm), $siteId)),
+                        'docFreq' => $docFreq,
                         'actualTerm' => $prefixTerm,
                         'confidence' => $docConfidence,
                     ];
@@ -1175,17 +1367,21 @@ abstract class BaseSearchAdapter extends Search
             return $matches;
         }
 
-        foreach ($this->findFuzzyMatchScores($term, siteId: $siteId) as $fuzzy => $confidence) {
-            if ($fuzzy === $term) {
-                continue;
-            }
-            foreach ($this->filterDocumentsBySite($this->getTermDocuments($fuzzy), $siteId) as $docId => $freq) {
+        $fuzzyScores = $this->findFuzzyMatchScores($term, siteId: $siteId);
+        unset($fuzzyScores[$term]);
+        $this->warmTermDocuments(array_keys($fuzzyScores));
+
+        foreach ($fuzzyScores as $fuzzy => $confidence) {
+            $fuzzy = (string)$fuzzy;
+            $fuzzyDocs = $this->filterDocumentsBySite($this->termDocumentsCached($fuzzy), $siteId);
+            $docFreq = count($fuzzyDocs);
+            foreach ($fuzzyDocs as $docId => $freq) {
                 if (isset($matches[$docId]) || !$this->termMatchesAttributeScope($docId, $fuzzy, $termSpec)) {
                     continue;
                 }
                 $matches[$docId] = [
                     'freq' => $freq,
-                    'docFreq' => count($this->filterDocumentsBySite($this->getTermDocuments($fuzzy), $siteId)),
+                    'docFreq' => $docFreq,
                     'actualTerm' => $fuzzy,
                     'confidence' => $confidence,
                 ];
@@ -1370,13 +1566,14 @@ abstract class BaseSearchAdapter extends Search
         $matches = [];
 
         if ($candidateDocIds !== null) {
+            $this->warmDocumentTerms($candidateDocIds);
             foreach ($candidateDocIds as $docId) {
                 [$docSiteId, $elementId] = explode(':', (string)$docId, 2);
                 if ((int)$docSiteId !== $siteId) {
                     continue;
                 }
 
-                foreach (array_keys($this->getDocumentTerms($siteId, (int)$elementId)) as $term) {
+                foreach (array_keys($this->documentTermsCached($siteId, (int)$elementId)) as $term) {
                     if (isset($excluded[$term]) || !str_starts_with((string)$term, $prefix)) {
                         continue;
                     }
@@ -1428,13 +1625,14 @@ abstract class BaseSearchAdapter extends Search
         array $matches,
     ): array {
         if ($candidateDocIds !== null) {
+            $this->warmDocumentTerms($candidateDocIds);
             foreach ($candidateDocIds as $docId) {
                 [$docSiteId, $elementId] = explode(':', (string)$docId, 2);
                 if ((int)$docSiteId !== $siteId) {
                     continue;
                 }
 
-                foreach (array_keys($this->getDocumentTerms($siteId, (int)$elementId)) as $term) {
+                foreach (array_keys($this->documentTermsCached($siteId, (int)$elementId)) as $term) {
                     if (isset($excluded[$term]) || isset($matches[$term])) {
                         continue;
                     }
@@ -1856,7 +2054,7 @@ abstract class BaseSearchAdapter extends Search
                 continue;
             }
 
-            if (empty($this->filterDocumentsBySite($this->getTermDocuments($term), $siteId))) {
+            if (empty($this->filterDocumentsBySite($this->termDocumentsCached($term), $siteId))) {
                 continue;
             }
 
@@ -1935,7 +2133,7 @@ abstract class BaseSearchAdapter extends Search
      */
     protected function isTermInTitle(string $term, string $docId): bool
     {
-        $titleTerms = $this->getTitleTerms($docId);
+        $titleTerms = $this->titleTermsCached($docId);
         return isset($titleTerms[$term]);
     }
 
@@ -1954,7 +2152,7 @@ abstract class BaseSearchAdapter extends Search
         $tokens = $this->getSearchTokens($phrase);
 
         [$siteId, $elementId] = explode(':', $docId);
-        $docTerms = $this->getDocumentTerms((int)$siteId, (int)$elementId);
+        $docTerms = $this->documentTermsCached((int)$siteId, (int)$elementId);
 
         foreach ($tokens as $token) {
             if (!isset($docTerms[$token])) {
@@ -1978,7 +2176,7 @@ abstract class BaseSearchAdapter extends Search
             return false;
         }
 
-        $titleTerms = $this->getTitleTerms($docId);
+        $titleTerms = $this->titleTermsCached($docId);
         $finalPrefix = (string)array_pop($tokens);
         $completedTerms = array_fill_keys($tokens, true);
 
@@ -2126,7 +2324,7 @@ abstract class BaseSearchAdapter extends Search
     {
         $terms = [];
 
-        foreach (array_keys($this->getTitleTerms($docId)) as $term) {
+        foreach (array_keys($this->titleTermsCached($docId)) as $term) {
             $term = (string)$term;
             if (preg_match('/^\d+$/', $term)) {
                 continue;
@@ -2326,6 +2524,8 @@ abstract class BaseSearchAdapter extends Search
     public function clearIndex(int $siteId): bool
     {
         try {
+            $this->clearSearchMemo();
+
             // Get all documents for this site
             $documents = $this->getSiteDocuments($siteId);
 
@@ -2382,6 +2582,8 @@ abstract class BaseSearchAdapter extends Search
     public function pruneIndexForSite(int $siteId, array $activeElementIds): bool
     {
         try {
+            $this->clearSearchMemo();
+
             $activeDocIds = [];
             foreach ($activeElementIds as $elementId) {
                 $elementId = (int)$elementId;
@@ -2451,6 +2653,8 @@ abstract class BaseSearchAdapter extends Search
     public function deleteElementFromIndex(int $elementId, int $siteId): bool
     {
         try {
+            $this->clearSearchMemo();
+
             // Get all terms for this document
             $terms = $this->getDocumentTerms($siteId, $elementId);
 
@@ -2541,6 +2745,8 @@ abstract class BaseSearchAdapter extends Search
      */
     public function cleanupOrphanedTerms(): void
     {
+        $this->clearSearchMemo();
+
         $allTerms = $this->getAllTerms();
         $siteIds = Craft::$app->getSites()->getAllSiteIds(true);
 

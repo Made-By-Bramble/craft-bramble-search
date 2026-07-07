@@ -263,6 +263,15 @@
         errors: settings.getErrors('fuzzySearchMaxCandidates'),
     }) }}
 
+    {{ forms.lightswitchField({
+        label: "Site Search-As-You-Type"|t('bramble-search'),
+        instructions: "Treat the final token of front-end site searches as an in-progress prefix. The control panel element search always does this. Enable only if the site has a live search UI; it is significantly slower for submitted searches."|t('bramble-search'),
+        id: 'siteSearchAsYouType',
+        name: 'siteSearchAsYouType',
+        on: settings.siteSearchAsYouType,
+        errors: settings.getErrors('siteSearchAsYouType'),
+    }) }}
+
 <hr>
 
 {# Index Management Section #}

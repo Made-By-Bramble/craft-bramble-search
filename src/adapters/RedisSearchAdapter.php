@@ -291,6 +291,95 @@ class RedisSearchAdapter extends BaseSearchAdapter
 
 
     /**
+     * Fetch documents for multiple terms in a single pipeline
+     *
+     * @param array<string> $terms
+     * @return array<string, array> term => documents
+     */
+    protected function getTermDocumentsBatch(array $terms): array
+    {
+        if (empty($terms)) {
+            return [];
+        }
+
+        $terms = array_values($terms);
+        $pipe = $this->redis->multi(\Redis::PIPELINE);
+        foreach ($terms as $term) {
+            $pipe->zRange($this->prefix . "term:$term", 0, -1, true);
+        }
+        $results = $pipe->exec();
+
+        $docs = [];
+        foreach ($terms as $index => $term) {
+            $result = $results[$index] ?? false;
+            $docs[$term] = ($result === false || !is_array($result)) ? [] : $result;
+        }
+
+        return $docs;
+    }
+
+    /**
+     * Fetch title terms for multiple documents in a single pipeline
+     *
+     * @param array<string> $docIds Document IDs (siteId:elementId)
+     * @return array<string, array> docId => title terms keyed to true
+     */
+    protected function getTitleTermsBatch(array $docIds): array
+    {
+        if (empty($docIds)) {
+            return [];
+        }
+
+        $docIds = array_values($docIds);
+        $pipe = $this->redis->multi(\Redis::PIPELINE);
+        foreach ($docIds as $docId) {
+            $pipe->sMembers($this->prefix . "title:$docId");
+        }
+        $results = $pipe->exec();
+
+        $titleTerms = [];
+        foreach ($docIds as $index => $docId) {
+            $result = $results[$index] ?? false;
+            $titleTerms[$docId] = ($result === false || !is_array($result)) ? [] : array_flip($result);
+        }
+
+        return $titleTerms;
+    }
+
+    /**
+     * Fetch terms for multiple documents in a single pipeline
+     *
+     * @param array<string> $docIds Document IDs (siteId:elementId)
+     * @return array<string, array> docId => terms and their frequencies
+     */
+    protected function getDocumentTermsBatch(array $docIds): array
+    {
+        if (empty($docIds)) {
+            return [];
+        }
+
+        $docIds = array_values($docIds);
+        $pipe = $this->redis->multi(\Redis::PIPELINE);
+        foreach ($docIds as $docId) {
+            $pipe->hGetAll($this->prefix . "doc:$docId");
+        }
+        $results = $pipe->exec();
+
+        $terms = [];
+        foreach ($docIds as $index => $docId) {
+            $result = $results[$index] ?? false;
+            if ($result === false || !is_array($result)) {
+                $terms[$docId] = [];
+                continue;
+            }
+            unset($result['_length']);
+            $terms[$docId] = $result;
+        }
+
+        return $terms;
+    }
+
+    /**
      * Get all terms in the index from Redis
      *
      * @return array All terms in the index
@@ -496,22 +585,32 @@ class RedisSearchAdapter extends BaseSearchAdapter
         $termScores = [];
         $searchCount = count($ngrams);
 
-        // Get all terms for each n-gram and count matches
+        // Get all terms for each n-gram and count matches, in a single pipeline
+        $ngrams = array_values($ngrams);
+        $pipe = $this->redis->multi(\Redis::PIPELINE);
         foreach ($ngrams as $ngram) {
-            $ngramKey = $this->prefix . "ngram:{$siteId}:{$ngram}";
-            $terms = $this->redis->sMembers($ngramKey);
-
+            $pipe->sMembers($this->prefix . "ngram:{$siteId}:{$ngram}");
+        }
+        foreach ($pipe->exec() as $terms) {
+            if (!is_array($terms)) {
+                continue;
+            }
             foreach ($terms as $term) {
                 $termScores[$term] = ($termScores[$term] ?? 0) + 1;
             }
         }
 
-        // Calculate Jaccard similarity for each candidate term
+        if (empty($termScores)) {
+            return [];
+        }
+
+        // Calculate Jaccard similarity for each candidate term, fetching all counts at once
         $results = [];
         $countKey = $this->prefix . "ngram_count:{$siteId}";
+        $ngramCounts = $this->redis->hMGet($countKey, array_map('strval', array_keys($termScores)));
 
         foreach ($termScores as $term => $matchCount) {
-            $termNgramCount = (int)$this->redis->hGet($countKey, $term);
+            $termNgramCount = (int)($ngramCounts[$term] ?? 0);
 
             if ($termNgramCount > 0) {
                 // Jaccard similarity: |intersection| / |union|

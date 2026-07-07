@@ -86,6 +86,12 @@ class Settings extends Model
      */
     public int $fuzzySearchMaxCandidates = 100;
 
+    /**
+     * Whether front-end site searches treat the final query token as an in-progress
+     * prefix (search-as-you-type). The control panel element search always does.
+     */
+    public bool $siteSearchAsYouType = false;
+
 
     /**
      * Define validation rules for settings
@@ -113,6 +119,7 @@ class Settings extends Model
       ['ngramSizes', 'each', 'rule' => ['integer', 'min' => 1, 'max' => 5]],
       ['ngramSimilarityThreshold', 'number', 'min' => 0.0, 'max' => 1.0],
       ['fuzzySearchMaxCandidates', 'integer', 'min' => 10, 'max' => 1000],
+      ['siteSearchAsYouType', 'boolean'],
     ];
     }
 }
