@@ -1,6 +1,9 @@
 # Release Notes for Bramble Search
 
-## Unreleased
+## 1.3.0
+- Improved search performance by batching Redis index reads into pipelines and caching term, title, and document lookups for the duration of a request.
+- Fixed fuzzy and typeahead scoring loops recomputing per-term document frequencies once per matched document.
+- Limited search-as-you-type final-token prefix matching to control panel searches by default; the new `siteSearchAsYouType` setting re-enables it for front-end site searches.
 
 ## 1.2.1
 - Republished release after restoring the immutable `1.2.0` tag reference on Packagist.
