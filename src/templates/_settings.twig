@@ -272,6 +272,40 @@
         errors: settings.getErrors('siteSearchAsYouType'),
     }) }}
 
+    <hr>
+
+    {% set extraStopWordsOverridden = 'extraStopWords' in overrides %}
+    {{ forms.textareaField({
+        label: "Extra Stop Words"|t('bramble-search'),
+        instructions: "Additional words to treat as stop words during indexing and search. One word per line."|t('bramble-search'),
+        tip: "Changes take effect after rebuilding the Bramble Search index (Utilities → Clear Caches → Bramble Search)."|t('bramble-search'),
+        warning: extraStopWordsOverridden
+            ? "This setting is being overridden by `extraStopWords` in `config/bramble-search.php`."|t('bramble-search')
+            : null,
+        id: 'extraStopWords',
+        name: 'extraStopWords',
+        rows: 4,
+        readonly: extraStopWordsOverridden,
+        value: settings.extraStopWords|join("\n"),
+        errors: settings.getErrors('extraStopWords'),
+    }) }}
+
+    {% set removeStopWordsOverridden = 'removeStopWords' in overrides %}
+    {{ forms.textareaField({
+        label: "Remove Stop Words"|t('bramble-search'),
+        instructions: "Words to remove from the bundled English stop word list. One word per line. Use this when common terms such as “back” should remain searchable in field content."|t('bramble-search'),
+        tip: "Changes take effect after rebuilding the Bramble Search index (Utilities → Clear Caches → Bramble Search)."|t('bramble-search'),
+        warning: removeStopWordsOverridden
+            ? "This setting is being overridden by `removeStopWords` in `config/bramble-search.php`."|t('bramble-search')
+            : null,
+        id: 'removeStopWords',
+        name: 'removeStopWords',
+        rows: 4,
+        readonly: removeStopWordsOverridden,
+        value: settings.removeStopWords|join("\n"),
+        errors: settings.getErrors('removeStopWords'),
+    }) }}
+
 <hr>
 
 {# Index Management Section #}

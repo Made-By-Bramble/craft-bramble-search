@@ -86,6 +86,10 @@ return [
     'ngramSizes' => [1, 2, 3],          // N-gram sizes for fuzzy matching
     'ngramSimilarityThreshold' => 0.25, // Minimum similarity threshold (0.0-1.0)
     'fuzzySearchMaxCandidates' => 100,  // Max fuzzy candidates to process
+
+    // Stop word overrides (optional - defaults shown)
+    'extraStopWords' => [],             // Additional stop words merged into the bundled list
+    'removeStopWords' => ['back'],      // e.g. keep "back" searchable in keyword tags
 ];
 ```
 

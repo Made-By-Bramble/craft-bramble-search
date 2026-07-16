@@ -92,6 +92,67 @@ class Settings extends Model
      */
     public bool $siteSearchAsYouType = false;
 
+    /**
+     * Additional stop words merged into the bundled English list.
+     *
+     * @var string[]
+     */
+    public array $extraStopWords = [];
+
+    /**
+     * Stop words removed from the bundled English list (e.g. `back` for health queries).
+     *
+     * @var string[]
+     */
+    public array $removeStopWords = [];
+
+    /**
+     * @param array<int, string>|string $value
+     */
+    public function setExtraStopWords(array|string $value): void
+    {
+        $this->extraStopWords = self::normalizeStopWordList($value);
+    }
+
+    /**
+     * @param array<int, string>|string $value
+     */
+    public function setRemoveStopWords(array|string $value): void
+    {
+        $this->removeStopWords = self::normalizeStopWordList($value);
+    }
+
+    /**
+     * @param array<int, string>|string $value
+     * @return string[]
+     */
+    public static function normalizeStopWordList(array|string $value): array
+    {
+        if (is_string($value)) {
+            $value = preg_split('/[\s,]+/u', $value, -1, PREG_SPLIT_NO_EMPTY) ?: [];
+        }
+
+        $normalized = [];
+        foreach ($value as $word) {
+            $word = strtolower(trim((string)$word));
+            if ($word !== '') {
+                $normalized[] = $word;
+            }
+        }
+
+        return array_values(array_unique($normalized));
+    }
+
+    /**
+     * @param string[] $bundled
+     * @param string[] $extra
+     * @param string[] $remove
+     * @return string[]
+     */
+    public static function mergeStopWordLists(array $bundled, array $extra, array $remove): array
+    {
+        return array_values(array_unique(array_diff(array_merge($bundled, $extra), $remove)));
+    }
 
     /**
      * Define validation rules for settings
@@ -120,6 +181,7 @@ class Settings extends Model
       ['ngramSimilarityThreshold', 'number', 'min' => 0.0, 'max' => 1.0],
       ['fuzzySearchMaxCandidates', 'integer', 'min' => 10, 'max' => 1000],
       ['siteSearchAsYouType', 'boolean'],
+      [['extraStopWords', 'removeStopWords'], 'each', 'rule' => ['string']],
     ];
     }
 }

@@ -14,6 +14,7 @@ use craft\helpers\Search as SearchHelper;
 use craft\search\SearchQuery;
 use craft\services\Search;
 use MadeByBramble\BrambleSearch\helpers\SearchQueryParser;
+use MadeByBramble\BrambleSearch\models\Settings;
 use yii\log\Logger;
 
 /**
@@ -97,16 +98,28 @@ abstract class BaseSearchAdapter extends Search
     public function init(): void
     {
         parent::init();
-        $this->loadStopWords();
         $this->loadSettings();
+        $this->loadStopWords();
     }
 
     /**
-     * Load stop words from language file
+     * Load stop words from language file, then apply plugin settings overrides.
      */
     protected function loadStopWords(): void
     {
-        $this->stopWords = require Craft::getAlias('@bramble_search/stopwords/en.php');
+        $bundled = require Craft::getAlias('@bramble_search/stopwords/en.php');
+        $extra = [];
+        $remove = [];
+
+        $plugin = \MadeByBramble\BrambleSearch\Plugin::$plugin;
+        if ($plugin) {
+            /** @var Settings $settings */
+            $settings = $plugin->getSettings();
+            $extra = $settings->extraStopWords;
+            $remove = $settings->removeStopWords;
+        }
+
+        $this->stopWords = Settings::mergeStopWordLists($bundled, $extra, $remove);
     }
 
     /**

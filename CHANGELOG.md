@@ -1,5 +1,9 @@
 # Release Notes for Bramble Search
 
+## 1.4.0
+- Added `extraStopWords` and `removeStopWords` plugin settings, overridable per project from `config/bramble-search.php`, to customize the bundled English stop word list without replacing it.
+- Stop word changes apply on top of the bundled `stopwords/en.php` list as `(bundled ∪ extra) − remove`; rebuild the index after changing them.
+
 ## 1.3.0
 - Improved search performance by batching Redis index reads into pipelines and caching term, title, and document lookups for the duration of a request.
 - Fixed fuzzy and typeahead scoring loops recomputing per-term document frequencies once per matched document.

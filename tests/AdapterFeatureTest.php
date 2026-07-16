@@ -767,6 +767,29 @@ final class InMemorySearchAdapter extends BaseSearchAdapter
     {
         unset($this->ngrams[$siteId][$term]);
     }
+
+    /**
+     * @return string[]
+     */
+    public function publicStopWords(): array
+    {
+        $property = new \ReflectionProperty(BaseSearchAdapter::class, 'stopWords');
+        $property->setAccessible(true);
+
+        /** @var string[] $stopWords */
+        $stopWords = $property->getValue($this);
+
+        return $stopWords;
+    }
+
+    /**
+     * @param string[] $tokens
+     * @return string[]
+     */
+    public function publicFilterStopWords(array $tokens): array
+    {
+        return $this->filterStopWords($tokens);
+    }
 }
 
 final class IndexableTestEntry extends Entry
