@@ -1,5 +1,12 @@
 # Release Notes for Bramble Search
 
+## 1.5.0
+- Fixed multi-word queries where a stop word sits between content words returning zero results; stop-word-only AND groups are now dropped instead of being forced into a required (and never indexed) match.
+- Shrunk the bundled English stop word list to ~90 function words; content-bearing words like "need", "best", "new", and "back" are now indexed and searchable by default. **Rebuild the search index after upgrading** so these newly-indexable words get postings.
+- Added a `commonTermDemotionThreshold` setting: an overly common AND term is demoted to optional (scoring-only) instead of gating out results, and a strict-AND miss now degrades to the most selective term's matches instead of returning nothing, correctly scoped to the element query's own criteria.
+- Fixed a memory-safe batch hydration issue in index rebuilds that could spawn thousands of near-empty batches on large sites, and added a supersede guard so an old rebuild chain dies quietly instead of racing a newer one after a stale lock is cleared.
+- Fixed BM25 document statistics leaking across search adapter instances within the same PHP process.
+
 ## 1.4.1
 - Fixed multi-word search terms (e.g. "L-Carnitine", quoted phrases) matching only their first word; every word is now required and scored.
 - Fixed long partial-word searches (e.g. "ashwagand") returning no results when stored n-grams predate an `ngramSizes` settings change; prefix matching no longer depends on n-gram similarity.

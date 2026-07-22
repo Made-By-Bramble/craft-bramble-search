@@ -3,6 +3,7 @@
 namespace MadeByBramble\BrambleSearch\jobs;
 
 use craft\base\Batchable;
+use craft\base\ElementInterface;
 use craft\elements\db\ElementQueryInterface;
 
 /**
@@ -13,6 +14,14 @@ use craft\elements\db\ElementQueryInterface;
  */
 class MultiElementTypeBatcher implements Batchable
 {
+    /**
+     * Maximum elements hydrated per fetch. Craft's BaseBatchedJob memory guard measures
+     * average memory use against the FIRST processed item, so eagerly hydrating a full
+     * 100-item batch in one ->all() call attributes the whole spike to item 1 and breaks
+     * the batch almost immediately. Small chunks keep that average honest.
+     */
+    private const CHUNK_SIZE = 20;
+
     /**
      * @var ElementQueryInterface[] Array of element queries to process
      */
@@ -53,7 +62,6 @@ class MultiElementTypeBatcher implements Batchable
      */
     public function getSlice(int $offset, int $limit): iterable
     {
-        $itemsProcessed = 0;
         $itemsToSkip = $offset;
         $itemsToTake = $limit;
 
@@ -66,14 +74,10 @@ class MultiElementTypeBatcher implements Batchable
             if ($itemsToSkip < $currentOffset + $queryCount) {
                 // Calculate the offset within this query
                 $queryOffset = $itemsToSkip - $currentOffset;
-
-                // Get items from this query
                 $queryLimit = min($itemsToTake, $queryCount - $queryOffset);
-                $querySlice = $query->offset($queryOffset)->limit($queryLimit)->all();
 
-                foreach ($querySlice as $item) {
+                foreach ($this->fetchChunked($query, $queryOffset, $queryLimit) as $item) {
                     yield $item;
-                    $itemsProcessed++;
                     $itemsToTake--;
 
                     if ($itemsToTake <= 0) {
@@ -82,15 +86,13 @@ class MultiElementTypeBatcher implements Batchable
                 }
 
                 // Move to next query if we need more items
-                $queryIndex++;
-                while ($queryIndex < count($this->queries) && $itemsToTake > 0) {
-                    $nextQuery = $this->queries[$queryIndex];
+                $nextIndex = $queryIndex + 1;
+                while ($nextIndex < count($this->queries) && $itemsToTake > 0) {
+                    $nextQuery = $this->queries[$nextIndex];
                     $nextQueryLimit = min($itemsToTake, $nextQuery->count());
-                    $nextQuerySlice = $nextQuery->limit($nextQueryLimit)->all();
 
-                    foreach ($nextQuerySlice as $item) {
+                    foreach ($this->fetchChunked($nextQuery, 0, $nextQueryLimit) as $item) {
                         yield $item;
-                        $itemsProcessed++;
                         $itemsToTake--;
 
                         if ($itemsToTake <= 0) {
@@ -98,7 +100,7 @@ class MultiElementTypeBatcher implements Batchable
                         }
                     }
 
-                    $queryIndex++;
+                    $nextIndex++;
                 }
 
                 return;
@@ -109,5 +111,36 @@ class MultiElementTypeBatcher implements Batchable
 
         // If we get here, the offset is beyond all queries
         return;
+    }
+
+    /**
+     * Fetch and yield a query's [offset, offset + limit) window in bounded chunks instead
+     * of hydrating it all at once. Clones the query per chunk so the shared query objects
+     * in $this->queries are never mutated.
+     *
+     * @param ElementQueryInterface $query
+     * @return iterable<ElementInterface>
+     */
+    private function fetchChunked(object $query, int $offset, int $limit): iterable
+    {
+        $fetched = 0;
+
+        while ($fetched < $limit) {
+            $chunkSize = min(self::CHUNK_SIZE, $limit - $fetched);
+            $chunk = (clone $query)->offset($offset + $fetched)->limit($chunkSize)->all();
+
+            foreach ($chunk as $item) {
+                yield $item;
+            }
+
+            $chunkCount = count($chunk);
+            unset($chunk);
+
+            if ($chunkCount === 0) {
+                return;
+            }
+
+            $fetched += $chunkCount;
+        }
     }
 }

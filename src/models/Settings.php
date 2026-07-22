@@ -87,6 +87,13 @@ class Settings extends Model
     public int $fuzzySearchMaxCandidates = 100;
 
     /**
+     * Match-ratio threshold above which a demotable AND group is treated as optional rather
+     * than a hard requirement, so a common term can't single-handedly gate out otherwise
+     * relevant results. Values <= 0 disable proactive demotion (default: 0.5)
+     */
+    public float $commonTermDemotionThreshold = 0.5;
+
+    /**
      * Whether front-end site searches treat the final query token as an in-progress
      * prefix (search-as-you-type). The control panel element search always does.
      */
@@ -180,6 +187,7 @@ class Settings extends Model
       ['ngramSizes', 'each', 'rule' => ['integer', 'min' => 1, 'max' => 5]],
       ['ngramSimilarityThreshold', 'number', 'min' => 0.0, 'max' => 1.0],
       ['fuzzySearchMaxCandidates', 'integer', 'min' => 10, 'max' => 1000],
+      ['commonTermDemotionThreshold', 'number', 'min' => 0.0, 'max' => 1.0],
       ['siteSearchAsYouType', 'boolean'],
       [['extraStopWords', 'removeStopWords'], 'each', 'rule' => ['string']],
     ];

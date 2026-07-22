@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace MadeByBrambleTest\BrambleSearch;
 
+use Craft;
 use craft\base\Batchable;
 use craft\queue\QueueInterface;
 use MadeByBramble\BrambleSearch\jobs\RebuildIndexJob;
@@ -61,6 +62,118 @@ final class RebuildIndexJobTest extends TestCase
         }
 
         self::assertNull($job->releasedSiteId);
+    }
+
+    public function testSupersededContinuationBatchReturnsWithoutProcessing(): void
+    {
+        $siteId = 9101;
+        $key = "bramble-search:rebuild:$siteId";
+        $cache = Craft::$app->getCache();
+        $cache->set($key, ['time' => time(), 'runId' => 'newer-chain'], 3600);
+
+        try {
+            $job = new SupersedeGuardRebuildIndexJob([
+                'siteId' => $siteId,
+                'itemOffset' => 1,
+                'batchSize' => 10,
+                'rebuildLockAcquired' => true,
+                'rebuildRunId' => 'stale-chain',
+            ]);
+
+            $job->execute(new NoopQueue());
+
+            self::assertFalse($job->processedAnyItem, 'A superseded batch must not process items.');
+            self::assertFalse($job->afterRan, 'A superseded batch must not spawn or run after().');
+        } finally {
+            $cache->delete($key);
+        }
+    }
+
+    public function testFirstBatchIsNeverTreatedAsSuperseded(): void
+    {
+        // itemOffset === 0 is the batch that acquires the lock in before(); the supersede
+        // guard only applies to continuation batches, so no lock needs to exist yet.
+        $siteId = 9102;
+        $key = "bramble-search:rebuild:$siteId";
+        Craft::$app->getCache()->delete($key);
+
+        $job = new SupersedeGuardRebuildIndexJob([
+            'siteId' => $siteId,
+            'itemOffset' => 0,
+            'batchSize' => 10,
+        ]);
+
+        $job->execute(new NoopQueue());
+
+        self::assertTrue($job->processedAnyItem);
+    }
+
+    public function testReleaseRebuildLockOnlyClearsALockThisChainOwns(): void
+    {
+        $siteId = 9103;
+        $key = "bramble-search:rebuild:$siteId";
+        $cache = Craft::$app->getCache();
+
+        try {
+            // A newer chain holds the lock; a superseded/stale chain must not clear it.
+            $cache->set($key, ['time' => time(), 'runId' => 'newer-chain'], 3600);
+
+            $staleJob = new SupersedeGuardRebuildIndexJob(['siteId' => $siteId, 'rebuildRunId' => 'stale-chain']);
+            $staleJob->publicReleaseRebuildLock($siteId);
+
+            self::assertSame('newer-chain', $cache->get($key)['runId'] ?? null, 'The newer chain\'s lock must survive.');
+
+            // The chain that actually owns the current lock can clear it.
+            $owningJob = new SupersedeGuardRebuildIndexJob(['siteId' => $siteId, 'rebuildRunId' => 'newer-chain']);
+            $owningJob->publicReleaseRebuildLock($siteId);
+
+            self::assertFalse($cache->get($key));
+        } finally {
+            $cache->delete($key);
+        }
+    }
+}
+
+/**
+ * Exercises the real (unmocked) ownsCurrentRebuildLock()/releaseRebuildLock() logic
+ * against Craft's cache, only stubbing out the batch-processing lifecycle so before()'s
+ * site lookup and normal indexing aren't needed.
+ */
+final class SupersedeGuardRebuildIndexJob extends RebuildIndexJob
+{
+    public bool $processedAnyItem = false;
+    public bool $afterRan = false;
+
+    public function loadData(): Batchable
+    {
+        return new SingleItemBatchable();
+    }
+
+    protected function before(): void
+    {
+    }
+
+    public function beforeBatch(): void
+    {
+    }
+
+    public function afterBatch(): void
+    {
+    }
+
+    public function processItem(mixed $item): void
+    {
+        $this->processedAnyItem = true;
+    }
+
+    protected function after(): void
+    {
+        $this->afterRan = true;
+    }
+
+    public function publicReleaseRebuildLock(?int $siteId): void
+    {
+        $this->releaseRebuildLock($siteId);
     }
 }
 

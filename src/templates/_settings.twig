@@ -263,6 +263,21 @@
         errors: settings.getErrors('fuzzySearchMaxCandidates'),
     }) }}
 
+    {{ forms.textField({
+        label: "Common Term Demotion Threshold"|t('bramble-search'),
+        instructions: "Match-ratio above which a term shared by too many documents is demoted from a required AND term to an optional, scoring-only term, so it can't single-handedly gate out otherwise relevant results."|t('bramble-search'),
+        tip: "Range: 0.0-1.0. Default of 0.5 only demotes terms matching over half the index. Set to 0 to disable proactive demotion (zero-match degradation still applies)."|t('bramble-search'),
+        id: 'commonTermDemotionThreshold',
+        name: 'commonTermDemotionThreshold',
+        value: settings.commonTermDemotionThreshold,
+        type: 'number',
+        min: 0.0,
+        max: 1.0,
+        step: 0.05,
+        size: 5,
+        errors: settings.getErrors('commonTermDemotionThreshold'),
+    }) }}
+
     {{ forms.lightswitchField({
         label: "Site Search-As-You-Type"|t('bramble-search'),
         instructions: "Treat the final token of front-end site searches as an in-progress prefix. The control panel element search always does this. Enable only if the site has a live search UI; it is significantly slower for submitted searches."|t('bramble-search'),

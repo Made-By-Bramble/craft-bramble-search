@@ -46,20 +46,20 @@ final class StopWordsSettingsTest extends TestCase
         self::assertNotContains('back', $merged);
     }
 
-    public function testDefaultAdapterLoadIncludesBundledStopWordBack(): void
+    public function testDefaultAdapterLoadIncludesBundledStopWordThe(): void
     {
         Plugin::$plugin = null;
 
         $adapter = new InMemorySearchAdapter();
         $adapter->init();
 
-        self::assertContains('back', $adapter->publicStopWords());
+        self::assertContains('the', $adapter->publicStopWords());
     }
 
-    public function testRemoveStopWordsSettingDropsBackFromAdapter(): void
+    public function testRemoveStopWordsSettingDropsTheFromAdapter(): void
     {
         $settings = new Settings();
-        $settings->setRemoveStopWords(['back']);
+        $settings->setRemoveStopWords(['the']);
 
         $plugin = $this->createMock(Plugin::class);
         $plugin->method('getSettings')->willReturn($settings);
@@ -68,9 +68,9 @@ final class StopWordsSettingsTest extends TestCase
         $adapter = new InMemorySearchAdapter();
         $adapter->init();
 
-        self::assertNotContains('back', $adapter->publicStopWords());
-        self::assertContains('the', $adapter->publicStopWords());
-        self::assertSame(['back', 'pain'], $adapter->publicFilterStopWords(['back', 'pain', 'the']));
+        self::assertNotContains('the', $adapter->publicStopWords());
+        self::assertContains('of', $adapter->publicStopWords());
+        self::assertSame(['the', 'widget'], $adapter->publicFilterStopWords(['the', 'widget', 'of']));
     }
 
     public function testExtraStopWordsSettingAddsCustomToken(): void

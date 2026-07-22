@@ -76,6 +76,12 @@ abstract class BaseSearchAdapter extends Search
     protected int $fuzzySearchMaxCandidates = 100;
 
     /**
+     * Match-ratio threshold above which a demotable AND group is treated as optional.
+     * Values <= 0 disable proactive demotion.
+     */
+    protected float $commonTermDemotionThreshold = 0.5;
+
+    /**
      * Whether front-end site searches treat the final token as an in-progress prefix.
      * The control panel's live element index search always does.
      */
@@ -87,6 +93,7 @@ abstract class BaseSearchAdapter extends Search
     private array $memoTermDocs = [];
     private array $memoTitleTerms = [];
     private array $memoDocTerms = [];
+    private ?array $memoSearchStats = null;
 
     // =========================================================================
     // INITIALIZATION METHODS
@@ -141,6 +148,7 @@ abstract class BaseSearchAdapter extends Search
             $this->ngramSimilarityThreshold = $settings->ngramSimilarityThreshold ?? 0.4;
             $this->fuzzySearchMaxCandidates = $settings->fuzzySearchMaxCandidates ?? 100;
             $this->siteSearchAsYouType = $settings->siteSearchAsYouType ?? false;
+            $this->commonTermDemotionThreshold = $settings->commonTermDemotionThreshold ?? 0.5;
         }
     }
 
@@ -447,6 +455,7 @@ abstract class BaseSearchAdapter extends Search
 
         $parsed = SearchQueryParser::parse($searchQuery);
         $parsed = $this->expandMultiTokenTerms($parsed);
+        $parsed = $this->filterStopWordGroups($parsed);
         $siteIds = $this->resolveQuerySiteIds($elementQuery);
         $elementIds = [];
 
@@ -530,6 +539,7 @@ abstract class BaseSearchAdapter extends Search
         $this->memoTermDocs = [];
         $this->memoTitleTerms = [];
         $this->memoDocTerms = [];
+        $this->memoSearchStats = null;
     }
 
     /**
@@ -669,6 +679,7 @@ abstract class BaseSearchAdapter extends Search
     {
         $parsed = SearchQueryParser::parse($elementQuery->search);
         $parsed = $this->expandMultiTokenTerms($parsed);
+        $parsed = $this->filterStopWordGroups($parsed);
         $searchQuery = $parsed['rawQuery'];
         $siteIds = $this->resolveQuerySiteIds($elementQuery);
 
@@ -767,9 +778,11 @@ abstract class BaseSearchAdapter extends Search
         $avgDocLength = $searchStats['avgDocLength'];
 
         $groupMatches = [];
+        $groupMeta = [];
         $docScores = [];
         $allDocuments = [];
         $groupTermData = [];
+        $lastGroupIndex = array_key_last($parsed['andGroups']);
 
         foreach ($parsed['andGroups'] as $groupIndex => $group) {
             $groupMatches[$groupIndex] = [];
@@ -781,7 +794,7 @@ abstract class BaseSearchAdapter extends Search
                     $siteId,
                     $isTypeaheadQuery,
                     $isTypeaheadQuery
-                        && $groupIndex === array_key_last($parsed['andGroups'])
+                        && $groupIndex === $lastGroupIndex
                         && $termIndex === array_key_last($group['terms']),
                     $isTypeaheadQuery ? $this->collectCompletedTerms($parsed, $groupIndex, $termIndex) : [],
                     $groupMatches,
@@ -800,22 +813,29 @@ abstract class BaseSearchAdapter extends Search
                 }
             }
 
-            if (empty($groupMatches[$groupIndex])) {
-                return [];
-            }
+            $groupMeta[$groupIndex] = [
+                'demotable' => !$this->containsExactSpec($group) && !($isTypeaheadQuery && $groupIndex === $lastGroupIndex),
+            ];
         }
 
-        $validDocs = null;
-        foreach ($groupMatches as $docs) {
-            $validDocs = $validDocs === null ? array_keys($docs) : array_intersect($validDocs, array_keys($docs));
-            if (empty($validDocs)) {
-                return [];
-            }
+        // Scope every group's doc set to the original query's element criteria BEFORE
+        // demotion/degradation runs, so those decisions can't be fooled by a cross-type
+        // match that the criteria filter would strip out later anyway (see
+        // filterDocIdsByElementQuery()'s docblock). One criteria query for the whole union.
+        $allowedDocIds = $this->filterDocIdsByElementQuery(array_keys($allDocuments), $elementQuery);
+        $scopedGroupMatches = [];
+        foreach ($groupMatches as $groupIndex => $docs) {
+            $scopedGroupMatches[$groupIndex] = array_intersect_key($docs, $allowedDocIds);
+        }
+
+        $validDocs = $this->resolveValidDocsForGroups($scopedGroupMatches, $groupMeta, $totalDocs);
+        if (empty($validDocs)) {
+            return [];
         }
 
         foreach ($parsed['excludeTerms'] as $excludeSpec) {
             $excludeMatches = $this->findTermMatchesForSpec($excludeSpec, $siteId, false, false, [], [], 0);
-            $validDocs = array_values(array_diff($validDocs ?? [], array_keys($excludeMatches)));
+            $validDocs = array_values(array_diff($validDocs, array_keys($excludeMatches)));
             if (empty($validDocs)) {
                 return [];
             }
@@ -985,9 +1005,34 @@ abstract class BaseSearchAdapter extends Search
             return [];
         }
 
+        $allowedDocIds = $this->filterDocIdsByElementQuery(array_keys($scores), $elementQuery);
+
+        return array_intersect_key($scores, $allowedDocIds);
+    }
+
+    /**
+     * Resolve which of the given internal doc IDs actually satisfy the original element
+     * query's criteria (status, section, element type, etc. — everything but search/paging).
+     *
+     * Demotion and degradation decisions (resolveValidDocsForGroups()) must run against
+     * criteria-scoped doc sets. Otherwise an unscoped cross-type match (e.g. a non-product
+     * entry that happens to contain both search terms) can make a group's intersection look
+     * non-empty, suppressing degradation, only for the criteria filter to strip that match
+     * out afterward and leave zero results.
+     *
+     * @param list<string> $docIds Internal doc IDs (siteId:elementId)
+     * @param ElementQuery $elementQuery The original element query
+     * @return array<string, true> Allowed doc IDs, keyed for fast lookup
+     */
+    protected function filterDocIdsByElementQuery(array $docIds, ElementQuery $elementQuery): array
+    {
+        if (empty($docIds)) {
+            return [];
+        }
+
         $elementIds = [];
-        foreach (array_keys($scores) as $docId) {
-            [, $elementId] = explode(':', $docId, 2);
+        foreach ($docIds as $docId) {
+            [, $elementId] = explode(':', (string)$docId, 2);
             $elementIds[] = (int)$elementId;
         }
         $elementIds = array_values(array_unique($elementIds));
@@ -1001,19 +1046,20 @@ abstract class BaseSearchAdapter extends Search
         $criteriaQuery->andWhere(['elements.id' => $elementIds]);
 
         try {
-            $allowedIds = array_fill_keys(array_map('intval', $criteriaQuery->ids()), true);
+            $allowedElementIds = array_fill_keys(array_map('intval', $criteriaQuery->ids()), true);
         } catch (QueryAbortedException) {
             return [];
         }
 
-        return array_filter(
-            $scores,
-            function(string $docId) use ($allowedIds): bool {
-                [, $elementId] = explode(':', $docId, 2);
-                return isset($allowedIds[(int)$elementId]);
-            },
-            ARRAY_FILTER_USE_KEY
-        );
+        $allowed = [];
+        foreach ($docIds as $docId) {
+            [, $elementId] = explode(':', (string)$docId, 2);
+            if (isset($allowedElementIds[(int)$elementId])) {
+                $allowed[$docId] = true;
+            }
+        }
+
+        return $allowed;
     }
 
     // =========================================================================
@@ -1261,6 +1307,230 @@ abstract class BaseSearchAdapter extends Search
     }
 
     /**
+     * Drop AND groups made up entirely of stop words, so a common word sitting between
+     * content words no longer forces a required-but-unindexed AND term that zeroes the
+     * whole query (getSearchTokens() falls back to the stop word itself per-group so
+     * title-only queries like "Why" still work; applied to every group, that fallback
+     * turns each stop word in a multi-word query into a mandatory match against content
+     * where stop words are never indexed).
+     *
+     * Preserves title-only stop-word searches (all groups stop-only). The final group of a
+     * typeahead query is never dropped since it is the in-progress prefix; consequently it is
+     * also excluded from the "are there any content-bearing groups" check, so a completed stop
+     * word that is the only OTHER completed term (e.g. "your" in "your p") is kept too, matching
+     * getSearchTokens()'s existing "keep the sole completed stop word" typeahead behaviour.
+     *
+     * @param array{andGroups: list<array{terms: list<array<string, mixed>}>>, excludeTerms: list<array<string, mixed>>, rawQuery: string} $parsed
+     * @return array{andGroups: list<array{terms: list<array<string, mixed>}>>, excludeTerms: list<array<string, mixed>>, rawQuery: string}
+     */
+    protected function filterStopWordGroups(array $parsed): array
+    {
+        $andGroups = $parsed['andGroups'];
+        if (empty($andGroups)) {
+            return $parsed;
+        }
+
+        $isTypeaheadQuery = $this->isSearchAsYouTypeQuery(
+            $parsed['rawQuery'],
+            $this->tokenize($parsed['rawQuery'])
+        );
+        $lastGroupIndex = array_key_last($andGroups);
+
+        $stopOnly = [];
+        foreach ($andGroups as $groupIndex => $group) {
+            $stopOnly[$groupIndex] = $this->isStopWordOnlyGroup($group);
+        }
+
+        // Groups eligible to be dropped: everything except a typeahead query's final
+        // (in-progress prefix) group, which is never dropped regardless of classification.
+        $droppable = $stopOnly;
+        if ($isTypeaheadQuery) {
+            unset($droppable[$lastGroupIndex]);
+        }
+
+        if (empty($droppable) || !in_array(false, $droppable, true)) {
+            // No droppable group is content-bearing: preserve everything (e.g. a title-only
+            // search like "Why", or "your p" where "your" is the only completed term).
+            return $parsed;
+        }
+
+        $filtered = [];
+        foreach ($andGroups as $groupIndex => $group) {
+            if ($droppable[$groupIndex] ?? false) {
+                continue;
+            }
+            $filtered[] = $group;
+        }
+
+        return [
+            'andGroups' => array_values($filtered),
+            'excludeTerms' => $parsed['excludeTerms'],
+            'rawQuery' => $parsed['rawQuery'],
+        ];
+    }
+
+    /**
+     * A group is stop-word-only when every term spec in it is non-exact and every token of
+     * its term is a stop word. An OR group with any content-bearing alternative, an exact
+     * spec, or a numeric token is never stop-only.
+     *
+     * @param array{terms: list<array<string, mixed>>} $group
+     */
+    protected function isStopWordOnlyGroup(array $group): bool
+    {
+        foreach ($group['terms'] as $spec) {
+            if (!empty($spec['exact'])) {
+                return false;
+            }
+
+            foreach ($this->tokenize((string)$spec['term']) as $token) {
+                if (!in_array($token, $this->stopWords, true)) {
+                    return false;
+                }
+            }
+        }
+
+        return true;
+    }
+
+    /**
+     * Whether any term spec in a group is an exact (quoted) match.
+     *
+     * @param array{terms: list<array<string, mixed>>} $group
+     */
+    protected function containsExactSpec(array $group): bool
+    {
+        foreach ($group['terms'] as $spec) {
+            if (!empty($spec['exact'])) {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    /**
+     * Resolve the valid document set for a parsed query's AND groups, used by both the
+     * scored and filter-only search paths so their required/optional semantics cannot drift.
+     *
+     * A strict intersection of every AND group turns any single common term into a hard gate:
+     * one group with poor selectivity, or a zero-match group, zeroes the whole query. This
+     * demotes over-broad or empty demotable groups to optional (scoring-only, non-constraining)
+     * so the query degrades gracefully instead of returning nothing.
+     *
+     * @param array<int, array<string, bool>> $groupDocSets docIds keyed true, per group index
+     * @param array<int, array{demotable: bool}> $groupMeta per group index
+     * @param int $totalDocs Total indexed document count, for the proactive demotion ratio
+     * @return list<string> Valid document IDs
+     */
+    protected function resolveValidDocsForGroups(array $groupDocSets, array $groupMeta, int $totalDocs): array
+    {
+        if (empty($groupDocSets)) {
+            return [];
+        }
+
+        $required = [];
+        foreach ($groupDocSets as $groupIndex => $docSet) {
+            $demotable = $groupMeta[$groupIndex]['demotable'] ?? true;
+            if (!$demotable && empty($docSet)) {
+                // An explicit exact/prefix miss on a non-demotable group is a legitimate zero.
+                return [];
+            }
+
+            $required[$groupIndex] = $docSet;
+        }
+
+        $optional = [];
+
+        // Proactive demotion: an over-broad demotable group stops being a hard requirement.
+        if ($this->commonTermDemotionThreshold > 0 && $totalDocs >= 50) {
+            $candidates = [];
+            foreach ($required as $groupIndex => $docSet) {
+                $demotable = $groupMeta[$groupIndex]['demotable'] ?? true;
+                if ($demotable && (count($docSet) / $totalDocs) > $this->commonTermDemotionThreshold) {
+                    $candidates[$groupIndex] = count($docSet);
+                }
+            }
+
+            if (count($candidates) === count($required)) {
+                // Demoting every candidate would leave zero required groups: keep the single
+                // most-selective (lowest match count) group required.
+                asort($candidates);
+                array_shift($candidates);
+            }
+
+            foreach (array_keys($candidates) as $groupIndex) {
+                $optional[$groupIndex] = $required[$groupIndex];
+                unset($required[$groupIndex]);
+            }
+        }
+
+        $intersection = $this->intersectDocSets($required);
+
+        // Degradation loop: while the intersection is empty and more than one required group
+        // remains, demote the required demotable group that contributes least — zero-match
+        // groups first (they annihilate the intersection outright), then the largest match
+        // count — and re-intersect. Stops once the intersection is non-empty or only one
+        // required group remains.
+        while (empty($intersection) && count($required) > 1) {
+            $demotableIndexes = array_values(array_filter(
+                array_keys($required),
+                fn(int $groupIndex): bool => $groupMeta[$groupIndex]['demotable'] ?? true
+            ));
+
+            if (empty($demotableIndexes)) {
+                return [];
+            }
+
+            usort($demotableIndexes, function(int $a, int $b) use ($required): int {
+                $countA = count($required[$a]);
+                $countB = count($required[$b]);
+                $zeroA = $countA === 0;
+                $zeroB = $countB === 0;
+
+                if ($zeroA !== $zeroB) {
+                    return $zeroA ? -1 : 1;
+                }
+
+                return $countB <=> $countA;
+            });
+
+            $toDemote = $demotableIndexes[0];
+            $optional[$toDemote] = $required[$toDemote];
+            unset($required[$toDemote]);
+
+            $intersection = $this->intersectDocSets($required);
+        }
+
+        if (empty($intersection) && count($required) === 1) {
+            return array_keys(reset($required));
+        }
+
+        return $intersection;
+    }
+
+    /**
+     * Intersect a set of per-group document maps, keyed docId => true.
+     *
+     * @param array<int, array<string, bool>> $groupDocSets
+     * @return list<string>
+     */
+    protected function intersectDocSets(array $groupDocSets): array
+    {
+        $intersection = null;
+        foreach ($groupDocSets as $docSet) {
+            $docIds = array_keys($docSet);
+            $intersection = $intersection === null ? $docIds : array_values(array_intersect($intersection, $docIds));
+
+            if (empty($intersection)) {
+                return [];
+            }
+        }
+
+        return $intersection ?? [];
+    }
+
+    /**
      * @param array<string, float> $filteredScores
      * @return array<string, float>
      */
@@ -1295,8 +1565,13 @@ abstract class BaseSearchAdapter extends Search
 
         $rawTokens = $this->tokenize($parsed['rawQuery']);
         $isTypeaheadQuery = $this->isSearchAsYouTypeQuery($parsed['rawQuery'], $rawTokens);
+        $lastGroupIndex = array_key_last($parsed['andGroups']);
+        $totalDocs = $this->getSearchStatistics()['totalDocs'];
+
         $groupMatches = [];
-        $validDocs = null;
+        $groupDocSets = [];
+        $groupMeta = [];
+        $allDocuments = [];
 
         foreach ($parsed['andGroups'] as $groupIndex => $group) {
             $groupMatches[$groupIndex] = [];
@@ -1308,7 +1583,7 @@ abstract class BaseSearchAdapter extends Search
                     $siteId,
                     $isTypeaheadQuery,
                     $isTypeaheadQuery
-                        && $groupIndex === array_key_last($parsed['andGroups'])
+                        && $groupIndex === $lastGroupIndex
                         && $termIndex === array_key_last($group['terms']),
                     $isTypeaheadQuery ? $this->collectCompletedTerms($parsed, $groupIndex, $termIndex) : [],
                     $groupMatches,
@@ -1319,26 +1594,32 @@ abstract class BaseSearchAdapter extends Search
                     $groupMatches[$groupIndex][$docId] = true;
                     if ($this->termMatchesQueryScope($docId, $matchData, $elementQuery)) {
                         $groupDocIds[] = $docId;
+                        $allDocuments[$docId] = true;
                     }
                 }
             }
 
-            $groupDocIds = array_values(array_unique($groupDocIds));
-            if ($groupDocIds === []) {
-                return [];
-            }
-
-            $validDocs = $validDocs === null
-                ? $groupDocIds
-                : array_values(array_intersect($validDocs, $groupDocIds));
+            $groupDocSets[$groupIndex] = array_fill_keys(array_values(array_unique($groupDocIds)), true);
+            $groupMeta[$groupIndex] = [
+                'demotable' => !$this->containsExactSpec($group) && !($isTypeaheadQuery && $groupIndex === $lastGroupIndex),
+            ];
         }
+
+        // See searchElementsForSite(): demotion/degradation must run on criteria-scoped
+        // doc sets, not the raw matches, or a cross-type match masks a genuine miss.
+        $allowedDocIds = $this->filterDocIdsByElementQuery(array_keys($allDocuments), $elementQuery);
+        foreach ($groupDocSets as $groupIndex => $docSet) {
+            $groupDocSets[$groupIndex] = array_intersect_key($docSet, $allowedDocIds);
+        }
+
+        $validDocs = $this->resolveValidDocsForGroups($groupDocSets, $groupMeta, $totalDocs);
 
         foreach ($parsed['excludeTerms'] as $excludeSpec) {
             $excludeMatches = $this->findTermMatchesForSpec($excludeSpec, $siteId, false, false, [], [], 0);
-            $validDocs = array_values(array_diff($validDocs ?? [], array_keys($excludeMatches)));
+            $validDocs = array_values(array_diff($validDocs, array_keys($excludeMatches)));
         }
 
-        return $validDocs ?? [];
+        return $validDocs;
     }
 
     /**
@@ -2548,20 +2829,18 @@ abstract class BaseSearchAdapter extends Search
      */
     protected function getSearchStatistics(): array
     {
-        static $cachedStats = null;
-        
-        if ($cachedStats === null) {
+        if ($this->memoSearchStats === null) {
             $totalDocs = max(1, $this->getTotalDocCount());
             $totalLength = max(1, $this->getTotalLength());
             $avgDocLength = $totalLength / $totalDocs;
-            
-            $cachedStats = [
+
+            $this->memoSearchStats = [
                 'totalDocs' => $totalDocs,
                 'avgDocLength' => $avgDocLength,
             ];
         }
-        
-        return $cachedStats;
+
+        return $this->memoSearchStats;
     }
 
     // =========================================================================

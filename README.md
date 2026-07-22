@@ -87,11 +87,21 @@ return [
     'ngramSimilarityThreshold' => 0.25, // Minimum similarity threshold (0.0-1.0)
     'fuzzySearchMaxCandidates' => 100,  // Max fuzzy candidates to process
 
+    // Match-ratio threshold above which a common AND term is demoted from a hard
+    // requirement to an optional (scoring-only) term. Values <= 0 disable this.
+    'commonTermDemotionThreshold' => 0.5,
+
     // Stop word overrides (optional - defaults shown)
     'extraStopWords' => [],             // Additional stop words merged into the bundled list
-    'removeStopWords' => ['back'],      // e.g. keep "back" searchable in keyword tags
+    'removeStopWords' => ['how'],       // e.g. keep "how" searchable for how-to guides
 ];
 ```
+
+The bundled English stop word list (`src/stopwords/en.php`) is intentionally lean: only
+function words (articles, pronouns, prepositions, conjunctions, auxiliary verbs). Earlier
+versions stripped content-bearing words such as "need", "best", "new", or "back"; those are
+now indexed and searchable by default. Rebuild the search index after upgrading so
+newly-indexable words get postings (`./craft clear-caches/bramble-search`).
 
 All settings can be overridden using environment variables:
 - `BRAMBLE_SEARCH_DRIVER` - Storage driver ('redis', 'file', 'mysql', 'mongodb', or 'craft')

@@ -15,6 +15,8 @@ use craft\models\FieldLayoutTab;
 use MadeByBramble\BrambleSearch\adapters\BaseSearchAdapter;
 use MadeByBramble\BrambleSearch\adapters\CraftCacheSearchAdapter;
 use MadeByBramble\BrambleSearch\adapters\FileSearchAdapter;
+use MadeByBramble\BrambleSearch\models\Settings;
+use MadeByBramble\BrambleSearch\Plugin;
 use PHPUnit\Framework\TestCase;
 
 final class AdapterFeatureTest extends TestCase
@@ -352,6 +354,148 @@ final class AdapterFeatureTest extends TestCase
         $matches = $adapter->searchElements($query);
 
         self::assertArrayHasKey('100-1', $matches);
+    }
+
+    public function testStopWordGroupsAreDroppedWhenAContentWordIsPresent(): void
+    {
+        // Before filterStopWordGroups(), "the" and "is" each became a required AND group of
+        // their own (getSearchTokens()'s title-only fallback), and stop words are never
+        // indexed outside titles, so the whole query used to zero out instead of finding
+        // "widget". A trailing space forces the real non-typeahead pathway.
+        $adapter = new InMemorySearchAdapter();
+        $adapter->addSearchTerm('widget', 1, 100);
+
+        $matches = $adapter->searchElements(Entry::find()->siteId(1)->search('the widget is '));
+
+        self::assertArrayHasKey('100-1', $matches);
+    }
+
+    public function testAllStopWordQueryStillMatchesTitleContainingTheWord(): void
+    {
+        $adapter = new InMemorySearchAdapter();
+        $adapter->addTitle('Why the Widget Works', 1, 100);
+
+        $matches = $adapter->searchElements(Entry::find()->siteId(1)->search('why'));
+
+        self::assertArrayHasKey('100-1', $matches);
+    }
+
+    public function testTypeaheadFinalStopWordTokenStillResolvesAsPrefix(): void
+    {
+        // "the" is stop-word-only and not the sole completed term (a content word precedes
+        // it), so without the "never drop the final typeahead group" exception it would be
+        // dropped from the query entirely instead of resolving as an in-progress prefix.
+        $adapter = new InMemorySearchAdapter();
+        $adapter->addTitle('Widget Theme Guide', 1, 100);
+        $adapter->addTitle('Widget Lantern Guide', 1, 200);
+
+        $matches = $adapter->searchElements(Entry::find()->siteId(1)->search('widget the'));
+
+        self::assertArrayHasKey('100-1', $matches);
+        self::assertArrayNotHasKey('200-1', $matches);
+    }
+
+    public function testFormerlyStoppedContentWordIsIndexedAndSearchableAfterListChange(): void
+    {
+        $adapter = new InMemorySearchAdapter();
+        $entry = IndexableTestEntry::withFields(['body' => 'this is the best widget available']);
+
+        self::assertTrue($adapter->indexElementAttributes($entry, null));
+
+        $matches = $adapter->searchElements(Entry::find()->siteId(1)->search('best'));
+
+        self::assertArrayHasKey($entry->id . '-1', $matches);
+    }
+
+    public function testCommonTermDemotionKeepsRareTermDocsAndRanksDualMatchesHigher(): void
+    {
+        $settings = new Settings();
+        $settings->commonTermDemotionThreshold = 0.2;
+
+        $plugin = $this->createMock(Plugin::class);
+        $plugin->method('getSettings')->willReturn($settings);
+        $originalPlugin = Plugin::$plugin;
+        Plugin::$plugin = $plugin;
+
+        try {
+            $adapter = new InMemorySearchAdapter();
+            $adapter->init();
+
+            // 60 docs to clear the totalDocs >= 50 proactive-demotion floor.
+            for ($i = 1; $i <= 60; $i++) {
+                $adapter->addSearchTerm('filler' . $i, 1, 1000 + $i);
+            }
+
+            // "gadget" sits in well over the 20% threshold of the corpus.
+            foreach ([...range(1, 3), ...range(31, 50)] as $i) {
+                $adapter->addSearchTerm('gadget', 1, 1000 + $i);
+            }
+
+            // "lantern" is rare (5 docs); docs 1001-1003 also have "gadget", 1004-1005 don't.
+            for ($i = 1; $i <= 5; $i++) {
+                $adapter->addSearchTerm('lantern', 1, 1000 + $i);
+            }
+
+            $matches = $adapter->searchElements(Entry::find()->siteId(1)->search('gadget lantern '));
+
+            foreach ([1001, 1002, 1003, 1004, 1005] as $elementId) {
+                self::assertArrayHasKey("$elementId-1", $matches, "Expected doc $elementId to survive demotion");
+            }
+
+            self::assertGreaterThan($matches['1004-1'], $matches['1001-1']);
+        } finally {
+            Plugin::$plugin = $originalPlugin;
+        }
+    }
+
+    public function testDegradationReturnsMoreSelectiveTermsDocsInsteadOfZero(): void
+    {
+        $adapter = new InMemorySearchAdapter();
+        foreach ([100, 200, 300, 400, 500] as $elementId) {
+            $adapter->addSearchTerm('amber', 1, $elementId);
+        }
+        foreach ([600, 700] as $elementId) {
+            $adapter->addSearchTerm('lantern', 1, $elementId);
+        }
+
+        $matches = $adapter->searchElements(Entry::find()->siteId(1)->search('amber lantern '));
+
+        self::assertEqualsCanonicalizing(['600-1', '700-1'], array_keys($matches));
+        self::assertArrayNotHasKey('100-1', $matches);
+    }
+
+    public function testDegradationFiresOnCriteriaScopedSetsNotRawMatches(): void
+    {
+        // Doc 200 is OUT of the element query's criteria (e.g. a different element type)
+        // but happens to match both terms, so the RAW (unscoped) intersection of the two
+        // groups is non-empty: {100,200} ∩ {200,300} = {200}. Left unscoped, that phantom
+        // intersection would suppress degradation entirely, resolveValidDocsForGroups()
+        // would return [200], and the criteria filter would then strip it out afterward —
+        // zero results even though in-scope docs 100 and 300 each match one term. Scoping
+        // each group to the allowed set BEFORE resolving makes the true (empty) in-scope
+        // intersection visible, so degradation correctly falls back to the more selective
+        // in-scope term instead of losing the query entirely.
+        $adapter = new InMemorySearchAdapter();
+        $adapter->addSearchTerm('need', 1, 100);
+        $adapter->addSearchTerm('need', 1, 200);
+        $adapter->addSearchTerm('widget', 1, 200);
+        $adapter->addSearchTerm('widget', 1, 300);
+        $adapter->allowOnlyDocIds(['1:100', '1:300']);
+
+        $matches = $adapter->searchElements(Entry::find()->siteId(1)->search('need widget '));
+
+        self::assertNotEmpty($matches, 'Expected an in-scope doc, not the phantom cross-type intersection zeroing the query.');
+        self::assertArrayNotHasKey('200-1', $matches, 'Doc 200 is out of criteria scope and must never surface.');
+    }
+
+    public function testExactSpecMissIsNeverDemotedAndReturnsZero(): void
+    {
+        $adapter = new InMemorySearchAdapter();
+        $adapter->addSearchTerm('lantern', 1, 100);
+
+        $matches = $adapter->searchElements(Entry::find()->siteId(1)->search('title::amber lantern '));
+
+        self::assertSame([], $matches);
     }
 
     public function testClearIndexPreservesOtherSiteDocumentLengthMetadata(): void
@@ -741,6 +885,22 @@ class InMemorySearchAdapter extends BaseSearchAdapter
         }
 
         return array_intersect_key($scores, $this->allowedDocIds);
+    }
+
+    /**
+     * The real implementation queries the database via a cloned ElementQuery, which unit
+     * tests have no connection for. Simulate element-criteria scoping through the same
+     * allowOnlyDocIds() mechanism filterScoresByElementQuery() already uses.
+     */
+    protected function filterDocIdsByElementQuery(array $docIds, \craft\elements\db\ElementQuery $elementQuery): array
+    {
+        $docIds = array_fill_keys($docIds, true);
+
+        if ($this->allowedDocIds === null) {
+            return $docIds;
+        }
+
+        return array_intersect_key($docIds, $this->allowedDocIds);
     }
 
     protected function storeTitleTerms(int $siteId, int $elementId, array $titleTerms): void

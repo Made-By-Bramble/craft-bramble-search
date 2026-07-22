@@ -43,6 +43,14 @@ class RebuildIndexJob extends BaseBatchedJob implements RetryableJobInterface
     public bool $rebuildLockAcquired = false;
 
     /**
+     * Unique ID for this rebuild chain, generated in before() and carried through every
+     * spawned continuation batch. Used to detect a superseded chain: if a stale lock gets
+     * cleared and a second chain starts, both chains' batches keep running unless each
+     * batch verifies it still owns the lock it started with.
+     */
+    public string $rebuildRunId = '';
+
+    /**
      * @inheritdoc
      */
     public function getTtr()
@@ -63,6 +71,17 @@ class RebuildIndexJob extends BaseBatchedJob implements RetryableJobInterface
      */
     public function execute($queue): void
     {
+        // Continuation batches (not the first) must still hold the rebuild lock they
+        // started with. If a stale lock was cleared and a newer chain started, this
+        // chain's lock is gone or reassigned: die quietly instead of racing the new one.
+        if ($this->itemOffset > 0 && !$this->ownsCurrentRebuildLock()) {
+            Craft::warning(
+                "Bramble Search rebuild for site ID {$this->siteId} was superseded by a newer rebuild chain; dropping this batch.",
+                __METHOD__
+            );
+            return;
+        }
+
         try {
             parent::execute($queue);
         } catch (\Throwable $e) {
@@ -85,6 +104,8 @@ class RebuildIndexJob extends BaseBatchedJob implements RetryableJobInterface
         if (!$site) {
             throw new \Exception("Site with ID {$this->siteId} not found");
         }
+
+        $this->rebuildRunId = uniqid('', true);
 
         $searchService = $this->getSearchAdapter();
         $this->acquireRebuildLock($site->id);
@@ -347,12 +368,34 @@ class RebuildIndexJob extends BaseBatchedJob implements RetryableJobInterface
 
     protected function storeRebuildLock(string $key): bool
     {
-        return Craft::$app->getCache()->add($key, time(), self::LOCK_TTL);
+        return Craft::$app->getCache()->add($key, $this->rebuildLockValue(), self::LOCK_TTL);
     }
 
     protected function storeRebuildLockAfterClear(string $key): bool
     {
-        return Craft::$app->getCache()->add($key, time(), self::LOCK_TTL);
+        return Craft::$app->getCache()->add($key, $this->rebuildLockValue(), self::LOCK_TTL);
+    }
+
+    /**
+     * @return array{time: int, runId: string}
+     */
+    protected function rebuildLockValue(): array
+    {
+        return ['time' => time(), 'runId' => $this->rebuildRunId];
+    }
+
+    /**
+     * Whether the site-level rebuild lock currently belongs to this job's chain.
+     */
+    protected function ownsCurrentRebuildLock(): bool
+    {
+        if ($this->siteId === null || $this->rebuildRunId === '') {
+            return false;
+        }
+
+        $lockValue = Craft::$app->getCache()->get($this->rebuildLockKey($this->siteId));
+
+        return is_array($lockValue) && ($lockValue['runId'] ?? null) === $this->rebuildRunId;
     }
 
     protected function isExpiredRebuildLock(mixed $lockValue): bool
@@ -374,7 +417,11 @@ class RebuildIndexJob extends BaseBatchedJob implements RetryableJobInterface
 
     protected function releaseRebuildLock(?int $siteId): void
     {
-        if ($siteId !== null) {
+        // Never release a lock this chain doesn't currently hold — that would let a
+        // superseded (e.g. previously-stale-cleared) chain's cleanup delete a newer
+        // chain's lock. clearRebuildLockForSite() remains the unconditional admin escape
+        // hatch for manually clearing a lock.
+        if ($siteId !== null && $this->ownsCurrentRebuildLock()) {
             self::clearRebuildLockForSite($siteId);
         }
 
