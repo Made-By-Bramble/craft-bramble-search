@@ -349,8 +349,8 @@ abstract class BaseSearchAdapter extends Search
 
         // Generate and store n-grams for fuzzy search
         foreach (array_keys($termFreqs) as $term) {
-            // Only generate n-grams for terms that don't already have them
-            if (!$this->termHasNgrams($term, $element->siteId)) {
+            // Only regenerate n-grams for terms that don't already have current ones
+            if (!$this->termNgramsCurrent($term, $element->siteId)) {
                 $ngrams = $this->generateNgrams($term);
                 if (!empty($ngrams)) {
                     $this->storeTermNgrams($term, $ngrams, $element->siteId);
@@ -446,6 +446,7 @@ abstract class BaseSearchAdapter extends Search
         }
 
         $parsed = SearchQueryParser::parse($searchQuery);
+        $parsed = $this->expandMultiTokenTerms($parsed);
         $siteIds = $this->resolveQuerySiteIds($elementQuery);
         $elementIds = [];
 
@@ -667,6 +668,7 @@ abstract class BaseSearchAdapter extends Search
     public function searchElements(ElementQuery $elementQuery): array
     {
         $parsed = SearchQueryParser::parse($elementQuery->search);
+        $parsed = $this->expandMultiTokenTerms($parsed);
         $searchQuery = $parsed['rawQuery'];
         $siteIds = $this->resolveQuerySiteIds($elementQuery);
 
@@ -1214,6 +1216,51 @@ abstract class BaseSearchAdapter extends Search
     }
 
     /**
+     * Expand single-term AND groups whose term tokenizes into multiple words.
+     *
+     * A query term like "l-carnitine" tokenizes into ["l", "carnitine"]. Left as one AND
+     * group it would otherwise only search its first token, silently discarding the rest.
+     * Splitting it into one AND group per token requires every token to match instead.
+     * Exact terms and OR groups (multiple term specs) are left untouched.
+     *
+     * @param array{andGroups: list<array{terms: list<array<string, mixed>}>>, excludeTerms: list<array<string, mixed>>, rawQuery: string} $parsed
+     * @return array{andGroups: list<array{terms: list<array<string, mixed>}>>, excludeTerms: list<array<string, mixed>>, rawQuery: string}
+     */
+    protected function expandMultiTokenTerms(array $parsed): array
+    {
+        $andGroups = [];
+
+        foreach ($parsed['andGroups'] as $group) {
+            if (count($group['terms']) !== 1) {
+                $andGroups[] = $group;
+                continue;
+            }
+
+            $spec = $group['terms'][0];
+            if (!empty($spec['exact'])) {
+                $andGroups[] = $group;
+                continue;
+            }
+
+            $tokens = $this->getSearchTokens((string)$spec['term'], false);
+            if (count($tokens) <= 1) {
+                $andGroups[] = $group;
+                continue;
+            }
+
+            foreach ($tokens as $token) {
+                $andGroups[] = ['terms' => [array_merge($spec, ['term' => $token])]];
+            }
+        }
+
+        return [
+            'andGroups' => $andGroups,
+            'excludeTerms' => $parsed['excludeTerms'],
+            'rawQuery' => $parsed['rawQuery'],
+        ];
+    }
+
+    /**
      * @param array<string, float> $filteredScores
      * @return array<string, float>
      */
@@ -1297,6 +1344,8 @@ abstract class BaseSearchAdapter extends Search
     /**
      * @param array<string, mixed> $termSpec
      * @param array<int, array<string, bool>> $groupMatches
+     * @param bool $allowTokenExpansion Whether a multi-word term should be resolved token-by-token.
+     *        Internal recursive calls pass false to guard against re-expanding an already-expanded token.
      * @return array<string, array<string, mixed>>
      */
     protected function findTermMatchesForSpec(
@@ -1307,11 +1356,49 @@ abstract class BaseSearchAdapter extends Search
         array $completedTerms,
         array $groupMatches,
         int $groupIndex,
+        bool $allowTokenExpansion = true,
     ): array {
         $term = (string)$termSpec['term'];
         $tokens = $this->getSearchTokens($term, $isTypeaheadTerm);
         if (empty($tokens)) {
             return [];
+        }
+
+        // OR-group members, exclude terms, and typeahead specs don't go through
+        // expandMultiTokenTerms(), so a multi-word term (e.g. "l-carnitine") can still
+        // reach here as a single spec. Resolve each token separately and require every
+        // token to match, instead of silently truncating to the first token.
+        if ($allowTokenExpansion && count($tokens) > 1) {
+            $lastIndex = array_key_last($tokens);
+            $matchingDocIds = null;
+            $firstTokenMatches = [];
+
+            foreach ($tokens as $index => $token) {
+                $tokenMatches = $this->findTermMatchesForSpec(
+                    array_merge($termSpec, ['term' => $token]),
+                    $siteId,
+                    $isTypeaheadQuery,
+                    $isTypeaheadTerm && $index === $lastIndex,
+                    $completedTerms,
+                    $groupMatches,
+                    $groupIndex,
+                    false // guard against re-expanding: a single token can only recurse one level
+                );
+
+                if ($index === 0) {
+                    $firstTokenMatches = $tokenMatches;
+                }
+
+                $matchingDocIds = $matchingDocIds === null
+                    ? array_keys($tokenMatches)
+                    : array_values(array_intersect($matchingDocIds, array_keys($tokenMatches)));
+
+                if (empty($matchingDocIds)) {
+                    return [];
+                }
+            }
+
+            return array_intersect_key($firstTokenMatches, array_flip($matchingDocIds));
         }
 
         $term = $tokens[0];
@@ -1544,6 +1631,25 @@ abstract class BaseSearchAdapter extends Search
             $candidate = (string)$candidate;
             if ($this->isWithinFuzzyEditDistance($term, $candidate, $maxDistance)) {
                 $matches[$candidate] = $this->calculateFuzzyConfidence($term, $candidate, $similarity);
+            }
+        }
+
+        // N-gram similarity depends on stored n-grams matching the currently configured
+        // ngramSizes. When settings changed since a term was indexed, stale n-grams can
+        // return zero candidates even for an obvious prefix. Supplement with a direct
+        // prefix lookup so long prefixes (e.g. "ashwagand" -> "ashwagandha") still resolve.
+        if (mb_strlen($term, 'UTF-8') >= 4) {
+            foreach ($this->getTermsByPrefix($term, $siteId, $this->fuzzySearchMaxCandidates) as $candidate => $confidence) {
+                $candidate = (string)$candidate;
+                if ($candidate === $term || isset($matches[$candidate])) {
+                    continue;
+                }
+
+                $matches[$candidate] = $this->calculateFuzzyConfidence(
+                    $term,
+                    $candidate,
+                    $this->calculateNgramSimilarity($searchNgrams, $this->generateNgrams($candidate))
+                );
             }
         }
 
@@ -2817,6 +2923,26 @@ abstract class BaseSearchAdapter extends Search
      * @return bool Whether the term has n-grams
      */
     abstract protected function termHasNgrams(string $term, int $siteId): bool;
+
+    /**
+     * Check whether a term's stored n-grams are current for the active ngramSizes setting.
+     *
+     * Existence alone (termHasNgrams()) isn't enough: if ngramSizes changes between
+     * releases, previously stored n-grams stay in the index unchanged and silently mismatch
+     * what generateNgrams() now produces, which degrades fuzzy-match Jaccard similarity.
+     * Adapters that can cheaply read the stored n-gram count should override this to also
+     * compare it against count($this->generateNgrams($term)), so a settings change causes
+     * n-grams to regenerate on the next index write. The base implementation falls back to
+     * plain existence checking.
+     *
+     * @param string $term The term to check
+     * @param int $siteId The site ID
+     * @return bool Whether the term's stored n-grams are current
+     */
+    protected function termNgramsCurrent(string $term, int $siteId): bool
+    {
+        return $this->termHasNgrams($term, $siteId);
+    }
 
     /**
      * Clear all n-grams for a site

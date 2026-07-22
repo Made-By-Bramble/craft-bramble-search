@@ -679,6 +679,26 @@ class MongoDbSearchAdapter extends BaseSearchAdapter
     }
 
     /**
+     * Check whether a term's stored n-gram count matches the currently configured ngramSizes.
+     *
+     * The ngram_index collection already stores the count from when the term was indexed, so
+     * this is a single cheap findOne rather than regenerating and diffing the full n-gram set.
+     *
+     * @param string $term The term to check
+     * @param int $siteId The site ID
+     * @return bool Whether the term's stored n-gram count matches current-size generation
+     */
+    protected function termNgramsCurrent(string $term, int $siteId): bool
+    {
+        $result = $this->database->selectCollection('ngram_index')->findOne([
+            'term' => $term,
+            'siteId' => $siteId,
+        ]);
+
+        return $result !== null && (int)$result['ngram_count'] === count($this->generateNgrams($term));
+    }
+
+    /**
      * Clear all n-grams for a site
      *
      * @param int $siteId The site ID

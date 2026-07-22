@@ -1004,6 +1004,27 @@ class MySqlSearchAdapter extends BaseSearchAdapter
     }
 
     /**
+     * Check whether a term's stored n-gram count matches the currently configured ngramSizes.
+     *
+     * The ngram_index table already stores the count from when the term was indexed, so this
+     * is a single cheap scalar query rather than regenerating and diffing the full n-gram set.
+     *
+     * @param string $term The term to check
+     * @param int $siteId The site ID
+     * @return bool Whether the term's stored n-gram count matches current-size generation
+     */
+    protected function termNgramsCurrent(string $term, int $siteId): bool
+    {
+        $storedCount = (new Query())
+            ->select(['ngram_count'])
+            ->from($this->tablePrefix . 'ngram_index}}')
+            ->where(['term' => $term, 'siteId' => $siteId])
+            ->scalar();
+
+        return $storedCount !== false && (int)$storedCount === count($this->generateNgrams($term));
+    }
+
+    /**
      * Clear all n-grams for a site
      *
      * @param int $siteId The site ID
@@ -1184,7 +1205,9 @@ class MySqlSearchAdapter extends BaseSearchAdapter
         $ngramBatch = [];
         $ngramIndexBatch = [];
         foreach (array_keys($termFreqs) as $term) {
-            if (!$this->termHasNgrams($term, $siteId)) {
+            // Same stale-n-gram guard as the base indexElementAttributesUnlocked(): existence
+            // alone isn't enough after an ngramSizes setting change.
+            if (!$this->termNgramsCurrent($term, $siteId)) {
                 $ngrams = $this->generateNgrams($term);
                 if (!empty($ngrams)) {
                     foreach ($ngrams as $ngram) {

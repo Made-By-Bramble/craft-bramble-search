@@ -468,6 +468,74 @@ final class AdapterFeatureTest extends TestCase
         self::assertArrayHasKey('100-1', $matches);
         self::assertArrayNotHasKey('200-1', $matches);
     }
+
+    public function testMultiTokenTermRequiresEveryTokenToMatch(): void
+    {
+        $adapter = new InMemorySearchAdapter();
+        $adapter->addTitle('L-Carnitine 500mg', 1, 100);
+        $adapter->addTitle('L-Lysine 500mg', 1, 200);
+
+        $matches = $adapter->searchElements(Entry::find()->siteId(1)->search('l-carnitine'));
+
+        self::assertArrayHasKey('100-1', $matches);
+        self::assertArrayNotHasKey('200-1', $matches);
+    }
+
+    public function testMultiTokenOrGroupMemberRequiresEveryTokenToMatch(): void
+    {
+        // OR-group members bypass expandMultiTokenTerms() and reach findTermMatchesForSpec()
+        // as a single multi-word spec, so the recursive per-token resolution has to cover them too.
+        $adapter = new InMemorySearchAdapter();
+        $adapter->addTitle('L-Carnitine 500mg', 1, 100);
+        $adapter->addTitle('Zinc Tablets', 1, 200);
+
+        $matches = $adapter->searchElements(Entry::find()->siteId(1)->search(
+            new \craft\search\SearchQuery('l-carnitine OR zinc')
+        ));
+
+        self::assertArrayHasKey('100-1', $matches);
+        self::assertArrayHasKey('200-1', $matches);
+    }
+
+    public function testLongPrefixFindsCandidateWhenNgramSimilarityReturnsNothing(): void
+    {
+        // Simulates stale stored n-grams (e.g. after an ngramSizes setting change) by making
+        // n-gram similarity retrieval return no candidates at all, the way Jaccard collapses
+        // to zero when stored and current n-gram sizes disagree.
+        $adapter = new StaleNgramInMemorySearchAdapter();
+        $adapter->addSearchTerm('ashwagandha', 1, 100);
+
+        $matches = $adapter->searchElements(Entry::find()->siteId(1)->search('ashwagand'));
+
+        self::assertArrayHasKey('100-1', $matches);
+    }
+
+    public function testTermNgramsCurrentDetectsStaleCountAfterNgramSizeChange(): void
+    {
+        $adapter = new CountTrackingNgramAdapter();
+        $currentNgrams = $adapter->publicGenerateNgrams('lavender');
+
+        // Simulate n-grams stored under a previous ngramSizes setting: a mismatched count.
+        $adapter->publicStoreTermNgrams('lavender', array_slice($currentNgrams, 0, 1), 1);
+        self::assertFalse($adapter->publicTermNgramsCurrent('lavender', 1));
+
+        $adapter->publicStoreTermNgrams('lavender', $currentNgrams, 1);
+        self::assertTrue($adapter->publicTermNgramsCurrent('lavender', 1));
+    }
+
+    public function testIndexingRegeneratesStaleNgramsWhenCountMismatches(): void
+    {
+        $adapter = new CountTrackingNgramAdapter();
+        $entry = IndexableTestEntry::withFields(['body' => 'ashwagandha extract']);
+
+        // Pre-seed a stale n-gram count for a term this entry will index, simulating a term
+        // whose n-grams were generated under a previous ngramSizes setting.
+        $adapter->publicStoreTermNgrams('ashwagandha', ['stale'], 1);
+
+        self::assertTrue($adapter->indexElementAttributes($entry, null));
+
+        self::assertTrue($adapter->publicTermNgramsCurrent('ashwagandha', 1));
+    }
 }
 
 final class TestableCraftCacheSearchAdapter extends CraftCacheSearchAdapter
@@ -528,7 +596,7 @@ final class TestableFileSearchAdapter extends FileSearchAdapter
     }
 }
 
-final class InMemorySearchAdapter extends BaseSearchAdapter
+class InMemorySearchAdapter extends BaseSearchAdapter
 {
     private array $documents = [];
     private array $terms = [];
@@ -789,6 +857,58 @@ final class InMemorySearchAdapter extends BaseSearchAdapter
     public function publicFilterStopWords(array $tokens): array
     {
         return $this->filterStopWords($tokens);
+    }
+}
+
+/**
+ * Simulates a search index whose stored n-grams no longer overlap with what the current
+ * ngramSizes setting would generate: n-gram similarity retrieval always comes back empty,
+ * the same symptom stale/mismatched n-grams produce in production adapters.
+ */
+final class StaleNgramInMemorySearchAdapter extends InMemorySearchAdapter
+{
+    protected function getTermsByNgramSimilarity(array $ngrams, int $siteId, float $threshold): array
+    {
+        return [];
+    }
+}
+
+/**
+ * Tracks n-gram counts the way RedisSearchAdapter/MySqlSearchAdapter do, so termNgramsCurrent()
+ * can be exercised without a live Redis or MySQL connection.
+ */
+final class CountTrackingNgramAdapter extends InMemorySearchAdapter
+{
+    private array $ngramCounts = [];
+
+    protected function storeTermNgrams(string $term, array $ngrams, int $siteId): void
+    {
+        parent::storeTermNgrams($term, $ngrams, $siteId);
+        $this->ngramCounts[$siteId][$term] = count($ngrams);
+    }
+
+    protected function termNgramsCurrent(string $term, int $siteId): bool
+    {
+        if (!isset($this->ngramCounts[$siteId][$term])) {
+            return false;
+        }
+
+        return $this->ngramCounts[$siteId][$term] === count($this->generateNgrams($term));
+    }
+
+    public function publicTermNgramsCurrent(string $term, int $siteId): bool
+    {
+        return $this->termNgramsCurrent($term, $siteId);
+    }
+
+    public function publicStoreTermNgrams(string $term, array $ngrams, int $siteId): void
+    {
+        $this->storeTermNgrams($term, $ngrams, $siteId);
+    }
+
+    public function publicGenerateNgrams(string $term): array
+    {
+        return $this->generateNgrams($term);
     }
 }
 

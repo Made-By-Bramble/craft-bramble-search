@@ -642,6 +642,24 @@ class RedisSearchAdapter extends BaseSearchAdapter
     }
 
     /**
+     * Check whether a term's stored n-gram count matches the currently configured ngramSizes.
+     *
+     * The ngram_count hash already stores the count from when the term was indexed, so this
+     * is a single cheap hGet rather than regenerating and diffing the full n-gram set.
+     *
+     * @param string $term The term to check
+     * @param int $siteId The site ID
+     * @return bool Whether the term's stored n-gram count matches current-size generation
+     */
+    protected function termNgramsCurrent(string $term, int $siteId): bool
+    {
+        $countKey = $this->prefix . "ngram_count:{$siteId}";
+        $stored = $this->redis->hGet($countKey, $term);
+
+        return $stored !== false && (int)$stored === count($this->generateNgrams($term));
+    }
+
+    /**
      * Clear all n-grams for a site
      *
      * @param int $siteId The site ID
