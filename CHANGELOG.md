@@ -1,5 +1,10 @@
 # Release Notes for Bramble Search
 
+## 1.4.1
+- Fixed multi-word search terms (e.g. "L-Carnitine", quoted phrases) matching only their first word; every word is now required and scored.
+- Fixed long partial-word searches (e.g. "ashwagand") returning no results when stored n-grams predate an `ngramSizes` settings change; prefix matching no longer depends on n-gram similarity.
+- Stale n-grams now regenerate automatically when a term is reindexed after an `ngramSizes` change (Redis, MySQL, MongoDB adapters).
+
 ## 1.4.0
 - Added `extraStopWords` and `removeStopWords` plugin settings, overridable per project from `config/bramble-search.php`, to customize the bundled English stop word list without replacing it.
 - Stop word changes apply on top of the bundled `stopwords/en.php` list as `(bundled ∪ extra) − remove`; rebuild the index after changing them.
