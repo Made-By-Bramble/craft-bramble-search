@@ -1985,10 +1985,60 @@ abstract class BaseSearchAdapter extends Search
             }
         }
 
+        $this->addSameLengthOneEditMatches($term, $siteId, $searchNgrams, $matches);
+
         // Limit candidates for performance and return by similarity score
         $matches = array_slice($matches, 0, $this->fuzzySearchMaxCandidates, true);
 
         return $matches;
+    }
+
+    /**
+     * N-gram recall misses single-letter substitutions in short words.
+     *
+     * @param array<string, float> $matches
+     */
+    protected function addSameLengthOneEditMatches(
+        string $term,
+        int $siteId,
+        array $searchNgrams,
+        array &$matches,
+    ): void {
+        $termLength = mb_strlen($term, 'UTF-8');
+        if ($termLength < 4) {
+            return;
+        }
+
+        $chars = mb_str_split($term, 1, 'UTF-8');
+        $candidates = [];
+        foreach ($chars as $i => $char) {
+            foreach (range('a', 'z') as $letter) {
+                if ($letter === $char) {
+                    continue;
+                }
+                $variant = $chars;
+                $variant[$i] = $letter;
+                $candidate = implode('', $variant);
+                if (isset($matches[$candidate])) {
+                    continue;
+                }
+                $candidates[$candidate] = true;
+            }
+        }
+
+        $candidateTerms = array_keys($candidates);
+        $this->warmTermDocuments($candidateTerms);
+
+        foreach ($candidateTerms as $candidate) {
+            if (empty($this->filterDocumentsBySite($this->termDocumentsCached($candidate), $siteId))) {
+                continue;
+            }
+            $matches[$candidate] = $this->calculateFuzzyConfidence(
+                $term,
+                $candidate,
+                $this->calculateNgramSimilarity($searchNgrams, $this->generateNgrams($candidate))
+            );
+        }
     }
 
     /**
@@ -2199,9 +2249,8 @@ abstract class BaseSearchAdapter extends Search
     /**
      * Decide whether to look for fuzzy candidates for a search term.
      *
-     * Long exact terms may still be typos that exist elsewhere in the index, so fuzzy
-     * supplements are useful. Short exact terms are noisy, so keep them exact unless
-     * no exact match exists.
+     * Three-letter exact terms stay exact. Four-letter and longer exact hits can still
+     * be spelling variants that exist elsewhere in the index, so fuzzy supplements run.
      *
      * @param string $term The search term
      * @param bool $hasExactMatches Whether exact matches were found on the active site
@@ -2215,7 +2264,7 @@ abstract class BaseSearchAdapter extends Search
 
         $termLength = mb_strlen($term, 'UTF-8');
 
-        return $termLength >= 3 && (!$hasExactMatches || $termLength >= 5);
+        return $termLength >= 3 && (!$hasExactMatches || $termLength >= 4);
     }
 
     /**

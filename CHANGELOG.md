@@ -1,5 +1,8 @@
 # Release Notes for Bramble Search
 
+## 1.5.2
+- Exact four-letter hits now also pick up same-length one-edit spelling variants.
+
 ## 1.5.1
 - AND-query degradation now keeps title-matching terms ahead of body-only matches.
 - Front-end searches now treat the final query token as a prefix.
