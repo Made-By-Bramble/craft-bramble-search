@@ -828,6 +828,7 @@ abstract class BaseSearchAdapter extends Search
             $scopedGroupMatches[$groupIndex] = array_intersect_key($docs, $allowedDocIds);
         }
 
+        $groupMeta = $this->withGroupTitleHits($scopedGroupMatches, $groupTermData, $groupMeta);
         $validDocs = $this->resolveValidDocsForGroups($scopedGroupMatches, $groupMeta, $totalDocs);
         if (empty($validDocs)) {
             return [];
@@ -900,10 +901,11 @@ abstract class BaseSearchAdapter extends Search
     }
 
     /**
-     * Decide whether the final query token should be treated as an in-progress prefix.
+     * Decide whether the final query token should be treated as a prefix.
      *
-     * This follows the search-as-you-type model used by engines such as Elasticsearch's
-     * match_bool_prefix: completed words are normal terms and the final typed word is a prefix.
+     * Completed words are normal terms and the final word is a prefix, matching
+     * the control panel element index. A trailing space means the last word is
+     * finished and must match exactly.
      *
      * @param string $searchQuery The raw search query
      * @param array $tokens Tokenized search terms
@@ -915,19 +917,7 @@ abstract class BaseSearchAdapter extends Search
             return false;
         }
 
-        if ($this->siteSearchAsYouType) {
-            return true;
-        }
-
-        // Front-end site searches are submitted queries; final-token prefix expansion
-        // is for the control panel's live element index search.
-        if (!isset(Craft::$app)) { // @phpstan-ignore isset.property (unset before bootstrap in unit tests)
-            return true;
-        }
-
-        $request = Craft::$app->getRequest();
-
-        return !($request instanceof \craft\web\Request) || $request->getIsCpRequest();
+        return true;
     }
 
     /**
@@ -1416,10 +1406,12 @@ abstract class BaseSearchAdapter extends Search
      * A strict intersection of every AND group turns any single common term into a hard gate:
      * one group with poor selectivity, or a zero-match group, zeroes the whole query. This
      * demotes over-broad or empty demotable groups to optional (scoring-only, non-constraining)
-     * so the query degrades gracefully instead of returning nothing.
+     * so the query degrades gracefully instead of returning nothing. Body-only matches (no
+     * title hits) demote before title-matching groups so a rare SEO spelling cannot displace
+     * the term that actually names the product.
      *
      * @param array<int, array<string, bool>> $groupDocSets docIds keyed true, per group index
-     * @param array<int, array{demotable: bool}> $groupMeta per group index
+     * @param array<int, array{demotable: bool, titleHits?: int}> $groupMeta per group index
      * @param int $totalDocs Total indexed document count, for the proactive demotion ratio
      * @return list<string> Valid document IDs
      */
@@ -1469,9 +1461,10 @@ abstract class BaseSearchAdapter extends Search
 
         // Degradation loop: while the intersection is empty and more than one required group
         // remains, demote the required demotable group that contributes least — zero-match
-        // groups first (they annihilate the intersection outright), then the largest match
-        // count — and re-intersect. Stops once the intersection is non-empty or only one
-        // required group remains.
+        // groups first (they annihilate the intersection outright), then body-only groups
+        // (no title hits) before title-matching groups, then the largest match count —
+        // and re-intersect. Stops once the intersection is non-empty or only one required
+        // group remains.
         while (empty($intersection) && count($required) > 1) {
             $demotableIndexes = array_values(array_filter(
                 array_keys($required),
@@ -1482,7 +1475,7 @@ abstract class BaseSearchAdapter extends Search
                 return [];
             }
 
-            usort($demotableIndexes, function(int $a, int $b) use ($required): int {
+            usort($demotableIndexes, function(int $a, int $b) use ($required, $groupMeta): int {
                 $countA = count($required[$a]);
                 $countB = count($required[$b]);
                 $zeroA = $countA === 0;
@@ -1490,6 +1483,12 @@ abstract class BaseSearchAdapter extends Search
 
                 if ($zeroA !== $zeroB) {
                     return $zeroA ? -1 : 1;
+                }
+
+                $titleA = ($groupMeta[$a]['titleHits'] ?? 0) > 0;
+                $titleB = ($groupMeta[$b]['titleHits'] ?? 0) > 0;
+                if ($titleA !== $titleB) {
+                    return $titleA ? 1 : -1;
                 }
 
                 return $countB <=> $countA;
@@ -1528,6 +1527,49 @@ abstract class BaseSearchAdapter extends Search
         }
 
         return $intersection ?? [];
+    }
+
+    /**
+     * @param array<int, array<string, bool>> $groupDocSets
+     * @param array<int, array<string, array<string, mixed>>> $groupTermData
+     * @param array<int, array{demotable: bool, titleHits?: int}> $groupMeta
+     * @return array<int, array{demotable: bool, titleHits: int}>
+     */
+    protected function withGroupTitleHits(array $groupDocSets, array $groupTermData, array $groupMeta): array
+    {
+        $docIds = [];
+        foreach ($groupDocSets as $docs) {
+            foreach (array_keys($docs) as $docId) {
+                $docIds[] = (string)$docId;
+            }
+        }
+        $this->warmTitleTerms($docIds);
+
+        foreach ($groupDocSets as $groupIndex => $docs) {
+            $groupMeta[$groupIndex]['titleHits'] = $this->countTitleHitsForGroup(
+                $docs,
+                $groupTermData[$groupIndex] ?? []
+            );
+        }
+
+        return $groupMeta;
+    }
+
+    /**
+     * @param array<string, bool> $docSet
+     * @param array<string, array<string, mixed>> $termDataByDoc
+     */
+    protected function countTitleHitsForGroup(array $docSet, array $termDataByDoc): int
+    {
+        $hits = 0;
+        foreach ($docSet as $docId => $_) {
+            $term = $termDataByDoc[(string)$docId]['actualTerm'] ?? $termDataByDoc[$docId]['actualTerm'] ?? null;
+            if (is_string($term) && $term !== '' && $this->isTermInTitle($term, (string)$docId)) {
+                $hits++;
+            }
+        }
+
+        return $hits;
     }
 
     /**
@@ -1571,10 +1613,12 @@ abstract class BaseSearchAdapter extends Search
         $groupMatches = [];
         $groupDocSets = [];
         $groupMeta = [];
+        $groupTermData = [];
         $allDocuments = [];
 
         foreach ($parsed['andGroups'] as $groupIndex => $group) {
             $groupMatches[$groupIndex] = [];
+            $groupTermData[$groupIndex] = [];
             $groupDocIds = [];
 
             foreach ($group['terms'] as $termIndex => $termSpec) {
@@ -1595,6 +1639,12 @@ abstract class BaseSearchAdapter extends Search
                     if ($this->termMatchesQueryScope($docId, $matchData, $elementQuery)) {
                         $groupDocIds[] = $docId;
                         $allDocuments[$docId] = true;
+                        if (
+                            !isset($groupTermData[$groupIndex][$docId])
+                            || ($matchData['confidence'] ?? 0) > ($groupTermData[$groupIndex][$docId]['confidence'] ?? 0)
+                        ) {
+                            $groupTermData[$groupIndex][$docId] = $matchData;
+                        }
                     }
                 }
             }
@@ -1612,6 +1662,7 @@ abstract class BaseSearchAdapter extends Search
             $groupDocSets[$groupIndex] = array_intersect_key($docSet, $allowedDocIds);
         }
 
+        $groupMeta = $this->withGroupTitleHits($groupDocSets, $groupTermData, $groupMeta);
         $validDocs = $this->resolveValidDocsForGroups($groupDocSets, $groupMeta, $totalDocs);
 
         foreach ($parsed['excludeTerms'] as $excludeSpec) {

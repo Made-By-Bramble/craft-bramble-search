@@ -1,5 +1,9 @@
 # Release Notes for Bramble Search
 
+## 1.5.1
+- AND-query degradation now keeps title-matching terms ahead of body-only matches.
+- Front-end searches now treat the final query token as a prefix.
+
 ## 1.5.0
 - Fixed multi-word queries where a stop word sits between content words returning zero results; stop-word-only AND groups are now dropped instead of being forced into a required (and never indexed) match.
 - Shrunk the bundled English stop word list to ~90 function words; content-bearing words like "need", "best", "new", and "back" are now indexed and searchable by default. **Rebuild the search index after upgrading** so these newly-indexable words get postings.
