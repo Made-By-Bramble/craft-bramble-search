@@ -4,6 +4,7 @@ namespace MadeByBramble\BrambleSearch\adapters;
 
 use Craft;
 use craft\base\ElementInterface;
+use craft\base\FieldInterface;
 use craft\db\Query;
 use craft\db\QueryAbortedException;
 use craft\elements\db\ElementQuery;
@@ -1747,6 +1748,7 @@ abstract class BaseSearchAdapter extends Search
                     'freq' => $freq,
                     'docFreq' => $docFreq,
                     'actualTerm' => $term,
+                    'attribute' => $termSpec['attribute'] ?? null,
                     'confidence' => 1.0,
                 ];
             }
@@ -1782,6 +1784,7 @@ abstract class BaseSearchAdapter extends Search
                         'freq' => $freq,
                         'docFreq' => $docFreq,
                         'actualTerm' => $prefixTerm,
+                        'attribute' => $termSpec['attribute'] ?? null,
                         'confidence' => $docConfidence,
                     ];
                     if (
@@ -1815,6 +1818,7 @@ abstract class BaseSearchAdapter extends Search
                     'freq' => $freq,
                     'docFreq' => $docFreq,
                     'actualTerm' => $fuzzy,
+                    'attribute' => $termSpec['attribute'] ?? null,
                     'confidence' => $confidence,
                 ];
             }
@@ -1894,17 +1898,24 @@ abstract class BaseSearchAdapter extends Search
         $sources = $this->getDocumentTermSources((int)$siteId, (int)$elementId);
         $term = (string)$matchData['actualTerm'];
         $origins = $sources[$term] ?? [];
-        if ($origins === [] && $sources === []) {
-            return true;
+        $attribute = $matchData['attribute'] ?? null;
+        if ($attribute !== null) {
+            $origins = array_values(array_filter(
+                $origins,
+                static fn(string $origin): bool => $origin === "attr:$attribute" || $origin === "field:$attribute"
+            ));
+        }
+        if ($origins === []) {
+            return $attribute === null && ($sources === [] || $this->isTermInTitle($term, $docId));
         }
 
         $allowed = array_map(
-            static fn($handle): string => "field:$handle",
+            static fn(FieldInterface $field): string => "field:$field->handle",
             $elementQuery->customFields
         );
 
         foreach ($origins as $origin) {
-            if (in_array($origin, $allowed, true)) {
+            if (str_starts_with($origin, 'attr:') || in_array($origin, $allowed, true)) {
                 return true;
             }
         }

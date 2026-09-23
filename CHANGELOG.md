@@ -1,5 +1,8 @@
 # Release Notes for Bramble Search
 
+## 1.5.3
+- Fixed MySQL searches returning no results for indexed entries while preserving custom-field search scoping.
+
 ## 1.5.2
 - Exact four-letter hits now also pick up same-length one-edit spelling variants.
 
