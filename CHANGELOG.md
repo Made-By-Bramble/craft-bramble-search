@@ -1,5 +1,8 @@
 # Release Notes for Bramble Search
 
+## 1.5.4
+- Rebuilding the search index now queues every site in a multi-site installation.
+
 ## 1.5.3
 - Fixed MySQL searches returning no results for indexed entries while preserving custom-field search scoping.
 

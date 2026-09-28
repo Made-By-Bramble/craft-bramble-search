@@ -215,7 +215,9 @@ class Plugin extends BasePlugin
                             throw new \RuntimeException('Bramble Search is not active as the Craft search service.');
                         }
 
-                        $this->queueRebuildIndexJob(Craft::$app->getSites()->currentSite->id);
+                        foreach (Craft::$app->getSites()->getAllSites() as $site) {
+                            $this->queueRebuildIndexJob($site->id);
+                        }
                     },
                 ];
                 $event->options = $options;

@@ -129,7 +129,7 @@ Alternatively, you can use the command line:
 ./craft clear-caches/bramble-search
 ```
 
-This will queue a job to rebuild the search index for the current site.
+This will queue a job to rebuild the search index for each site.
 
 ### Basic Usage
 
