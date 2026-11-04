@@ -10,7 +10,7 @@ use craft\elements\db\ElementQueryInterface;
  * MultiElementTypeBatcher
  *
  * A Batchable implementation that processes multiple element type queries sequentially.
- * Used by RebuildIndexJob to index all registered element types.
+ * Retained for callers that need generic slices; rebuild execution uses an immutable manifest.
  */
 class MultiElementTypeBatcher implements Batchable
 {

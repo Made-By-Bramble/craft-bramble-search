@@ -16,12 +16,12 @@ class Install extends Migration
      */
     public function safeUp(): bool
     {
+        (new m261103_000000_add_rebuild_manifests(['db' => $this->db, 'compact' => $this->compact]))->safeUp();
+        (new m261104_000001_add_rebuild_lifecycle(['db' => $this->db, 'compact' => $this->compact]))->safeUp();
         $tablePrefix = '{{%bramble_search_';
         $isMysql = $this->db->getDriverName() === 'mysql';
-        $isMariaDb = $isMysql && stripos($this->db->getServerVersion(), 'mariadb') !== false;
-        $collation = $isMariaDb ? 'utf8mb4_bin' : 'utf8mb4_0900_as_ci';
         $termCol = $isMysql
-            ? "varchar(255) CHARACTER SET utf8mb4 COLLATE {$collation} NOT NULL"
+            ? 'varchar(255) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin NOT NULL'
             : $this->string(255)->notNull();
 
         // Create documents table
@@ -122,8 +122,8 @@ class Install extends Migration
         if (!$this->db->tableExists($tablePrefix . 'metadata}}')) {
             $this->createTable($tablePrefix . 'metadata}}', [
                 'id' => $this->primaryKey(),
-                'key' => $this->string(255)->notNull(),
-                'value' => $this->text()->notNull(),
+                'key' => $termCol,
+                'value' => $this->longText()->notNull(),
                 'dateCreated' => $this->dateTime()->notNull(),
                 'dateUpdated' => $this->dateTime()->notNull(),
                 'uid' => $this->uid(),
@@ -135,13 +135,16 @@ class Install extends Migration
                 $tablePrefix . 'metadata}}',
                 ['key']
             );
+            if ($isMysql) {
+                $this->createIndex(null, $tablePrefix . 'metadata}}', ['key', new \yii\db\Expression('[[value]](191)')]);
+            }
         }
 
         // Create n-grams table for fuzzy search optimization
         if (!$this->db->tableExists($tablePrefix . 'ngrams}}')) {
             $this->createTable($tablePrefix . 'ngrams}}', [
                 'id' => $this->primaryKey(),
-                'ngram' => $this->string(5)->notNull(), // Max 5 chars for up to 5-grams
+                'ngram' => $isMysql ? 'varchar(5) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin NOT NULL' : $this->string(5)->notNull(),
                 'term' => $termCol,
                 'ngram_type' => $this->tinyInteger()->notNull(), // 2=bigram, 3=trigram, etc.
                 'siteId' => $this->integer()->notNull(),
@@ -202,6 +205,8 @@ class Install extends Migration
      */
     public function safeDown(): bool
     {
+        $this->dropTableIfExists('{{%bramble_search_rebuild_chunks}}');
+        $this->dropTableIfExists('{{%bramble_search_rebuild_runs}}');
         $tablePrefix = '{{%bramble_search_';
 
         // Drop tables in reverse order to avoid foreign key constraints

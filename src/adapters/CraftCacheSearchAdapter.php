@@ -12,6 +12,121 @@ use Craft;
  */
 class CraftCacheSearchAdapter extends BaseSearchAdapter
 {
+    protected function getIndexedDocumentIds(): array
+    {
+        $ids = Craft::$app->getCache()->get($this->prefix . 'meta:docs');
+        if ($ids === false) {
+            return [];
+        }
+        if (!is_array($ids)) {
+            throw new \RuntimeException('Invalid search document catalogue.');
+        }
+
+        return array_keys($ids);
+    }
+    protected function documentExists(int $siteId, int $elementId): bool
+    {
+        return Craft::$app->getCache()->exists($this->prefix . "doc:$siteId:$elementId");
+    }
+
+    protected function termNgramsCurrent(string $term, int $siteId): bool
+    {
+        return Craft::$app->getCache()->get($this->prefix . "ngrams:$siteId:$term") === $this->generateNgrams($term);
+    }
+    protected function getStorageNamespace(): array
+    {
+        $cache = Craft::$app->getCache();
+        $properties = array_intersect_key(get_object_vars($cache), array_flip(['keyPrefix', 'cachePath', 'cacheTable']));
+        if ($cache instanceof \yii\redis\Cache) {
+            $connection = \yii\di\Instance::ensure($cache->redis, \yii\redis\ConnectionInterface::class);
+            $connectionProperties = get_object_vars($connection);
+            $properties['redis'] = [$connectionProperties['hostname'] ?? null, $connectionProperties['port'] ?? null, $connectionProperties['database'] ?? null];
+        }
+
+        return ['driver' => 'craft', 'backend' => $cache::class, 'namespace' => $properties];
+    }
+
+    protected function readIndexRecord(string $key): ?array
+    {
+        $value = Craft::$app->getCache()->get($this->prefix . 'state:' . $key);
+
+        return $value === false ? null : $value;
+    }
+
+    protected function readIndexRecordsBatch(array $keys): array
+    {
+        if ($keys === []) {
+            return [];
+        }
+        $cacheKeys = array_map(fn(string $key): string => $this->prefix . 'state:' . $key, $keys);
+        $values = Craft::$app->getCache()->multiGet($cacheKeys);
+        $records = [];
+        foreach ($keys as $index => $key) {
+            $records[$key] = ($values[$cacheKeys[$index]] ?? false) === false ? null : $values[$cacheKeys[$index]];
+        }
+
+        return $records;
+    }
+
+    protected function writeIndexRecord(string $key, array $value): void
+    {
+        $this->setPersistent($this->prefix . 'state:' . $key, $value);
+    }
+
+    protected function deleteIndexRecord(string $key): void
+    {
+        $cacheKey = $this->prefix . 'state:' . $key;
+        $cache = Craft::$app->getCache();
+        if ($cache->exists($cacheKey) && !$cache->delete($cacheKey)) {
+            throw new \RuntimeException('Unable to remove search state from cache.');
+        }
+    }
+
+    protected function writeIndexTotals(int $documents, int $length): void
+    {
+        if (Craft::$app->getCache()->multiSet([$this->prefix . 'meta:totalDocs' => $documents, $this->prefix . 'meta:totalLength' => $length], 0) !== []) {
+            throw new \RuntimeException('Unable to publish search cache metadata.');
+        }
+    }
+
+    private function setPersistent(string $key, mixed $value): void
+    {
+        if (!Craft::$app->getCache()->set($key, $value, 0)) {
+            throw new \RuntimeException('Unable to persist search cache data.');
+        }
+    }
+
+    private function deletePersistent(string $key): void
+    {
+        $cache = Craft::$app->getCache();
+        if ($cache->exists($key) && !$cache->delete($key)) {
+            throw new \RuntimeException('Unable to remove search cache data.');
+        }
+    }
+
+    protected function writePostingChanges(int $siteId, int $elementId, array $frequencies): void
+    {
+        if ($frequencies === []) {
+            return;
+        }
+        $cache = Craft::$app->getCache();
+        $keys = array_map(fn(string|int $term): string => $this->prefix . 'term:' . $term, array_keys($frequencies));
+        $values = $cache->multiGet($keys);
+        $writes = [];
+        foreach ($frequencies as $term => $frequency) {
+            $key = $this->prefix . 'term:' . $term;
+            $documents = $values[$key] === false ? [] : $values[$key];
+            $documents["$siteId:$elementId"] = $frequency;
+            $writes[$key] = $documents;
+        }
+        $catalogueKey = $this->prefix . 'all_terms';
+        $catalogue = $cache->get($catalogueKey);
+        $catalogue = is_array($catalogue) ? array_map('strval', $catalogue) : [];
+        $writes[$catalogueKey] = array_values(array_unique([...$catalogue, ...array_map('strval', array_keys($frequencies))]));
+        if ($cache->multiSet($writes, 0) !== []) {
+            throw new \RuntimeException('Unable to publish search cache postings.');
+        }
+    }
     // =========================================================================
     // DOCUMENT OPERATIONS
     // =========================================================================
@@ -68,12 +183,12 @@ class CraftCacheSearchAdapter extends BaseSearchAdapter
         }
 
         $lengths = [];
-        
+
         // Note: Craft cache doesn't support batch operations, so we iterate
         foreach ($docIds as $docId) {
             $docKey = $this->prefix . "doc:$docId";
             $docData = Craft::$app->cache->get($docKey);
-            
+
             if ($docData === false || !is_array($docData)) {
                 $lengths[$docId] = 0;
             } else {
@@ -93,7 +208,7 @@ class CraftCacheSearchAdapter extends BaseSearchAdapter
     protected function deleteDocument(int $siteId, int $elementId): void
     {
         $docKey = $this->prefix . "doc:{$siteId}:{$elementId}";
-        Craft::$app->cache->delete($docKey);
+        $this->deletePersistent($docKey);
     }
 
     /**
@@ -112,7 +227,7 @@ class CraftCacheSearchAdapter extends BaseSearchAdapter
             '_length' => $docLen,
         ];
 
-        Craft::$app->cache->set($docKey, $docData);
+        $this->setPersistent($docKey, $docData);
     }
 
 
@@ -120,6 +235,23 @@ class CraftCacheSearchAdapter extends BaseSearchAdapter
     // =========================================================================
     // TERM OPERATIONS
     // =========================================================================
+
+    protected function getTermDocumentsBatch(array $terms): array
+    {
+        $terms = array_map('strval', $terms);
+        if ($terms === []) {
+            return [];
+        }
+        $keys = array_map(fn(string $term): string => $this->prefix . 'term:' . $term, $terms);
+        $values = Craft::$app->getCache()->multiGet($keys);
+        $result = [];
+        foreach ($terms as $index => $term) {
+            $value = $values[$keys[$index]] ?? false;
+            $result[$term] = is_array($value) ? $value : [];
+        }
+
+        return $result;
+    }
 
     /**
      * Get all documents containing a specific term
@@ -149,38 +281,40 @@ class CraftCacheSearchAdapter extends BaseSearchAdapter
      */
     protected function getAllTerms(): array
     {
-        $allTermsKey = $this->prefix . 'all_terms';
-        $terms = Craft::$app->cache->get($allTermsKey);
+        return $this->withPublicationGuard(function(): array {
+            $allTermsKey = $this->prefix . 'all_terms';
+            $terms = Craft::$app->cache->get($allTermsKey);
 
-        if ($terms === false || !is_array($terms)) {
-            // This is a fallback method to find all terms
-            // It's less efficient but necessary for the first run
-            $terms = [];
-            $docs = Craft::$app->cache->get($this->prefix . 'meta:docs');
+            if ($terms === false || !is_array($terms)) {
+                // This is a fallback method to find all terms
+                // It's less efficient but necessary for the first run
+                $terms = [];
+                $docs = Craft::$app->cache->get($this->prefix . 'meta:docs');
 
-            if ($docs === false || !is_array($docs)) {
-                return [];
-            }
-
-            foreach (array_keys($docs) as $docId) {
-                $docKey = $this->prefix . "doc:$docId";
-                $docData = Craft::$app->cache->get($docKey);
-
-                if ($docData === false || !is_array($docData)) {
-                    continue;
+                if ($docs === false || !is_array($docs)) {
+                    return [];
                 }
 
-                if (isset($docData['terms']) && is_array($docData['terms'])) {
-                    $terms = array_merge($terms, array_keys($docData['terms']));
+                foreach (array_keys($docs) as $docId) {
+                    $docKey = $this->prefix . "doc:$docId";
+                    $docData = Craft::$app->cache->get($docKey);
+
+                    if ($docData === false || !is_array($docData)) {
+                        continue;
+                    }
+
+                    if (isset($docData['terms']) && is_array($docData['terms'])) {
+                        $terms = array_merge($terms, array_keys($docData['terms']));
+                    }
                 }
+
+                $terms = array_unique($terms);
+                // Cache the terms for future use
+                $this->setPersistent($allTermsKey, $terms);
             }
 
-            $terms = array_unique($terms);
-            // Cache the terms for future use
-            Craft::$app->cache->set($allTermsKey, $terms);
-        }
-
-        return $terms;
+            return $terms;
+        });
     }
 
     /**
@@ -190,17 +324,20 @@ class CraftCacheSearchAdapter extends BaseSearchAdapter
      */
     protected function addTermToIndex(string $term): void
     {
-        $allTermsKey = $this->prefix . 'all_terms';
-        $terms = Craft::$app->cache->get($allTermsKey);
+        $this->withPublicationGuard(function() use ($term): void {
+            $allTermsKey = $this->prefix . 'all_terms';
+            $terms = Craft::$app->cache->get($allTermsKey);
 
-        if ($terms === false || !is_array($terms)) {
-            $terms = [];
-        }
+            if ($terms === false || !is_array($terms)) {
+                $terms = [];
+            }
 
-        if (!in_array($term, $terms)) {
-            $terms[] = $term;
-            Craft::$app->cache->set($allTermsKey, $terms);
-        }
+            $terms = array_map('strval', $terms);
+            if (!in_array($term, $terms, true)) {
+                $terms[] = $term;
+                $this->setPersistent($allTermsKey, $terms);
+            }
+        });
     }
 
     /**
@@ -212,18 +349,20 @@ class CraftCacheSearchAdapter extends BaseSearchAdapter
      */
     protected function removeTermDocument(string $term, int $siteId, int $elementId): void
     {
-        $termKey = $this->prefix . "term:$term";
-        $termDocs = Craft::$app->cache->get($termKey);
+        $this->withPublicationGuard(function() use ($term, $siteId, $elementId): void {
+            $termKey = $this->prefix . "term:$term";
+            $termDocs = Craft::$app->cache->get($termKey);
 
-        // Handle false return from cache
-        if ($termDocs === false || !is_array($termDocs)) {
-            return;
-        }
+            // Handle false return from cache
+            if ($termDocs === false || !is_array($termDocs)) {
+                return;
+            }
 
-        if (isset($termDocs["{$siteId}:{$elementId}"])) {
-            unset($termDocs["{$siteId}:{$elementId}"]);
-            Craft::$app->cache->set($termKey, $termDocs);
-        }
+            if (isset($termDocs["{$siteId}:{$elementId}"])) {
+                unset($termDocs["{$siteId}:{$elementId}"]);
+                $this->setPersistent($termKey, $termDocs);
+            }
+        });
     }
 
     /**
@@ -236,20 +375,22 @@ class CraftCacheSearchAdapter extends BaseSearchAdapter
      */
     protected function storeTermDocument(string $term, int $siteId, int $elementId, int $freq): void
     {
-        $termKey = $this->prefix . "term:$term";
-        $termDocs = Craft::$app->cache->get($termKey);
+        $this->withPublicationGuard(function() use ($term, $siteId, $elementId, $freq): void {
+            $termKey = $this->prefix . "term:$term";
+            $termDocs = Craft::$app->cache->get($termKey);
 
-        // Handle false return from cache
-        if ($termDocs === false || !is_array($termDocs)) {
-            $termDocs = [];
-        }
+            // Handle false return from cache
+            if ($termDocs === false || !is_array($termDocs)) {
+                $termDocs = [];
+            }
 
-        $termDocs["{$siteId}:{$elementId}"] = $freq;
+            $termDocs["{$siteId}:{$elementId}"] = $freq;
 
-        Craft::$app->cache->set($termKey, $termDocs);
+            $this->setPersistent($termKey, $termDocs);
 
-        // Update the all terms index
-        $this->addTermToIndex($term);
+            // Update the all terms index
+            $this->addTermToIndex($term);
+        });
     }
 
 
@@ -261,21 +402,24 @@ class CraftCacheSearchAdapter extends BaseSearchAdapter
      */
     protected function removeTermFromIndex(string $term): void
     {
-        // Remove the term from the all_terms list
-        $allTermsKey = $this->prefix . 'all_terms';
-        $terms = Craft::$app->cache->get($allTermsKey);
+        $this->withPublicationGuard(function() use ($term): void {
+            // Remove the term from the all_terms list
+            $allTermsKey = $this->prefix . 'all_terms';
+            $terms = Craft::$app->cache->get($allTermsKey);
 
-        if ($terms !== false && is_array($terms)) {
-            $key = array_search($term, $terms);
-            if ($key !== false) {
-                unset($terms[$key]);
-                Craft::$app->cache->set($allTermsKey, array_values($terms));
+            if ($terms !== false && is_array($terms)) {
+                $terms = array_map('strval', $terms);
+                $key = array_search($term, $terms, true);
+                if ($key !== false) {
+                    unset($terms[$key]);
+                    $this->setPersistent($allTermsKey, array_values($terms));
+                }
             }
-        }
 
-        // Delete the term's document list
-        $termKey = $this->prefix . "term:$term";
-        Craft::$app->cache->delete($termKey);
+            // Delete the term's document list
+            $termKey = $this->prefix . "term:$term";
+            $this->deletePersistent($termKey);
+        });
     }
 
     // =========================================================================
@@ -290,18 +434,20 @@ class CraftCacheSearchAdapter extends BaseSearchAdapter
      */
     protected function addDocumentToIndex(int $siteId, int $elementId): void
     {
-        $metaKey = $this->prefix . "meta";
-        $docsKey = $metaKey . ':docs';
-        $docs = Craft::$app->cache->get($docsKey);
+        $this->withPublicationGuard(function() use ($siteId, $elementId): void {
+            $metaKey = $this->prefix . "meta";
+            $docsKey = $metaKey . ':docs';
+            $docs = Craft::$app->cache->get($docsKey);
 
-        // Handle false return from cache
-        if ($docs === false || !is_array($docs)) {
-            $docs = [];
-        }
+            // Handle false return from cache
+            if ($docs === false || !is_array($docs)) {
+                $docs = [];
+            }
 
-        $docs["{$siteId}:{$elementId}"] = true;
+            $docs["{$siteId}:{$elementId}"] = true;
 
-        Craft::$app->cache->set($docsKey, $docs);
+            $this->setPersistent($docsKey, $docs);
+        });
     }
 
     /**
@@ -309,18 +455,20 @@ class CraftCacheSearchAdapter extends BaseSearchAdapter
      */
     protected function updateTotalDocCount(): void
     {
-        $metaKey = $this->prefix . "meta";
-        $docsKey = $metaKey . ':docs';
-        $docs = Craft::$app->cache->get($docsKey);
+        $this->withPublicationGuard(function(): void {
+            $metaKey = $this->prefix . "meta";
+            $docsKey = $metaKey . ':docs';
+            $docs = Craft::$app->cache->get($docsKey);
 
-        // Handle false return from cache
-        if ($docs === false || !is_array($docs)) {
-            $docs = [];
-        }
+            // Handle false return from cache
+            if ($docs === false || !is_array($docs)) {
+                $docs = [];
+            }
 
-        $totalDocs = count($docs);
+            $totalDocs = count($docs);
 
-        Craft::$app->cache->set($metaKey . ':totalDocs', $totalDocs);
+            $this->setPersistent($metaKey . ':totalDocs', $totalDocs);
+        });
     }
 
     /**
@@ -330,16 +478,18 @@ class CraftCacheSearchAdapter extends BaseSearchAdapter
      */
     protected function updateTotalLength(int $docLen): void
     {
-        $metaKey = $this->prefix . "meta";
-        $totalLengthKey = $metaKey . ':totalLength';
-        $totalLength = Craft::$app->cache->get($totalLengthKey);
+        $this->withPublicationGuard(function() use ($docLen): void {
+            $metaKey = $this->prefix . "meta";
+            $totalLengthKey = $metaKey . ':totalLength';
+            $totalLength = Craft::$app->cache->get($totalLengthKey);
 
-        // Handle false return from cache
-        if ($totalLength === false || !is_numeric($totalLength)) {
-            $totalLength = 0;
-        }
+            // Handle false return from cache
+            if ($totalLength === false || !is_numeric($totalLength)) {
+                $totalLength = 0;
+            }
 
-        Craft::$app->cache->set($totalLengthKey, $totalLength + $docLen);
+            $this->setPersistent($totalLengthKey, $totalLength + $docLen);
+        });
     }
 
     /**
@@ -349,10 +499,10 @@ class CraftCacheSearchAdapter extends BaseSearchAdapter
      */
     protected function getTotalDocCount(): int
     {
-        $metaKey = $this->prefix . "meta";
-        $totalDocsKey = $metaKey . ':totalDocs';
+        $this->ensureIndexMetadata();
+        $value = Craft::$app->getCache()->get($this->prefix . 'meta:totalDocs');
 
-        return (int)(Craft::$app->cache->get($totalDocsKey) ?? 0);
+        return $this->requireMetadataCounter($value);
     }
 
     /**
@@ -362,10 +512,10 @@ class CraftCacheSearchAdapter extends BaseSearchAdapter
      */
     protected function getTotalLength(): int
     {
-        $metaKey = $this->prefix . "meta";
-        $totalLengthKey = $metaKey . ':totalLength';
+        $this->ensureIndexMetadata();
+        $value = Craft::$app->getCache()->get($this->prefix . 'meta:totalLength');
 
-        return (int)(Craft::$app->cache->get($totalLengthKey) ?? 0);
+        return $this->requireMetadataCounter($value);
     }
 
     // =========================================================================
@@ -382,7 +532,7 @@ class CraftCacheSearchAdapter extends BaseSearchAdapter
     protected function storeTitleTerms(int $siteId, int $elementId, array $titleTerms): void
     {
         $titleKey = $this->prefix . "title:{$siteId}:{$elementId}";
-        Craft::$app->cache->set($titleKey, $titleTerms);
+        $this->setPersistent($titleKey, $titleTerms);
     }
 
     /**
@@ -412,7 +562,7 @@ class CraftCacheSearchAdapter extends BaseSearchAdapter
     protected function deleteTitleTerms(int $siteId, int $elementId): void
     {
         $titleKey = $this->prefix . "title:{$siteId}:{$elementId}";
-        Craft::$app->cache->delete($titleKey);
+        $this->deletePersistent($titleKey);
     }
 
     // =========================================================================
@@ -457,20 +607,22 @@ class CraftCacheSearchAdapter extends BaseSearchAdapter
      */
     protected function removeDocumentFromIndex(int $siteId, int $elementId): void
     {
-        $metaKey = $this->prefix . "meta";
-        $docsKey = $metaKey . ':docs';
-        $docs = Craft::$app->cache->get($docsKey);
+        $this->withPublicationGuard(function() use ($siteId, $elementId): void {
+            $metaKey = $this->prefix . "meta";
+            $docsKey = $metaKey . ':docs';
+            $docs = Craft::$app->cache->get($docsKey);
 
-        // Handle false return from cache
-        if ($docs === false || !is_array($docs)) {
-            return;
-        }
+            // Handle false return from cache
+            if ($docs === false || !is_array($docs)) {
+                return;
+            }
 
-        $docId = "{$siteId}:{$elementId}";
-        if (isset($docs[$docId])) {
-            unset($docs[$docId]);
-            Craft::$app->cache->set($docsKey, $docs);
-        }
+            $docId = "{$siteId}:{$elementId}";
+            if (isset($docs[$docId])) {
+                unset($docs[$docId]);
+                $this->setPersistent($docsKey, $docs);
+            }
+        });
     }
 
     /**
@@ -478,9 +630,11 @@ class CraftCacheSearchAdapter extends BaseSearchAdapter
      */
     protected function resetTotalLength(): void
     {
-        $metaKey = $this->prefix . "meta";
-        $totalLengthKey = $metaKey . ':totalLength';
-        Craft::$app->cache->set($totalLengthKey, 0);
+        $this->withPublicationGuard(function(): void {
+            $metaKey = $this->prefix . "meta";
+            $totalLengthKey = $metaKey . ':totalLength';
+            $this->setPersistent($totalLengthKey, 0);
+        });
     }
 
     // =========================================================================
@@ -495,9 +649,9 @@ class CraftCacheSearchAdapter extends BaseSearchAdapter
         if (empty($ngrams)) {
             return;
         }
-        
+
         $ngramKey = $this->prefix . "ngrams:{$siteId}:{$term}";
-        Craft::$app->cache->set($ngramKey, $ngrams);
+        $this->setPersistent($ngramKey, $ngrams);
     }
 
     /**
@@ -543,8 +697,11 @@ class CraftCacheSearchAdapter extends BaseSearchAdapter
      */
     protected function clearNgrams(int $siteId): void
     {
-        // Cache doesn't support pattern-based deletion, so this is a no-op
-        // N-grams will expire naturally or be overwritten
+        $this->withPublicationGuard(function() use ($siteId): void {
+            foreach ($this->getAllTerms() as $term) {
+                $this->removeTermNgrams((string)$term, $siteId);
+            }
+        });
     }
 
     /**
@@ -553,6 +710,6 @@ class CraftCacheSearchAdapter extends BaseSearchAdapter
     protected function removeTermNgrams(string $term, int $siteId): void
     {
         $ngramKey = $this->prefix . "ngrams:{$siteId}:{$term}";
-        Craft::$app->cache->delete($ngramKey);
+        $this->deletePersistent($ngramKey);
     }
 }

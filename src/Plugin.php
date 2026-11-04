@@ -3,19 +3,14 @@
 namespace MadeByBramble\BrambleSearch;
 
 use Craft;
+use craft\base\Element;
 use craft\base\Plugin as BasePlugin;
 use craft\console\Application as ConsoleApplication;
-use craft\controllers\ElementIndexesController;
-use craft\db\Query;
 use craft\elements\db\ElementQuery;
 use craft\events\RegisterCacheOptionsEvent;
+use craft\events\RegisterElementSearchableAttributesEvent;
 use craft\helpers\App;
-use craft\helpers\Component;
-use craft\helpers\ElementHelper;
-use craft\helpers\Queue as QueueHelper;
-use craft\queue\Queue as CraftQueue;
 use craft\search\SearchQuery;
-use craft\services\ElementSources;
 use craft\utilities\ClearCaches;
 
 use MadeByBramble\BrambleSearch\adapters\BaseSearchAdapter;
@@ -24,9 +19,11 @@ use MadeByBramble\BrambleSearch\adapters\FileSearchAdapter;
 use MadeByBramble\BrambleSearch\adapters\MongoDbSearchAdapter;
 use MadeByBramble\BrambleSearch\adapters\MySqlSearchAdapter;
 use MadeByBramble\BrambleSearch\adapters\RedisSearchAdapter;
-use MadeByBramble\BrambleSearch\jobs\RebuildIndexJob;
+use MadeByBramble\BrambleSearch\helpers\RebuildState;
+use MadeByBramble\BrambleSearch\jobs\FreshSearchIndexJob;
 use MadeByBramble\BrambleSearch\models\Settings;
 use yii\base\Event;
+use yii\base\ModelEvent;
 
 /**
  * Bramble Search Plugin
@@ -56,7 +53,7 @@ class Plugin extends BasePlugin
      *
      * @var string
      */
-    public string $schemaVersion = '1.0.2';
+    public string $schemaVersion = '1.0.5';
 
     /**
      * Indicates that the plugin has Control Panel settings.
@@ -65,6 +62,13 @@ class Plugin extends BasePlugin
      * @var bool
      */
     public bool $hasCpSettings = true;
+
+    private ?\yii\mutex\Mutex $indexMutex = null;
+
+    public function getIndexMutex(): \yii\mutex\Mutex
+    {
+        return $this->indexMutex ??= Craft::createObject(App::dbMutexConfig());
+    }
 
     /**
      * Initializes the plugin.
@@ -193,8 +197,8 @@ class Plugin extends BasePlugin
      *
      * This method sets up event listeners for:
      * - Cache clearing options in the Control Panel
-     * - Element index controller actions for accurate search counts
-     * - Element query preparation to intercept search queries
+     * - Native lifecycle indexing and element deletion
+     * - Raw zero search compatibility during query preparation
      *
      * @return void
      */
@@ -224,27 +228,34 @@ class Plugin extends BasePlugin
             }
         );
 
-        // Hook into the element index controller to modify the count elements response
         Event::on(
-            ElementIndexesController::class,
-            ElementIndexesController::EVENT_AFTER_ACTION,
-            [$this, 'handleElementCountAction']
+            \yii\queue\Queue::class,
+            \yii\queue\Queue::EVENT_BEFORE_EXEC,
+            function(\yii\queue\ExecEvent $event): void {
+                if ($event->job instanceof \craft\queue\jobs\UpdateSearchIndex
+                    && get_class($event->job) === \craft\queue\jobs\UpdateSearchIndex::class
+                    && Craft::$app->getSearch() instanceof BaseSearchAdapter) {
+                    $event->job = new FreshSearchIndexJob(get_object_vars($event->job));
+                }
+            }
         );
 
-        // Hook into the ElementQuery's prepare method to intercept all element queries with search parameters
         Event::on(
             ElementQuery::class,
             ElementQuery::EVENT_BEFORE_PREPARE,
-            [$this, 'handleElementQueryPrepare']
+            [$this, 'handleZeroSearchQuery']
         );
 
-        // Ensure new elements are indexed on creation
-        // Craft's native indexing only triggers if there are dirty fields/attributes,
-        // which might not be the case for new elements
-        // Register on the instance, not the class, to ensure it's active
-        Craft::$app->getElements()->on(
-            \craft\services\Elements::EVENT_AFTER_SAVE_ELEMENT,
-            [$this, 'handleElementSave']
+        Event::on(
+            Element::class,
+            Element::EVENT_REGISTER_SEARCHABLE_ATTRIBUTES,
+            [$this, 'handleSearchableAttributes']
+        );
+
+        Event::on(
+            Element::class,
+            Element::EVENT_AFTER_SAVE,
+            [$this, 'handleElementAfterSave']
         );
 
         Craft::$app->getElements()->on(
@@ -255,6 +266,11 @@ class Plugin extends BasePlugin
         Craft::$app->getElements()->on(
             \craft\services\Elements::EVENT_AFTER_DELETE_FOR_SITE,
             [$this, 'handleElementDelete']
+        );
+
+        Craft::$app->getElements()->on(
+            \craft\services\Elements::EVENT_AFTER_RESTORE_ELEMENT,
+            [$this, 'handleElementRestore']
         );
 
         $this->registerCommerceEventHandlers();
@@ -301,488 +317,45 @@ class Plugin extends BasePlugin
      */
     protected function queueRebuildIndexJob(int $siteId): void
     {
-        $mutexName = "bramble-search:rebuild-index-queue:$siteId";
-        $mutex = Craft::$app->getMutex();
-
-        if (!$mutex->acquire($mutexName, 5)) {
-            Craft::warning(
-                "Bramble Search rebuild queue lock could not be acquired for site ID: $siteId; skipping duplicate queue request.",
-                'bramble-search'
-            );
-            return;
+        $adapter = Craft::$app->getSearch();
+        if (!($adapter instanceof BaseSearchAdapter)) {
+            throw new \RuntimeException('Bramble Search is not the active search service.');
         }
-
-        try {
-            if ($this->hasQueuedRebuildIndexJob($siteId)) {
-                Craft::info(
-                    "Bramble Search rebuild is already queued or running for site ID: $siteId; skipping duplicate queue request.",
-                    'bramble-search'
-                );
-
-                $request = Craft::$app->getRequest();
-                if ($request instanceof \craft\web\Request && $request->getIsCpRequest()) {
-                    Craft::$app->getSession()->setNotice(Craft::t(
-                        'bramble-search',
-                        'Bramble Search rebuild is already queued or running.'
-                    ));
-                }
-
-                return;
-            }
-
-            if (
-                Craft::$app->getQueue() instanceof CraftQueue &&
-                RebuildIndexJob::clearRebuildLockForSite($siteId)
-            ) {
-                Craft::warning(
-                    "Cleared stale Bramble Search rebuild lock for site ID: $siteId before queueing a new rebuild.",
-                    'bramble-search'
-                );
-            }
-
-            QueueHelper::push(new RebuildIndexJob([
-                'siteId' => $siteId,
-            ]));
-        } finally {
-            $mutex->release($mutexName);
-        }
-    }
-
-    /**
-     * Checks whether a Bramble Search rebuild job is already waiting or running.
-     *
-     * @param int $siteId
-     * @return bool
-     */
-    protected function hasQueuedRebuildIndexJob(int $siteId): bool
-    {
-        $queue = Craft::$app->getQueue();
-        if (!($queue instanceof CraftQueue)) {
-            return false;
-        }
-
-        $rows = (new Query())
-            ->select(['id', 'job'])
-            ->from($queue->tableName)
-            ->where([
-                'channel' => $this->queueChannel($queue),
-                'fail' => false,
-            ])
-            ->all($queue->db);
-
-        foreach ($rows as $row) {
-            [$job, $error] = $queue->unserializeMessage($this->queueJobData($row['job']));
-            if ($error !== null || !($job instanceof RebuildIndexJob)) {
-                continue;
-            }
-
-            if ($job->siteId === null || (int)$job->siteId === $siteId) {
-                return true;
-            }
-        }
-
-        return false;
-    }
-
-    /**
-     * Returns the queue channel value Craft uses for the queue component.
-     *
-     * @param CraftQueue $queue
-     * @return string
-     */
-    protected function queueChannel(CraftQueue $queue): string
-    {
-        if ($queue->channel !== null) {
-            return $queue->channel;
-        }
-
-        foreach (Craft::$app->getComponents(false) as $id => $component) {
-            if ($component === $queue) {
-                return (string)$id;
-            }
-        }
-
-        return 'queue';
-    }
-
-    /**
-     * Normalizes queue job data before passing it to Yii's queue serializer.
-     *
-     * @param mixed $job
-     * @return string
-     */
-    protected function queueJobData(mixed $job): string
-    {
-        if (is_resource($job)) {
-            $job = stream_get_contents($job);
-
-            if (is_string($job) && str_starts_with($job, 'x')) {
-                $hex = substr($job, 1);
-                if (ctype_xdigit($hex)) {
-                    $job = hex2bin($hex);
-                }
-            }
-        }
-
-        return (string)$job;
-    }
-
-    /**
-     * Handles the ElementQuery prepare event to intercept search queries for exports.
-     *
-     * This method intercepts ElementQuery objects with search parameters during export
-     * operations and modifies them to use Bramble Search results instead of Craft's
-     * default search functionality.
-     *
-     * Also ensures orderBy['score'] is set when shouldCallSearchElements() returns true,
-     * to prevent Craft from accessing a non-existent array key.
-     *
-     * @param Event $event The event object containing the ElementQuery
-     * @return void
-     */
-    public function handleElementQueryPrepare(Event $event): void
-    {
-        /** @var ElementQuery $query */
-        $query = $event->sender;
-
-        // Check if this is a search query
-        if (!empty($query->search)) {
-            Craft::info(
-                sprintf(
-                    'Bramble Search: Intercepted ElementQuery with search: "%s"',
-                    $this->normalizeSearchQueryForLogging($query->search)
-                ),
-                'bramble-search'
-            );
-
-            // Get the search service
-            $searchService = Craft::$app->getSearch();
-
-            // Check if it's one of our adapters
-            if ($searchService instanceof BaseSearchAdapter) {
-                // CRITICAL FIX: Ensure orderBy['score'] is set when shouldCallSearchElements() returns true
-                // Craft's _applySearchParam() method accesses orderBy['score'] without checking if it exists
-                // when shouldCallSearchElements() returns true, causing "Undefined array key 'score'" errors
-                if ($searchService->shouldCallSearchElements($query)) {
-                    // Initialize orderBy if it doesn't exist
-                    if (!is_array($query->orderBy)) {
-                        $query->orderBy = [];
-                    }
-                    // Set orderBy['score'] to SORT_DESC (default) if it's not already set
-                    // This prevents Craft from trying to access a non-existent array key
-                    if (!isset($query->orderBy['score'])) {
-                        $query->orderBy['score'] = SORT_DESC;
-                    }
-                }
-
-                // Get the current request
-                $request = Craft::$app->getRequest();
-
-                // Check if this is an export request (only applicable for web requests)
-                $isExport = false;
-                if ($request instanceof \craft\web\Request) {
-                    $path = $request->getPathInfo();
-                    if (
-                        strpos($path, 'element-indexes/export') !== false ||
-                        (strpos($path, 'actions/element-indexes/export') !== false)
-                    ) {
-                        $isExport = true;
-                    }
-                }
-
-                if ($isExport) {
-                    Craft::info(
-                        sprintf(
-                            'Bramble Search: Modifying export query for search: "%s"',
-                            $this->normalizeSearchQueryForLogging($query->search)
-                        ),
-                        'bramble-search'
-                    );
-
-                    // Perform the search using our adapter
-                    $searchResults = $searchService->searchElements($query);
-
-                    if (empty($searchResults)) {
-                        // If no results, set an impossible condition to return no results
-                        $query->id(0);
-                    } else {
-                        // Set the element IDs based on our search results
-                        $elementIds = [];
-                        foreach (array_keys($searchResults) as $key) {
-                            [$elementId,] = explode('-', $key);
-                            $elementIds[] = $elementId;
-                        }
-
-                        // Set the element IDs in the query and remove the search parameter
-                        $query->id($elementIds);
-                        $query->search = null;
-
-                        Craft::info(
-                            sprintf(
-                                'Bramble Search: Modified export query with %d results',
-                                count($searchResults)
-                            ),
-                            'bramble-search'
-                        );
-                    }
-                }
-            }
-        }
-    }
-
-    /**
-     * Handles the element count action to provide accurate search counts.
-     *
-     * This method intercepts the response from the ElementIndexesController's
-     * countElements action and updates the count to reflect the actual number
-     * of search results when using Bramble Search.
-     *
-     * @param Event $event The event object containing the controller and response
-     * @return void
-     */
-    public function handleElementCountAction(Event $event): void
-    {
-        /** @var ElementIndexesController $controller */
-        $controller = $event->sender;
-
-        // Only intercept the countElements action
-        if ($controller->action->id !== 'count-elements') {
-            return;
-        }
-
-        // Get the response data
-        $responseData = $controller->response->data;
-
-        // Check if this is a search response
-        if (!isset($responseData['total']) || !isset($responseData['resultSet'])) {
-            return;
-        }
-
-        // Get the search query from the request
-        $searchQuery = $this->getSearchQueryFromRequest();
-
-        if (empty($searchQuery)) {
-            return;
-        }
-
-        // Get the search service
-        $searchService = Craft::$app->getSearch();
-
-        // Check if it's one of our adapters
-        if (!($searchService instanceof BaseSearchAdapter)) {
-            return;
-        }
-
-        // Create a temporary element query to perform the search
-        $elementType = $this->getElementTypeFromRequest();
-        if (!$elementType) {
-            return;
-        }
-
-        // Get search results (unfiltered by criteria — just the search term)
-        $searchQuery_temp = $elementType::find();
-        $searchQuery_temp->search = $searchQuery;
-
-        // Set the site ID
-        $siteId = Craft::$app->getRequest()->getParam('siteId');
-        if (!$siteId) {
-            $siteId = Craft::$app->getSites()->getCurrentSite()->id;
-        }
-        $searchQuery_temp->siteId = $siteId;
-
-        $searchResults = $searchService->searchElements($searchQuery_temp);
-
-        if (empty($searchResults)) {
-            $controller->response->data = [
-                'resultSet' => $responseData['resultSet'],
-                'total' => 0,
-                'unfilteredTotal' => $responseData['unfilteredTotal'] ?? 0,
-            ];
-            return;
-        }
-
-        // Extract element IDs from search results
-        $elementIds = [];
-        foreach (array_keys($searchResults) as $key) {
-            [$elementId,] = explode('-', $key);
-            $elementIds[] = (int)$elementId;
-        }
-
-        // Start from Craft's prepared element index query so active sources,
-        // base criteria, custom sources, filters, and user criteria are preserved.
-        /** @var ElementQuery $query */
-        $query = clone $controller->getElementQuery();
-        $query->siteId = $siteId;
-
-        // Native source criteria can be supplied only by the source key, so make
-        // sure the replacement count query has the same source constraint.
-        $this->applySourceCriteriaFromRequest($query, $elementType);
-
-        // Constrain to only the element IDs that matched our search
-        $query->id($elementIds);
-
-        // Remove the search param so Craft doesn't try to use its native search
-        $query->search = null;
-        $query->offset(null);
-        $query->limit(null);
-
-        // Count the filtered results
-        $total = $query->count();
-
-        // Log the count update for debugging
-        Craft::info(
-            sprintf(
-                'Bramble Search: Updating count from %d to %d for search: "%s" (search matched %d, after criteria filtering %d)',
-                $responseData['total'] ?? 0,
-                $total,
-                $searchQuery,
-                count($searchResults),
-                $total
-            ),
-            'bramble-search'
-        );
-
-        // Update the response data
-        $controller->response->data = [
-            'resultSet' => $responseData['resultSet'],
-            'total' => $total,
-            'unfilteredTotal' => $responseData['unfilteredTotal'] ?? $total,
-        ];
-    }
-
-    /**
-     * Applies the active element index source criteria to a replacement count query.
-     *
-     * @param ElementQuery $query The query being used for the replacement count
-     * @param string $elementType The element type class from the request
-     * @return void
-     */
-    protected function applySourceCriteriaFromRequest(ElementQuery $query, string $elementType): void
-    {
+        $queued = RebuildState::enqueue($adapter, $siteId);
         $request = Craft::$app->getRequest();
-        $sourceKey = $request->getParam('source');
-        if (!$sourceKey || $sourceKey === '__IMP__') {
-            return;
+        if (!$queued && $request instanceof \craft\web\Request && $request->getIsCpRequest()) {
+            Craft::$app->getSession()->setNotice(Craft::t('bramble-search', 'Bramble Search rebuild is already queued or running.'));
         }
-
-        $context = $request->getParam('context') ?: ElementSources::CONTEXT_INDEX;
-        $source = ElementHelper::findSource($elementType, $sourceKey, $context);
-        $criteria = $source['criteria'] ?? null;
-
-        if (is_array($criteria)) {
-            Craft::configure($query, Component::cleanseConfig($criteria));
+    }
+    public function handleZeroSearchQuery(Event $event): void
+    {
+        if ($event->sender->search === '0' && Craft::$app->getSearch() instanceof BaseSearchAdapter) {
+            $event->sender->search(new SearchQuery('0'));
         }
     }
 
-    /**
-     * Extracts the search query from the current request.
-     *
-     * This method checks various locations where a search query might be found
-     * in the request, including direct parameters, criteria arrays, and body parameters.
-     *
-     * @return string|null The search query string if found, null otherwise
-     */
-    protected function getSearchQueryFromRequest(): ?string
+    public function handleSearchableAttributes(RegisterElementSearchableAttributesEvent $event): void
     {
-        $request = Craft::$app->getRequest();
-
-        // Check direct search parameter
-        $searchQuery = $request->getParam('search');
-        if (!empty($searchQuery)) {
-            return $searchQuery;
+        if (!(Craft::$app->getSearch() instanceof BaseSearchAdapter)) {
+            return;
         }
 
-        // Check criteria parameter
-        $criteria = $request->getParam('criteria');
-        if (is_array($criteria) && isset($criteria['search'])) {
-            return $criteria['search'];
-        }
-
-        // Check body parameters
-        $bodyParams = $request->getBodyParams();
-        if (isset($bodyParams['search'])) {
-            return $bodyParams['search'];
-        } elseif (isset($bodyParams['criteria']) && is_array($bodyParams['criteria']) && isset($bodyParams['criteria']['search'])) {
-            return $bodyParams['criteria']['search'];
-        }
-
-        return null;
+        $event->attributes = array_values(array_unique([...$event->attributes, 'enabled', 'enabledForSite']));
     }
 
-    /**
-     * Determines the element type class from the current request.
-     *
-     * This method attempts to extract the element type from request parameters,
-     * body parameters, or context clues. If no element type can be determined,
-     * it returns null.
-     *
-     * @return string|null The fully qualified element type class name if found, null otherwise
-     */
-    protected function getElementTypeFromRequest(): ?string
+    /** Keeps first publication on Craft's ordinary suppressed/coalesced scheduling path. */
+    public function handleElementAfterSave(ModelEvent $event): void
     {
-        $request = Craft::$app->getRequest();
-
-        // Check direct elementType parameter
-        $elementType = $request->getParam('elementType');
-        if ($elementType) {
-            return $elementType;
-        }
-
-        // Check body params for elementType
-        $bodyParams = $request->getBodyParams();
-        if (isset($bodyParams['elementType'])) {
-            return $bodyParams['elementType'];
-        }
-
-        // Try to determine element type from context
-        $context = $request->getParam('context');
-        if (strpos($context, 'index') !== false) {
-            // Default to Entry for most common case
-            return 'craft\\elements\\Entry';
-        }
-
-        return null;
-    }
-
-
-    /**
-     * Handles element save events to ensure new elements are indexed.
-     *
-     * Craft's native search indexing only triggers if there are dirty fields/attributes,
-     * which might not be detected for new elements. This handler ensures new elements
-     * are always indexed, including when they're first published from drafts.
-     *
-     * @param \craft\events\ElementEvent $event The element event
-     * @return void
-     */
-    public function handleElementSave(\craft\events\ElementEvent $event): void
-    {
-        $element = $event->element;
-        $isNew = $event->isNew ?? false;
-        $elementType = get_class($element);
-
-        // Skip drafts and revisions
-        if (\craft\helpers\ElementHelper::isDraftOrRevision($element)) {
+        if (!(Craft::$app->getSearch() instanceof BaseSearchAdapter)) {
             return;
         }
 
-        // Get the search service
-        $searchService = Craft::$app->getSearch();
-
-        // Check if it's one of our adapters
-        if (!($searchService instanceof BaseSearchAdapter)) {
+        $element = $event->sender;
+        if (!($element instanceof Element) || (!$element->firstSave && !$element->isNewForSite)) {
             return;
         }
 
-        // Only queue indexing for new elements. Craft handles updates once field-handle semantics are aligned.
-        if (!$isNew) {
-            return;
-        }
-
-        if ($element->id && $element->siteId) {
-            $fieldHandles = Craft::$app->getSearch()->getSearchableFieldHandles($element);
-            $searchService->queueIndexElement($element, $fieldHandles);
-        }
+        $element->setDirtyAttributes(['slug'], true);
     }
 
     /**
@@ -804,24 +377,38 @@ class Plugin extends BasePlugin
             return;
         }
 
-        $searchService->deleteElementIndex($element);
+        if ($event->name === \craft\services\Elements::EVENT_AFTER_DELETE_ELEMENT && $element::isLocalized()) {
+            foreach (array_unique([...Craft::$app->getSites()->getAllSiteIds(), $element->siteId]) as $siteId) {
+                if (!$searchService->deleteElementFromIndex($element->id, (int)$siteId)) {
+                    throw new \RuntimeException('Unable to remove a deleted element from search.');
+                }
+            }
+        } elseif (!$searchService->deleteElementIndex($element)) {
+            throw new \RuntimeException('Unable to remove a deleted element from search.');
+        }
     }
 
-    /**
-     * Normalizes a search query value to a string for logging.
-     *
-     * Handles both string search queries and SearchQuery objects.
-     *
-     * @param string|SearchQuery|null $search The search query value
-     * @return string The normalized search query string
-     */
-    protected function normalizeSearchQueryForLogging(string|SearchQuery|null $search): string
+    public function handleElementRestore(\craft\events\ElementEvent $event): void
     {
-        if ($search instanceof SearchQuery) {
-            return $search->getQuery();
+        $adapter = Craft::$app->getSearch();
+        $element = $event->element;
+        if (!($adapter instanceof BaseSearchAdapter) || !$element->id || !$element->siteId) {
+            return;
         }
-
-        return (string)$search;
+        $elements = [$element];
+        if ($element::isLocalized()) {
+            $others = $element::find()->id($element->id)->siteId('*')->status(null)->cache(false)->all();
+            foreach ($others as $localized) {
+                if ($localized->siteId !== $element->siteId) {
+                    $elements[] = $localized;
+                }
+            }
+        }
+        foreach ($elements as $restored) {
+            if (!$adapter->indexElementAttributes($restored)) {
+                throw new \RuntimeException('Unable to restore the element search index.');
+            }
+        }
     }
 
     /**

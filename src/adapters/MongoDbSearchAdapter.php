@@ -17,6 +17,317 @@ use MongoDB\Database;
  */
 class MongoDbSearchAdapter extends BaseSearchAdapter
 {
+    protected function hasPrefixDictionary(): bool
+    {
+        return true;
+    }
+
+    protected function validatePrefixLifecycleCursors(array $state): void
+    {
+        if (($state['cleanup'] !== [] && (array_keys($state['cleanup']) !== ['stage'] || !is_int($state['cleanup']['stage']) || $state['cleanup']['stage'] < 0 || $state['cleanup']['stage'] > 2))
+            || ($state['legacyCursor'] !== null && (!is_int($state['legacyCursor']) || $state['legacyCursor'] < 0 || $state['legacyCursor'] > 5))) {
+            throw new \MadeByBramble\BrambleSearch\helpers\PrefixIntegrityException('Invalid MongoDB prefix cleanup checkpoint.');
+        }
+    }
+
+    protected function prefixEpochCollections(): array
+    {
+        return [$this->prefixDictionaryCollection, $this->prefixMembershipCollection, $this->prefixDocumentsCollection];
+    }
+
+    protected function initializePrefixEpoch(int $siteId, string $epoch): void
+    {
+        foreach ($this->prefixEpochCollections() as $collection) {
+            $collection->updateOne(['_id' => "epoch:$siteId:$epoch"], ['$setOnInsert' => [
+                'siteId' => $siteId, 'epoch' => $epoch, 'version' => 2, 'kind' => 'epoch', 'term' => '', 'docId' => '',
+            ]], ['upsert' => true]);
+        }
+        $this->assertPrefixEpoch($siteId, $epoch);
+    }
+
+    protected function assertPrefixEpoch(int $siteId, string $epoch): void
+    {
+        foreach ($this->prefixEpochCollections() as $collection) {
+            $marker = $collection->findOne(['_id' => "epoch:$siteId:$epoch"]);
+            if ($marker === null || ($marker['version'] ?? null) !== 2 || ($marker['siteId'] ?? null) !== $siteId || ($marker['epoch'] ?? null) !== $epoch || ($marker['kind'] ?? null) !== 'epoch') {
+                throw new \MadeByBramble\BrambleSearch\helpers\PrefixIntegrityException('MongoDB prefix epoch marker is missing or incompatible.');
+            }
+        }
+    }
+
+    protected function prefixMembershipTerms(int $siteId, string $epoch, string $docId): array
+    {
+        $terms = [];
+        foreach ($this->prefixMembershipCollection->find(['siteId' => $siteId, 'epoch' => $epoch, 'docId' => $docId], ['projection' => ['term' => 1], 'collation' => ['locale' => 'simple'], 'batchSize' => 500]) as $row) {
+            $terms[] = (string)$row['term'];
+        }
+
+        return $this->normalizePrefixTerms($terms);
+    }
+
+    protected function publishPrefixEpochMembership(int $siteId, string $epoch, int $elementId, array $terms, bool $exists): void
+    {
+        $this->assertPrefixEpoch($siteId, $epoch);
+        $docId = "$siteId:$elementId";
+        $filter = ['siteId' => $siteId, 'epoch' => $epoch, 'docId' => $docId];
+        $previous = $this->prefixDocumentsCollection->findOne($filter);
+        $oldTerms = $this->prefixMembershipTerms($siteId, $epoch, $docId);
+        if ($exists && $previous !== null && ($previous['pending'] ?? null) === false && $oldTerms === $terms) {
+            return;
+        }
+        $journal = $this->readIndexRecord('journal:' . $docId);
+        $affected = $this->normalizePrefixTerms([
+            ...$oldTerms, ...$terms, ...($journal['oldTerms'] ?? []), ...($journal['intendedTerms'] ?? []),
+            ...($previous === null ? [] : json_decode(json_encode($previous['affected'] ?? [], JSON_THROW_ON_ERROR), true, 512, JSON_THROW_ON_ERROR)),
+        ]);
+        $this->prefixDocumentsCollection->updateOne($filter, ['$set' => ['affected' => $affected, 'pending' => true]], ['upsert' => true]);
+        $this->mutationCheckpoint('prefixPending', $siteId, $elementId);
+        $this->prefixMembershipCollection->deleteMany($filter);
+        $this->mutationCheckpoint('prefixRemoved', $siteId, $elementId);
+        foreach (array_chunk($terms, 500) as $chunk) {
+            $operations = array_map(static fn(string $term): array => ['insertOne' => [[...$filter, 'term' => $term]]], $chunk);
+            $this->prefixMembershipCollection->bulkWrite($operations, ['ordered' => true]);
+        }
+        $this->mutationCheckpoint('prefixRows', $siteId, $elementId);
+        foreach (array_chunk($affected, 500) as $chunk) {
+            $counts = [];
+            foreach ($this->prefixMembershipCollection->aggregate([
+                ['$match' => ['siteId' => $siteId, 'epoch' => $epoch, 'term' => ['$in' => $chunk]]],
+                ['$group' => ['_id' => '$term', 'count' => ['$sum' => 1]]],
+            ], ['collation' => ['locale' => 'simple']]) as $row) {
+                $counts[(string)$row['_id']] = (int)$row['count'];
+            }
+            $operations = [];
+            foreach ($chunk as $term) {
+                $termFilter = ['siteId' => $siteId, 'epoch' => $epoch, 'term' => $term];
+                $operations[] = isset($counts[$term])
+                    ? ['updateOne' => [$termFilter, ['$set' => ['count' => $counts[$term]]], ['upsert' => true]]]
+                    : ['deleteOne' => [$termFilter]];
+            }
+            $this->prefixDictionaryCollection->bulkWrite($operations, ['ordered' => true]);
+        }
+        $this->mutationCheckpoint('prefixCounts', $siteId, $elementId);
+        if ($exists) {
+            $this->prefixDocumentsCollection->updateOne($filter, ['$set' => ['pending' => false], '$unset' => ['affected' => '']]);
+        } else {
+            $this->prefixDocumentsCollection->deleteOne($filter);
+        }
+    }
+
+    protected function getTermsByPrefix(string $prefix, int $siteId, int $limit = 100): array
+    {
+        if ($prefix === '' || $limit <= 0) {
+            return [];
+        }
+
+        return $this->prefixTermsFromActiveEpoch($prefix, $siteId, $limit) ?? parent::getTermsByPrefix($prefix, $siteId, $limit);
+    }
+
+    protected function queryPrefixEpoch(int $siteId, string $epoch, string $prefix, int $limit): array
+    {
+        $matches = [];
+        foreach ($this->prefixDictionaryCollection->find([
+            'siteId' => $siteId, 'epoch' => $epoch, 'term' => new \MongoDB\BSON\Regex('^' . preg_quote($prefix, '/')),
+        ], ['sort' => ['term' => 1], 'limit' => $limit, 'projection' => ['term' => 1, 'count' => 1], 'collation' => ['locale' => 'simple']]) as $row) {
+            $count = $row['count'] ?? null;
+            if (!is_int($count) || $count < 1) {
+                throw new \MadeByBramble\BrambleSearch\helpers\PrefixIntegrityException('MongoDB prefix reference count is invalid.');
+            }
+            $term = (string)$row['term'];
+            $matches[$term] = $this->calculateTypeaheadConfidence($prefix, $term);
+        }
+        arsort($matches);
+
+        return $matches;
+    }
+
+    protected function prefixDocumentPage(int $siteId, ?string $epoch, mixed $cursor, int $limit): array
+    {
+        $collection = $epoch === null ? $this->documentsCollection : $this->prefixDocumentsCollection;
+        $filter = ['docId' => ['$gt' => $cursor ?? '']];
+        if ($siteId !== 0) {
+            $filter['siteId'] = $siteId;
+        }
+        if ($epoch !== null) {
+            $filter['epoch'] = $epoch;
+        }
+        $documents = [];
+        foreach ($collection->find($filter, ['sort' => ['docId' => 1], 'limit' => $limit, 'projection' => ['docId' => 1], 'collation' => ['locale' => 'simple']]) as $row) {
+            $documents[] = (string)$row['docId'];
+        }
+
+        return ['documents' => $documents, 'cursor' => $documents === [] ? $cursor : end($documents), 'done' => count($documents) < $limit];
+    }
+
+    protected function deletePrefixRowsPage(Collection $collection, array $filter, int $limit): bool
+    {
+        $ids = [];
+        foreach ($collection->find($filter, ['projection' => ['_id' => 1], 'limit' => $limit]) as $row) {
+            $ids[] = $row['_id'];
+        }
+        if ($ids !== []) {
+            $collection->deleteMany(['_id' => ['$in' => $ids]]);
+        }
+
+        return count($ids) < $limit;
+    }
+
+    protected function cleanupPrefixEpochStep(int $siteId, string $epoch, array $checkpoint, int $limit): array
+    {
+        $stage = $checkpoint['stage'] ?? 0;
+        if ($this->deletePrefixRowsPage($this->prefixEpochCollections()[$stage], ['siteId' => $siteId, 'epoch' => $epoch], $limit * 25)) {
+            $stage++;
+        }
+
+        return ['done' => $stage === 3, 'checkpoint' => ['stage' => $stage]];
+    }
+
+    protected function cleanupLegacyPrefixStep(int $siteId, mixed $cursor): array
+    {
+        $stage = $cursor ?? 0;
+        $collections = [$this->database->selectCollection('prefix_dictionary_v1'), $this->database->selectCollection('prefix_membership_v1'), ...$this->prefixEpochCollections()];
+        $filter = ['siteId' => $siteId];
+        if ($stage >= 2) {
+            $state = $this->prefixLifecycleState($siteId);
+            $filter['epoch'] = ['$nin' => array_values(array_filter([$state['active'], $state['building']], static fn(mixed $epoch): bool => $epoch !== null))];
+        }
+        if ($this->deletePrefixRowsPage($collections[$stage], $filter, 500)) {
+            $stage++;
+        }
+        if ($stage === count($collections)) {
+            $this->deleteIndexRecord('prefix:' . $siteId);
+        }
+
+        return ['done' => $stage === count($collections), 'cursor' => $stage];
+    }
+
+    protected function documentIsCatalogued(int $siteId, int $elementId): bool
+    {
+        return ($this->readIndexRecord("catalogue:$siteId:$elementId")['exists'] ?? false)
+            || $this->metadataCollection->findOne(['key' => 'docs', 'values' => "$siteId:$elementId"], ['projection' => ['_id' => 1]]) !== null;
+    }
+
+    protected function publishDocumentCatalogue(int $siteId, int $elementId, bool $exists, int $length): void
+    {
+        if ($exists) {
+            $this->writeIndexRecord("catalogue:$siteId:$elementId", ['exists' => true, 'length' => $length]);
+            $this->addDocumentToIndex($siteId, $elementId);
+        } else {
+            $this->removeDocumentFromIndex($siteId, $elementId);
+            $this->deleteIndexRecord("catalogue:$siteId:$elementId");
+        }
+    }
+    protected function removePostingChanges(int $siteId, int $elementId, array $terms): void
+    {
+        if ($terms === []) {
+            return;
+        }
+        $operations = [];
+        foreach ($terms as $term) {
+            $operations[] = ['updateOne' => [['term' => $term], ['$unset' => ["docs.$siteId:$elementId" => '']]]];
+            $operations[] = ['deleteOne' => [['term' => $term, 'docs' => ['$eq' => new \stdClass()]]]];
+        }
+        $this->termsCollection->bulkWrite($operations);
+    }
+    private array $storageCoordinates = [];
+    protected function getIndexedDocumentIds(): array
+    {
+        $record = $this->metadataCollection->findOne(['key' => 'docs']);
+        $values = $record['values'] ?? [];
+
+        return array_values(is_array($values) ? $values : iterator_to_array($values));
+    }
+    protected function documentExists(int $siteId, int $elementId): bool
+    {
+        return $this->documentsCollection->findOne(['docId' => "$siteId:$elementId", 'length' => ['$exists' => true]], ['projection' => ['_id' => 1]]) !== null;
+    }
+    protected function getStorageNamespace(): array
+    {
+        return $this->storageCoordinates;
+    }
+
+    protected function readIndexRecord(string $key): ?array
+    {
+        if (str_starts_with($key, 'term_sources:')) {
+            $record = $this->documentsCollection->findOne(['docId' => substr($key, 13)], ['projection' => ['sourceState' => 1]]);
+            $value = $record['sourceState'] ?? null;
+        } else {
+            $record = $this->metadataCollection->findOne(['key' => 'state:' . $key]);
+            $value = $record['state'] ?? null;
+        }
+
+        $record = $value === null ? null : json_decode(json_encode($value, JSON_THROW_ON_ERROR), true, 512, JSON_THROW_ON_ERROR);
+        if ($record !== null && !is_array($record) && str_starts_with($key, 'prefix_lifecycle:')) {
+            throw new \MadeByBramble\BrambleSearch\helpers\PrefixIntegrityException('Invalid MongoDB prefix lifecycle record.');
+        }
+
+        return $record;
+    }
+
+    protected function readIndexRecordsBatch(array $keys): array
+    {
+        $records = array_fill_keys($keys, null);
+        $docKeys = [];
+        $metaKeys = [];
+        foreach ($keys as $key) {
+            if (str_starts_with($key, 'term_sources:')) {
+                $docKeys[] = substr($key, 13);
+            } else {
+                $metaKeys[] = 'state:' . $key;
+            }
+        }
+        if ($docKeys !== []) {
+            foreach ($this->documentsCollection->find(['docId' => ['$in' => $docKeys]], ['projection' => ['docId' => 1, 'sourceState' => 1]]) as $record) {
+                $records['term_sources:' . $record['docId']] = isset($record['sourceState']) ? json_decode(json_encode($record['sourceState'], JSON_THROW_ON_ERROR), true, 512, JSON_THROW_ON_ERROR) : null;
+            }
+        }
+        if ($metaKeys !== []) {
+            foreach ($this->metadataCollection->find(['key' => ['$in' => $metaKeys]]) as $record) {
+                $records[substr($record['key'], 6)] = json_decode(json_encode($record['state'], JSON_THROW_ON_ERROR), true, 512, JSON_THROW_ON_ERROR);
+            }
+        }
+
+        return $records;
+    }
+
+    protected function writeIndexRecord(string $key, array $value): void
+    {
+        if (str_starts_with($key, 'term_sources:')) {
+            $this->documentsCollection->updateOne(['docId' => substr($key, 13)], ['$set' => ['sourceState' => $value]], ['upsert' => true]);
+        } else {
+            $this->metadataCollection->updateOne(['key' => 'state:' . $key], ['$set' => ['state' => $value]], ['upsert' => true]);
+        }
+    }
+
+    protected function deleteIndexRecord(string $key): void
+    {
+        if (str_starts_with($key, 'term_sources:')) {
+            $this->documentsCollection->updateOne(['docId' => substr($key, 13)], ['$unset' => ['sourceState' => '']]);
+            $this->documentsCollection->deleteOne(['docId' => substr($key, 13), 'length' => ['$exists' => false]]);
+        } else {
+            $this->metadataCollection->deleteOne(['key' => 'state:' . $key]);
+        }
+    }
+
+    protected function writeIndexTotals(int $documents, int $length): void
+    {
+        $this->metadataCollection->bulkWrite([
+            ['updateOne' => [['key' => 'totalDocs'], ['$set' => ['value' => $documents]], ['upsert' => true]]],
+            ['updateOne' => [['key' => 'totalLength'], ['$set' => ['value' => $length]], ['upsert' => true]]],
+        ]);
+    }
+
+    protected function writePostingChanges(int $siteId, int $elementId, array $frequencies): void
+    {
+        if ($frequencies === []) {
+            return;
+        }
+        $operations = [];
+        foreach ($frequencies as $term => $frequency) {
+            $operations[] = ['updateOne' => [['term' => (string)$term], ['$set' => ["docs.$siteId:$elementId" => $frequency]], ['upsert' => true]]];
+        }
+        $this->termsCollection->bulkWrite($operations);
+    }
     // =========================================================================
     // PROPERTIES
     // =========================================================================
@@ -50,6 +361,9 @@ class MongoDbSearchAdapter extends BaseSearchAdapter
      * MongoDB metadata collection
      */
     protected Collection $metadataCollection;
+    protected Collection $prefixDictionaryCollection;
+    protected Collection $prefixMembershipCollection;
+    protected Collection $prefixDocumentsCollection;
 
     // =========================================================================
     // INITIALIZATION METHODS
@@ -67,6 +381,19 @@ class MongoDbSearchAdapter extends BaseSearchAdapter
         // Get connection settings from environment or settings
         $mongoUri = App::parseEnv('$BRAMBLE_SEARCH_MONGODB_URI') ?: $settings->mongoDbUri;
         $databaseName = App::parseEnv('$BRAMBLE_SEARCH_MONGODB_DATABASE') ?: $settings->mongoDbDatabase;
+        [$scheme, $remainder] = explode('://', $mongoUri, 2);
+        $authority = explode('/', $remainder, 2)[0];
+        $authority = substr($authority, strrpos($authority, '@') === false ? 0 : strrpos($authority, '@') + 1);
+        $endpoints = array_map(static function(string $endpoint) use ($scheme): string {
+            if (str_contains(rawurldecode($endpoint), '/')) {
+                return rawurldecode($endpoint);
+            }
+            $endpoint = strtolower($endpoint);
+
+            return $scheme === 'mongodb' && (!str_contains($endpoint, ':') || str_ends_with($endpoint, ']')) ? $endpoint . ':27017' : $endpoint;
+        }, explode(',', $authority));
+        sort($endpoints, SORT_STRING);
+        $this->storageCoordinates = ['driver' => 'mongodb', 'scheme' => strtolower($scheme), 'endpoints' => $endpoints, 'database' => $databaseName];
 
         try {
             // Initialize MongoDB client
@@ -78,6 +405,9 @@ class MongoDbSearchAdapter extends BaseSearchAdapter
             $this->termsCollection = $this->database->selectCollection('terms');
             $this->titlesCollection = $this->database->selectCollection('titles');
             $this->metadataCollection = $this->database->selectCollection('metadata');
+            $this->prefixDictionaryCollection = $this->database->selectCollection('prefix_dictionary_v2');
+            $this->prefixMembershipCollection = $this->database->selectCollection('prefix_membership_v2');
+            $this->prefixDocumentsCollection = $this->database->selectCollection('prefix_documents_v2');
 
             // Ensure indexes exist
             $this->ensureIndexes();
@@ -111,6 +441,11 @@ class MongoDbSearchAdapter extends BaseSearchAdapter
 
         // Metadata collection indexes
         $this->metadataCollection->createIndex(['key' => 1], ['unique' => true]);
+        $this->documentsCollection->createIndex(['siteId' => 1, 'docId' => 1]);
+        $this->prefixDictionaryCollection->createIndex(['siteId' => 1, 'epoch' => 1, 'term' => 1], ['unique' => true, 'collation' => ['locale' => 'simple']]);
+        $this->prefixMembershipCollection->createIndex(['siteId' => 1, 'epoch' => 1, 'term' => 1, 'docId' => 1], ['unique' => true, 'collation' => ['locale' => 'simple']]);
+        $this->prefixMembershipCollection->createIndex(['siteId' => 1, 'epoch' => 1, 'docId' => 1], ['collation' => ['locale' => 'simple']]);
+        $this->prefixDocumentsCollection->createIndex(['siteId' => 1, 'epoch' => 1, 'docId' => 1], ['unique' => true, 'collation' => ['locale' => 'simple']]);
     }
 
     // =========================================================================
@@ -133,6 +468,15 @@ class MongoDbSearchAdapter extends BaseSearchAdapter
         );
 
         if (!$document || !isset($document['terms'])) {
+            if ($this->documentIsCatalogued($siteId, $elementId)) {
+                $terms = [];
+                foreach ($this->termsCollection->find(["docs.$docId" => ['$exists' => true]], ['projection' => ['term' => 1, 'docs.' . $docId => 1]]) as $posting) {
+                    $terms[$posting['term']] = (int)$posting['docs'][$docId];
+                }
+
+                return $terms;
+            }
+
             return [];
         }
 
@@ -197,7 +541,13 @@ class MongoDbSearchAdapter extends BaseSearchAdapter
         );
 
         if (!$document || !isset($document['length'])) {
-            return 0;
+            $catalogue = $this->readIndexRecord('catalogue:' . $docId);
+            if ($catalogue !== null) {
+                return $catalogue['length'];
+            }
+            [$siteId, $elementId] = array_map('intval', explode(':', $docId, 2));
+
+            return $this->documentIsCatalogued($siteId, $elementId) ? array_sum($this->getDocumentTerms($siteId, $elementId)) : 0;
         }
 
         return (int)$document['length'];
@@ -298,16 +648,11 @@ class MongoDbSearchAdapter extends BaseSearchAdapter
      */
     protected function getTotalDocCount(): int
     {
-        $metadata = $this->metadataCollection->findOne(
-            ['key' => 'totalDocs'],
-            ['projection' => ['value' => 1, '_id' => 0]]
-        );
+        $this->ensureIndexMetadata();
+        $record = $this->metadataCollection->findOne(['key' => 'totalDocs']);
+        $value = $record['value'] ?? false;
 
-        if (!$metadata || !isset($metadata['value'])) {
-            return 0;
-        }
-
-        return (int)$metadata['value'];
+        return $this->requireMetadataCounter($value);
     }
 
     /**
@@ -317,16 +662,11 @@ class MongoDbSearchAdapter extends BaseSearchAdapter
      */
     protected function getTotalLength(): int
     {
-        $metadata = $this->metadataCollection->findOne(
-            ['key' => 'totalLength'],
-            ['projection' => ['value' => 1, '_id' => 0]]
-        );
+        $this->ensureIndexMetadata();
+        $record = $this->metadataCollection->findOne(['key' => 'totalLength']);
+        $value = $record['value'] ?? false;
 
-        if (!$metadata || !isset($metadata['value'])) {
-            return 0;
-        }
-
-        return (int)$metadata['value'];
+        return $this->requireMetadataCounter($value);
     }
 
     // =========================================================================
@@ -371,7 +711,24 @@ class MongoDbSearchAdapter extends BaseSearchAdapter
         );
 
         // Clean up empty terms (where docs is empty)
-        $this->termsCollection->deleteMany(['docs' => ['$eq' => new \stdClass()]]);
+        $this->termsCollection->deleteOne(['term' => $term, 'docs' => ['$eq' => new \stdClass()]]);
+    }
+
+    protected function getTermDocumentsBatch(array $terms): array
+    {
+        $terms = array_map('strval', $terms);
+        $result = array_fill_keys($terms, []);
+        if ($terms === []) {
+            return $result;
+        }
+        foreach ($this->termsCollection->find(['term' => ['$in' => array_values($terms)]], ['projection' => ['term' => 1, 'docs' => 1], 'collation' => ['locale' => 'simple']]) as $row) {
+            $result[$row['term']] = [];
+            foreach ($row['docs'] ?? [] as $docId => $frequency) {
+                $result[$row['term']][(string)$docId] = (int)$frequency;
+            }
+        }
+
+        return $result;
     }
 
     /**
@@ -452,7 +809,7 @@ class MongoDbSearchAdapter extends BaseSearchAdapter
                 '$set' => [
                     'siteId' => $siteId,
                     'elementId' => $elementId,
-                    'terms' => array_keys($titleTerms),
+                    'terms' => array_map('strval', array_keys($titleTerms)),
                 ],
             ],
             ['upsert' => true]
@@ -482,8 +839,8 @@ class MongoDbSearchAdapter extends BaseSearchAdapter
         // Make sure we have a flat, indexed array before flipping
         $flatTerms = [];
         foreach ($terms as $term) {
-            if (is_string($term)) {
-                $flatTerms[] = $term;
+            if (is_string($term) || is_int($term)) {
+                $flatTerms[] = (string)$term;
             }
         }
 
@@ -633,6 +990,7 @@ class MongoDbSearchAdapter extends BaseSearchAdapter
                 'as' => 'term_info',
             ]],
             ['$unwind' => '$term_info'],
+            ['$match' => ['term_info.siteId' => $siteId]],
             ['$addFields' => [
                 'jaccard_similarity' => [
                     '$divide' => [

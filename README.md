@@ -1,379 +1,200 @@
-# 🔍 Bramble Search
+# Bramble Search
 
-A powerful search engine plugin for Craft CMS that replaces the default search service with an enhanced inverted index implementation. Designed for performance, accuracy, and flexibility.
+Bramble Search replaces Craft's search service with a separate index. It supports Redis, MySQL, MongoDB, local files and Craft Cache.
 
-## ✨ Features
+## Requirements
 
-- 📊 **Inverted Index Architecture** - Fast, efficient search using modern indexing techniques
-- 🔤 **Fuzzy Search** - Find results even with typos using n-gram similarity with adaptive thresholds
-- 🧮 **BM25 Ranking Algorithm** - Industry-standard relevance scoring for better results
-- 🔄 **Multiple Storage Backends** - Choose between Redis (fastest), File Storage, MySQL, MongoDB, or Craft cache
-- 📝 **Stop Word Removal** - Filter out common words to improve search relevance
-- 🔠 **Title Field Boosting** - Prioritize matches in title fields (5x boost factor)
-- 📏 **Exact Phrase Matching** - Boost results that contain the exact search phrase (3x boost factor)
-- 🎛️ **Craft Search Replacement** - Seamlessly replaces Craft's built-in search service
-- 🌐 **Multi-site Support** - Each site has its own search index
-- 🔄 **Automatic Indexing** - Content is automatically indexed when created, updated, or deleted
-- 🧹 **Orphaned Term Cleanup** - Automatically removes terms with no associated documents
-- 🛠️ **Console Commands** - Tools for viewing index statistics and rebuilding the index
-- 🔍 **AND Logic for Multiple Terms** - Narrows results as more terms are added (unlike Craft's default OR logic)
-- 🚫 **Revision Handling** - Properly skips drafts, revisions, and provisional drafts during indexing
+- Craft CMS 5.5 or later within Craft 5
+- PHP 8.2 or later
+- A database supported by your Craft installation
 
-## 📋 Requirements
+Redis requires the PHP Redis extension. MongoDB requires the PHP MongoDB extension and the `mongodb/mongodb` Composer package.
 
-- 🔧 Craft CMS 5.5.0 or later
-- 💻 PHP 8.2 or later
-- 🔄 Redis 5.0+ (for Redis driver)
-- 🗄️ MySQL 5.7.8+ or MariaDB 10.2.7+ (for MySQL driver)
-- 🍃 MongoDB 4.4+ (for MongoDB driver)
+## Installation
 
-## 📦 Installation
-
-### Via Plugin Store
-
-1. 🛒 Open your Craft Control Panel
-2. 🔍 Navigate to **Plugin Store** → **Search** for "Bramble Search"
-3. ⬇️ Click **Install**
-
-### Via Composer
+Install through Craft's Plugin Store or run these commands from your Craft project.
 
 ```bash
-# Navigate to your project directory
-cd /path/to/your-project
-
-# Install the plugin
-composer require made-by-bramble/craft-bramble-search
-
-# Install the plugin in Craft
-./craft plugin/install bramble-search
+composer require madebybramble/craft-bramble-search
+php craft plugin/install bramble-search
 ```
 
-## 🛠️ Configuration
+## Configuration
 
-Bramble Search can be configured via the Control Panel or a configuration file.
-
-### Configuration File Setup
-
-Create a new file at `config/bramble-search.php` in your Craft project:
+Create `config/bramble-search.php`. Set `enabled` to `true` to use Bramble Search instead of Craft's native search.
 
 ```php
 <?php
-// config/bramble-search.php
+
 return [
-    // Whether to enable the plugin and replace Craft's search service
-    'enabled' => false,
-
-    // Storage driver: 'redis', 'file', 'mysql', 'mongodb', or 'craft'
+    'enabled' => true,
     'storageDriver' => 'mysql',
+    'siteSearchAsYouType' => false,
+    'titleAliases' => [],
 
-    // Redis connection settings (only needed if using Redis driver)
     'redisHost' => 'localhost',
     'redisPort' => 6379,
     'redisPassword' => null,
     'redisKeyPrefix' => 'bramble_search:',
 
-    // MongoDB connection settings (only needed if using MongoDB driver)
     'mongoDbUri' => 'mongodb://localhost:27017',
     'mongoDbDatabase' => 'craft_search',
 
-    // BM25 algorithm parameters (optional - defaults shown)
-    'bm25K1' => 1.5,                    // Term frequency saturation (0.1-5.0)
-    'bm25B' => 0.75,                    // Document length normalization (0.0-1.0)
-    'titleBoostFactor' => 5.0,          // Title field boost multiplier (1.0-20.0)
-    'exactMatchBoostFactor' => 3.0,     // Exact phrase match boost (1.0-20.0)
-
-    // N-gram fuzzy search parameters (optional - defaults shown)
-    'ngramSizes' => [1, 2, 3],          // N-gram sizes for fuzzy matching
-    'ngramSimilarityThreshold' => 0.25, // Minimum similarity threshold (0.0-1.0)
-    'fuzzySearchMaxCandidates' => 100,  // Max fuzzy candidates to process
-
-    // Match-ratio threshold above which a common AND term is demoted from a hard
-    // requirement to an optional (scoring-only) term. Values <= 0 disable this.
+    'bm25K1' => 1.5,
+    'bm25B' => 0.75,
+    'titleBoostFactor' => 5.0,
+    'exactMatchBoostFactor' => 3.0,
+    'ngramSizes' => [1, 2, 3],
+    'ngramSimilarityThreshold' => 0.25,
+    'fuzzySearchMaxCandidates' => 100,
     'commonTermDemotionThreshold' => 0.5,
-
-    // Stop word overrides (optional - defaults shown)
-    'extraStopWords' => [],             // Additional stop words merged into the bundled list
-    'removeStopWords' => ['how'],       // e.g. keep "how" searchable for how-to guides
+    'extraStopWords' => [],
+    'removeStopWords' => ['how'],
 ];
 ```
 
-The bundled English stop word list (`src/stopwords/en.php`) is intentionally lean: only
-function words (articles, pronouns, prepositions, conjunctions, auxiliary verbs). Earlier
-versions stripped content-bearing words such as "need", "best", "new", or "back"; those are
-now indexed and searchable by default. Rebuild the search index after upgrading so
-newly-indexable words get postings (`./craft clear-caches/bramble-search`).
+Only configure the connection settings for the driver you use. MySQL is the default. Use a different Redis key prefix for each installation sharing a Redis database.
 
-All settings can be overridden using environment variables:
-- `BRAMBLE_SEARCH_DRIVER` - Storage driver ('redis', 'file', 'mysql', 'mongodb', or 'craft')
-- `BRAMBLE_SEARCH_REDIS_HOST` - Redis host
-- `BRAMBLE_SEARCH_REDIS_PORT` - Redis port
-- `BRAMBLE_SEARCH_REDIS_PASSWORD` - Redis password
-- `BRAMBLE_SEARCH_REDIS_KEY_PREFIX` - Redis key prefix, useful when multiple sites share a Redis database
-- `BRAMBLE_SEARCH_MONGODB_URI` - MongoDB connection URI
-- `BRAMBLE_SEARCH_MONGODB_DATABASE` - MongoDB database name
+Environment variables override the corresponding settings.
 
-## 🚀 Getting Started
+| Variable | Setting |
+| --- | --- |
+| `BRAMBLE_SEARCH_DRIVER` | `storageDriver` |
+| `BRAMBLE_SEARCH_REDIS_HOST` | `redisHost` |
+| `BRAMBLE_SEARCH_REDIS_PORT` | `redisPort` |
+| `BRAMBLE_SEARCH_REDIS_PASSWORD` | `redisPassword` |
+| `BRAMBLE_SEARCH_REDIS_KEY_PREFIX` | `redisKeyPrefix` |
+| `BRAMBLE_SEARCH_MONGODB_URI` | `mongoDbUri` |
+| `BRAMBLE_SEARCH_MONGODB_DATABASE` | `mongoDbDatabase` |
 
-### Initializing the Search Index
+### Autocomplete
 
-After installing and enabling the plugin, you need to build the search index:
+Set `siteSearchAsYouType` to `true` for frontend autocomplete. The control panel uses autocomplete automatically. A trailing space marks the last word as complete.
 
-1. Go to **Utilities → Clear Caches** in the Control Panel
-2. Check the **Bramble Search** option
-3. Click **Clear Caches**
+### Title aliases
 
-Alternatively, you can use the command line:
-
-```bash
-# Build the search index
-./craft clear-caches/bramble-search
-```
-
-This will queue a job to rebuild the search index for each site.
-
-### Basic Usage
-
-Since Bramble Search replaces Craft's built-in search service, you can use Craft's standard search functionality in your templates. No special template variables are needed.
-
-#### Standard Craft Search
-
-```twig
-{# Use Craft's standard search functionality #}
-{% set entries = craft.entries()
-    .search('your search query')
-    .all() %}
-
-{# Display results #}
-{% for entry in entries %}
-    <article class="search-result">
-        <h2><a href="{{ entry.url }}">{{ entry.title }}</a></h2>
-        <p>{{ entry.summary }}</p>
-    </article>
-{% endfor %}
-```
-
-#### Search with Pagination
-
-```twig
-{# Use Craft's standard search with pagination #}
-{% set entriesQuery = craft.entries()
-    .search('your search query') %}
-
-{# Paginate the results #}
-{% paginate entriesQuery as pageInfo, pageEntries %}
-
-{# Display results #}
-{% for entry in pageEntries %}
-    <article class="search-result">
-        <h2><a href="{{ entry.url }}">{{ entry.title }}</a></h2>
-    </article>
-{% endfor %}
-
-{# Display pagination #}
-{% if pageInfo.totalPages > 1 %}
-    <nav class="pagination">
-        {% if pageInfo.prevUrl %}
-            <a href="{{ pageInfo.prevUrl }}">Previous</a>
-        {% endif %}
-
-        <span class="current">{{ pageInfo.currentPage }}</span>
-
-        {% if pageInfo.nextUrl %}
-            <a href="{{ pageInfo.nextUrl }}">Next</a>
-        {% endif %}
-    </nav>
-{% endif %}
-```
-
-## 🔍 Advanced Usage
-
-### AJAX Search with Craft
-
-You can use Craft's built-in ElementAPI or GraphQL to create AJAX search experiences:
-
-```javascript
-// In your JavaScript file
-document.getElementById('search-form').addEventListener('submit', function(e) {
-    e.preventDefault();
-    const query = this.querySelector('input[name="q"]').value;
-
-    // Using Craft's Element API endpoint
-    fetch(`/api/entries.json?search=${encodeURIComponent(query)}`)
-        .then(response => response.json())
-        .then(data => {
-            const resultsContainer = document.getElementById('search-results');
-            resultsContainer.innerHTML = '';
-
-            if (data.length === 0) {
-                resultsContainer.innerHTML = '<p class="no-results">No results found</p>';
-                return;
-            }
-
-            const resultsList = document.createElement('ul');
-            data.forEach(entry => {
-                const item = document.createElement('li');
-                item.innerHTML = `
-                    <a href="${entry.url}">
-                        <h3>${entry.title}</h3>
-                    </a>
-                `;
-                resultsList.appendChild(item);
-            });
-
-            resultsContainer.appendChild(resultsList);
-        });
-});
-```
-
-### Programmatic Search
-
-You can use Craft's standard ElementQuery API with search parameters:
+Use `titleAliases` to promote titles for an alternate search phrase. Every target word must appear in the title.
 
 ```php
-// In your PHP code
+'titleAliases' => [
+    'desk lamp' => ['reading', 'lamp'],
+],
+```
+
+Aliases apply to plain search phrases. Explicit query operators do not trigger them.
+
+### Stop words
+
+Use `extraStopWords` to exclude words from normal matching. Use `removeStopWords` to keep words that the bundled English list excludes. Rebuild the index after changing either setting.
+
+## Searching
+
+Use Craft's normal element queries. Sort by score when you want the most relevant results first.
+
+```twig
+{% set results = craft.entries()
+    .search(craft.app.request.getQueryParam('q'))
+    .orderBy('score DESC')
+    .all() %}
+
+{% for entry in results %}
+    <a href="{{ entry.url }}">{{ entry.title }}</a>
+{% endfor %}
+```
+
+Craft pagination uses the same query.
+
+```twig
+{% set resultsQuery = craft.entries()
+    .search(craft.app.request.getQueryParam('q'))
+    .orderBy('score DESC') %}
+
+{% paginate resultsQuery as pageInfo, results %}
+```
+
+The same API is available in PHP.
+
+```php
 use craft\elements\Entry;
 
-// Perform a search
-$entries = Entry::find()
+$results = Entry::find()
     ->search('your search query')
-    ->siteId(Craft::$app->sites->currentSite->id)
-    ->section(['blog', 'news'])
+    ->orderBy('score DESC')
     ->limit(20)
-    ->orderBy('score')
     ->all();
-
-// Process results
-foreach ($entries as $entry) {
-    echo $entry->title;
-}
 ```
 
-## ⚙️ Performance Tuning
+Multiple words normally narrow the results. Common words can become optional when they would otherwise remove useful matches. Title matches receive a configurable score boost.
 
-### Storage Driver Selection
+Attached units use the existing case insensitive matching without converting values. Spaced units use normal word matching. Leading zeros remain significant.
 
-Choose the right storage driver based on your site's needs:
+### Craft compatibility
 
-| Driver | Best For | Pros | Cons |
-|--------|----------|------|------|
-| **Redis** | Medium to large sites | Fastest performance, persistent storage | Requires Redis server setup |
-| **File Storage** | Small to medium sites | Custom binary format, file locking for concurrent access | Slow on networked file systems |
-| **MySQL** *(default)* | Small to medium sites | Persistent storage, n-gram optimization, no additional dependencies | Adds load to Craft's database |
-| **MongoDB** | Medium to large sites | Flexible schema, excellent scalability, optimized n-gram aggregation | Requires MongoDB server setup |
-| **Craft Cache** | Small to medium sites | Easy setup, no additional dependencies | Limited persistence, not scalable |
+| Feature | Behaviour |
+| --- | --- |
+| `OR` and excluded terms | Supported |
+| `title:term` and `title::term` | Restrict matching to the attribute |
+| `customFields` | Limits custom field matching. Attributes remain searchable |
+| Site and source restrictions | Applied before results are returned |
+| Counts and exports | Use the same matching rules |
+| Craft search events | Forwarded by the adapter |
+| Scores | Adapter scores are floats. Craft exposes element search scores as integers |
 
-### Indexing Considerations
+Bramble Search keeps its own index. If you disable it, Craft's native index may need rebuilding before native searches return current results.
 
-- The plugin automatically skips drafts, revisions, and provisional drafts during indexing
-- The plugin indexes all searchable attributes and fields as defined by Craft's ElementHelper::searchableAttributes()
-- Title fields receive special handling with 5x boosting for better relevance
-- N-gram indexing provides 10-100x faster fuzzy search compared to traditional Levenshtein distance
-- Adaptive similarity thresholds optimize fuzzy matching for short terms (2-3 characters)
+## Index management
 
-## 🛠️ Command Line Tools
-
-### Index Management
-
-The primary way to rebuild the search index is through the Clear Caches utility in the Control Panel or by using the clear-caches command:
+Build the index after enabling the plugin. Use **Utilities / Clear Caches / Bramble Search** or run the command below. It queues a rebuild for every Craft site.
 
 ```bash
-# Rebuild the search index
-./craft clear-caches/bramble-search
+php craft clear-caches/bramble-search
 ```
 
-This will queue a job that processes entries in batches to avoid memory issues, making it suitable for sites with large numbers of entries.
+Content changes use Craft's normal indexing process. Disabled elements and drafts are excluded. Rebuilds include any lookup data required by the driver. Saved checkpoints allow interrupted batches to resume within Craft's retry limit. Start a new rebuild if a run has exhausted its retries. Check the queue for failed or stalled jobs.
+
+Rebuild after changing the site's structure or moving content between sites. The full rebuild removes indexed records belonging to deleted sites. Rebuild after enabling the plugin again if content changed while it was disabled.
 
 ### Statistics
 
-View detailed information about your search index:
-
 ```bash
-# View basic index statistics
-./craft bramble-search/stats
-
-# View detailed statistics including top terms
-./craft bramble-search/stats --detailed
-
-# Specify a storage driver
-./craft bramble-search/stats --driver=redis
-./craft bramble-search/stats --driver=file
-./craft bramble-search/stats --driver=mysql
-./craft bramble-search/stats --driver=mongodb
-./craft bramble-search/stats --driver=craft
+php craft bramble-search/stats
+php craft bramble-search/stats --detailed
 ```
 
-The statistics command provides information about:
-- Total number of documents in the index
-- Total number of unique terms
-- Total number of tokens
-- Average document length
-- Estimated storage size
-- Top terms by document frequency (with --detailed flag)
-- Term-to-document ratio and other health metrics (with --detailed flag)
+The commands report an estimated index size and document counts. Use `--driver` to inspect a driver other than the configured one.
 
-## 🔄 Automatic Indexing
+## Upgrading
 
-Bramble Search automatically indexes entries when they are:
-- Created
-- Updated
-- Deleted
+Major releases often change the index format and require a full rebuild.
 
-## 🎛️ How It Works
+Check the changelog before updating. Pause indexing and stop queue workers while applying plugin migrations. Replace old rebuild jobs only when the release requires it. Keep ordinary indexing jobs queued.
 
-Bramble Search completely replaces Craft's built-in search service when enabled. This is the core functionality of the plugin.
+Restart the workers and rebuild the index when required.
 
-When you enable the plugin by setting `enabled = true`, it:
+### Rolling back
 
-1. Registers its own search adapter as Craft's search service
-2. Intercepts all search queries from both the Control Panel and frontend
-3. Processes searches using its enhanced inverted index and BM25 ranking
-4. Implements AND logic for multiple search terms (requiring all terms to be present)
-5. Applies n-gram similarity fuzzy matching when exact matches aren't found
+Index formats are not guaranteed to work with older packages. Pause indexing before restoring an older version. Set aside queued jobs that need the newer package.
 
-### What This Affects
+Clear incompatible indexes with the installed package before switching code, then rebuild them using the older package. The Bramble Search option in Clear Caches queues a rebuild and does not empty the index. Keep the migrated database schema unless you are restoring a compatible database backup.
 
-When enabled, Bramble Search will:
+## Storage and tuning
 
-- 🎛️ **Replace Admin CP Search** - All searches in the Control Panel will use Bramble Search
-- 🌐 **Replace Frontend Element Queries** - Any `craft.entries.search()` queries will use Bramble Search
-- 🔄 **Handle Element Exports** - Search-based element exports will use Bramble Search
-- 🔢 **Fix Element Counts** - Search result counts in the Control Panel will be accurate
-- 🔍 **Improve Search Relevance** - Results are ranked using BM25 with title and exact match boosting
+| Driver | Storage |
+| --- | --- |
+| `mysql` | Uses Craft's database |
+| `redis` | Requires a Redis server |
+| `mongodb` | Requires a MongoDB server |
+| `file` | Uses `storage/runtime/bramble-search` |
+| `craft` | Uses the configured Craft cache |
 
-> ⚠️ **Important**: After enabling the plugin, you must build your search index using the Clear Caches utility in the Control Panel or by running `./craft clear-caches/bramble-search`.
+File and Craft Cache lookups can scan the stored vocabulary. Test them with your site's content volume before choosing them. Clearing the backing cache or deleting the index files removes that index.
 
-### Craft search compatibility
+BM25 settings control how term frequency and document length affect ranking. `titleBoostFactor` changes the weight of title matches. `fuzzySearchMaxCandidates` limits fuzzy candidates. Lower limits reduce work but can omit useful matches.
 
-Bramble Search stores indexes in `bramble_search_*` tables (or the configured adapter) and does **not** write to Craft's native `searchindex` table while enabled.
+## License
 
-| Capability | Support |
-|------------|---------|
-| Plain-text `->search('terms')` | Full support with BM25 + fuzzy + AND logic |
-| `orderBy('score')` / relevancy sorting | Full support (float scores; GraphQL exposes integers) |
-| `SearchQuery` OR groups | Supported |
-| Exclude terms (`-term`) | Supported |
-| Attribute scoping (`title:term`, `title::exact`) | Supported when term sources are stored |
-| `$query->customFields` | Supported when term sources are stored |
-| Multi-site `siteId` arrays / `*` | Supported |
-| Craft search events (`beforeSearch`, `beforeIndexKeywords`, etc.) | Forwarded from Bramble adapter |
-| Filter-only queries (no score ordering) | Uses fast `createDbQuery()` path |
+Bramble Search uses a proprietary license. See LICENSE.md.
 
-**Intentional differences from Craft native search:**
+## Support
 
-- Multiple terms use **AND** logic by default (Craft scoring uses OR within groups)
-- Scores are floats internally; GraphQL `searchScore` truncates to integers
-- Commerce cart purge cleans Bramble index via Commerce event hook when Commerce is installed
-
-Run `./vendor/bin/phpunit` and `php tests/craft5-feature-matrix.php` after upgrades.
-
-## 📄 License
-
-Bramble Search is licensed under a proprietary license. See the LICENSE.md file for details.
-
-## 👨‍💻 Support
-
-For support, please contact [hello@madebybramble.co.uk](mailto:hello@madebybramble.co.uk).
-
----
-
-Made with ❤️ by [Made By Bramble](https://madebybramble.co.uk)
+Contact [hello@madebybramble.co.uk](mailto:hello@madebybramble.co.uk).

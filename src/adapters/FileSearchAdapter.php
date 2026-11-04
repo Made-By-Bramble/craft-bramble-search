@@ -15,6 +15,129 @@ use yii\base\Exception;
  */
 class FileSearchAdapter extends BaseSearchAdapter
 {
+    protected function getIndexedDocumentIds(): array
+    {
+        $data = $this->readFile($this->metaDir . '/docs.dat');
+        if ($data === false) {
+            return [];
+        }
+        $ids = $this->decodeData($data);
+        if (!is_array($ids)) {
+            throw new \RuntimeException('Invalid search document catalogue.');
+        }
+
+        return $ids;
+    }
+    protected function documentExists(int $siteId, int $elementId): bool
+    {
+        return is_file($this->docsDir . "/{$siteId}_{$elementId}.dat");
+    }
+
+    protected function termNgramsCurrent(string $term, int $siteId): bool
+    {
+        $data = $this->readFile($this->baseDir . "/ngrams/site$siteId/$term.dat");
+
+        return $data !== false && $this->decodeData($data) === $this->generateNgrams($term);
+    }
+    private array $heldFileLocks = [];
+
+    protected function withFileLock(string $path, callable $callback, bool $exclusive = true): mixed
+    {
+        if (isset($this->heldFileLocks[$path])) {
+            if ($exclusive && !$this->heldFileLocks[$path]) {
+                throw new \RuntimeException('Cannot upgrade a search file read lock.');
+            }
+
+            return $callback();
+        }
+        $handle = fopen($path . '.lock', 'c+b');
+        if ($handle === false) {
+            throw new \RuntimeException('Unable to open a stable search file lock.');
+        }
+        $deadline = microtime(true) + $this->lockTimeout;
+        $locked = false;
+        $result = null;
+        $failure = null;
+        try {
+            do {
+                if (flock($handle, ($exclusive ? LOCK_EX : LOCK_SH) | LOCK_NB)) {
+                    $locked = true;
+                    $this->heldFileLocks[$path] = $exclusive;
+                    $result = $callback();
+                    break;
+                }
+                usleep(10000);
+            } while (microtime(true) < $deadline);
+
+            if (!$locked) {
+                throw new \RuntimeException('Timed out acquiring a search file lock.');
+            }
+        } catch (\Throwable $exception) {
+            $failure = $exception;
+        }
+        unset($this->heldFileLocks[$path]);
+        try {
+            if ($locked && !flock($handle, LOCK_UN)) {
+                throw new \RuntimeException('Unable to release a stable search file lock.');
+            }
+        } catch (\Throwable $exception) {
+            $failure = $failure === null ? $exception : new \RuntimeException($exception->getMessage(), 0, $failure);
+        }
+        try {
+            if (!fclose($handle)) {
+                throw new \RuntimeException('Unable to close a stable search file lock.');
+            }
+        } catch (\Throwable $exception) {
+            if ($failure !== null) {
+                throw new \RuntimeException($exception->getMessage(), 0, $failure);
+            }
+            throw $exception;
+        }
+        if ($failure !== null) {
+            throw $failure;
+        }
+
+        return $result;
+    }
+    protected function getStorageNamespace(): array
+    {
+        return ['driver' => 'file', 'directory' => realpath($this->baseDir) ?: $this->baseDir];
+    }
+
+    protected function indexRecordPath(string $key): string
+    {
+        return $this->metaDir . '/state-' . hash('sha256', $key) . '.dat';
+    }
+
+    protected function readIndexRecord(string $key): ?array
+    {
+        $data = $this->readFile($this->indexRecordPath($key));
+        if ($data === false) {
+            return null;
+        }
+        $value = $this->decodeData($data);
+        if (!is_array($value)) {
+            throw new \RuntimeException('Invalid search source-state file.');
+        }
+
+        return $value;
+    }
+
+    protected function writeIndexRecord(string $key, array $value): void
+    {
+        $this->writeFile($this->indexRecordPath($key), $this->encodeData($value));
+    }
+
+    protected function deleteIndexRecord(string $key): void
+    {
+        $this->deleteFile($this->indexRecordPath($key));
+    }
+
+    protected function writeIndexTotals(int $documents, int $length): void
+    {
+        $this->writeFile($this->metaDir . '/count.dat', $this->encodeData($documents));
+        $this->writeFile($this->metaDir . '/length.dat', $this->encodeData($length));
+    }
     // =========================================================================
     // PROPERTIES
     // =========================================================================
@@ -194,24 +317,59 @@ class FileSearchAdapter extends BaseSearchAdapter
      */
     protected function writeFile(string $path, string $data): bool
     {
-        $handle = $this->getFileHandle($path, 'wb');
+        return $this->withFileLock($path, function() use ($path, $data): bool {
+            $temporary = tempnam(dirname($path), '.brms-');
+            if ($temporary === false) {
+                throw new \RuntimeException('Unable to create a search file replacement.');
+            }
+            $handle = null;
+            $failure = null;
+            try {
+                $handle = fopen($temporary, 'wb');
+                if ($handle === false) {
+                    throw new \RuntimeException('Unable to open a search file replacement.');
+                }
+                $bytes = $this->createFileHeader() . $data;
+                $offset = 0;
+                while ($offset < strlen($bytes)) {
+                    $written = fwrite($handle, substr($bytes, $offset));
+                    if ($written === false || $written === 0) {
+                        throw new \RuntimeException('Incomplete search file write.');
+                    }
+                    $offset += $written;
+                }
+                if (!fflush($handle) || !fsync($handle)) {
+                    throw new \RuntimeException('Unable to synchronize a search file replacement.');
+                }
+                if (!fclose($handle)) {
+                    throw new \RuntimeException('Unable to close a search file replacement.');
+                }
+                $handle = null;
+                if (!rename($temporary, $path)) {
+                    throw new \RuntimeException('Unable to publish a search file replacement.');
+                }
+            } catch (\Throwable $exception) {
+                $failure = $exception;
+            }
+            try {
+                if (is_resource($handle) && !fclose($handle)) {
+                    throw new \RuntimeException('Unable to close an unpublished search file replacement.');
+                }
+                if (is_file($temporary) && !unlink($temporary)) {
+                    throw new \RuntimeException('Unable to remove an unpublished search file replacement.');
+                }
+            } catch (\Throwable $exception) {
+                if ($failure !== null) {
+                    throw new \RuntimeException($exception->getMessage(), 0, $failure);
+                }
+                throw $exception;
+            }
+            if ($failure !== null) {
+                throw $failure;
+            }
 
-        if ($handle === false) {
-            Craft::error("Failed to open file for writing: $path", 'bramble-search');
-            return false;
-        }
-
-        // Write header
-        $header = $this->createFileHeader();
-        fwrite($handle, $header);
-
-        // Write data
-        $bytesWritten = fwrite($handle, $data);
-        $success = ($bytesWritten !== false);
-
-        $this->releaseFileHandle($handle);
-
-        return $success;
+            return true;
+        });
     }
 
     /**
@@ -220,29 +378,26 @@ class FileSearchAdapter extends BaseSearchAdapter
      * @param string $path File path
      * @return string|false The file contents or false on failure
      */
-    protected function readFile(string $path)
+    protected function readFile(string $path): string|false
     {
-        if (!file_exists($path)) {
+        clearstatcache(true, $path);
+        if (!is_file($path)) {
             return false;
         }
 
-        $handle = $this->getFileHandle($path, 'rb');
+        return $this->withFileLock($path, function() use ($path): string|false {
+            clearstatcache(true, $path);
+            if (!is_file($path)) {
+                return false;
+            }
+            $bytes = file_get_contents($path);
+            $header = $this->createFileHeader();
+            if ($bytes === false || strlen($bytes) < strlen($header) || !str_starts_with($bytes, $header)) {
+                throw new \RuntimeException('Invalid or incomplete search file header.');
+            }
 
-        if ($handle === false) {
-            Craft::error("Failed to open file for reading: $path", 'bramble-search');
-            return false;
-        }
-
-        // Skip header
-        $headerSize = strlen($this->createFileHeader());
-        fseek($handle, $headerSize);
-
-        // Read data
-        $data = stream_get_contents($handle);
-
-        $this->releaseFileHandle($handle);
-
-        return $data;
+            return substr($bytes, strlen($header));
+        }, false);
     }
 
     /**
@@ -268,11 +423,17 @@ class FileSearchAdapter extends BaseSearchAdapter
      */
     protected function deleteFile(string $path): bool
     {
-        if (!file_exists($path)) {
+        if (!is_dir(dirname($path))) {
             return true;
         }
 
-        return @unlink($path);
+        return $this->withFileLock($path, function() use ($path): bool {
+            if (is_file($path) && !unlink($path)) {
+                throw new \RuntimeException('Unable to remove a search file.');
+            }
+
+            return true;
+        });
     }
 
     /**
@@ -298,20 +459,11 @@ class FileSearchAdapter extends BaseSearchAdapter
      * @param string $data Binary data
      * @return mixed Decoded data
      */
-    protected function decodeData(string $data)
+    protected function decodeData(string $data): mixed
     {
-        // Check if this is our custom binary format
-        if (strlen($data) > 0 && ord($data[0]) === 0xB1) {
-            return $this->decodeBinary($data);
-        }
-
-        // Otherwise, try standard serialization
-        try {
-            return unserialize($data);
-        } catch (\Exception $e) {
-            Craft::error('Failed to decode data: ' . $e->getMessage(), 'bramble-search');
-            return false;
-        }
+        return $data !== '' && ord($data[0]) === 0xB1
+            ? $this->decodeBinary($data)
+            : unserialize($data, ['allowed_classes' => false]);
     }
 
     /**
@@ -375,79 +527,39 @@ class FileSearchAdapter extends BaseSearchAdapter
      * @param string $data Binary data
      * @return mixed Decoded data
      */
-    protected function decodeBinary(string $data)
+    protected function decodeBinary(string $data): mixed
     {
-        // Check minimum length and format marker
-        if (strlen($data) < 7 || ord($data[0]) !== 0xB1) {
-            return false;
+        $size = strlen($data);
+        if ($size < 6 || ord($data[0]) !== 0xB1 || !in_array(ord($data[1]), [1, 2], true)) {
+            throw new \RuntimeException('Invalid search data envelope.');
         }
-
-        // Get type
-        $type = ord($data[1]);
-        $isObject = ($type === 2);
-
-        // Get item count
         $count = unpack('V', substr($data, 2, 4))[1];
-
-        // Initialize result
+        $position = 6;
         $result = [];
-
-        // Current position in binary data
-        $pos = 6;
-
-        // Read each key-value pair
-        for ($i = 0; $i < $count; $i++) {
-            // Check if we have enough data left
-            if ($pos + 2 > strlen($data)) {
-                break;
+        for ($index = 0; $index < $count; $index++) {
+            if ($position + 2 > $size) {
+                throw new \RuntimeException('Incomplete search data key length.');
             }
-
-            // Get key length
-            $keyLength = unpack('v', substr($data, $pos, 2))[1];
-            $pos += 2;
-
-            // Check if we have enough data left
-            if ($pos + $keyLength > strlen($data)) {
-                break;
+            $keyLength = unpack('v', substr($data, $position, 2))[1];
+            $position += 2;
+            if ($position + $keyLength + 4 > $size) {
+                throw new \RuntimeException('Incomplete search data key.');
             }
-
-            // Get key
-            $key = substr($data, $pos, $keyLength);
-            $pos += $keyLength;
-
-            // Check if we have enough data left
-            if ($pos + 4 > strlen($data)) {
-                break;
+            $key = substr($data, $position, $keyLength);
+            $position += $keyLength;
+            $valueLength = unpack('V', substr($data, $position, 4))[1];
+            $position += 4;
+            if ($position + $valueLength > $size) {
+                throw new \RuntimeException('Incomplete search data value.');
             }
-
-            // Get value length
-            $valueLength = unpack('V', substr($data, $pos, 4))[1];
-            $pos += 4;
-
-            // Check if we have enough data left
-            if ($pos + $valueLength > strlen($data)) {
-                break;
-            }
-
-            // Get value
-            $serializedValue = substr($data, $pos, $valueLength);
-            $pos += $valueLength;
-
-            // Unserialize value
-            try {
-                $value = unserialize($serializedValue);
-                $result[$key] = $value;
-            } catch (\Exception $e) {
-                Craft::error('Failed to unserialize value: ' . $e->getMessage(), 'bramble-search');
-            }
+            $result[$key] = unserialize(substr($data, $position, $valueLength), ['allowed_classes' => false]);
+            $position += $valueLength;
+        }
+        if ($position !== $size) {
+            throw new \RuntimeException('Unexpected trailing search data bytes.');
         }
 
-        // Convert to object if needed
-        if ($isObject) {
-            $result = (object)$result;
-        }
-
-        return $result;
+        return ord($data[1]) === 2 ? (object)$result : $result;
     }
 
     // =========================================================================
@@ -495,34 +607,38 @@ class FileSearchAdapter extends BaseSearchAdapter
      */
     protected function removeTermDocument(string $term, int $siteId, int $elementId): void
     {
-        $termPath = $this->termsDir . "/{$term}.dat";
-        $data = $this->readFile($termPath);
+        $this->withPublicationGuard(function() use ($term, $siteId, $elementId): void {
+            $this->withFileLock($this->termsDir . "/$term.dat", function() use ($term, $siteId, $elementId): void {
+                $termPath = $this->termsDir . "/{$term}.dat";
+                $data = $this->readFile($termPath);
 
-        if ($data === false) {
-            return;
-        }
+                if ($data === false) {
+                    return;
+                }
 
-        $docs = $this->decodeData($data);
+                $docs = $this->decodeData($data);
 
-        // Handle decode failure
-        if ($docs === false || !is_array($docs)) {
-            return;
-        }
+                // Handle decode failure
+                if ($docs === false || !is_array($docs)) {
+                    return;
+                }
 
-        $docId = "{$siteId}:{$elementId}";
+                $docId = "{$siteId}:{$elementId}";
 
-        // Remove the document from the term's document list
-        if (isset($docs[$docId])) {
-            unset($docs[$docId]);
+                // Remove the document from the term's document list
+                if (isset($docs[$docId])) {
+                    unset($docs[$docId]);
 
-            // If there are still documents for this term, update the file
-            if (!empty($docs)) {
-                $this->writeFile($termPath, $this->encodeData($docs));
-            } else {
-                // Otherwise, delete the term file
-                $this->deleteFile($termPath);
-            }
-        }
+                    // If there are still documents for this term, update the file
+                    if (!empty($docs)) {
+                        $this->writeFile($termPath, $this->encodeData($docs));
+                    } else {
+                        // Otherwise, delete the term file
+                        $this->deleteFile($termPath);
+                    }
+                }
+            });
+        });
     }
 
     /**
@@ -569,30 +685,34 @@ class FileSearchAdapter extends BaseSearchAdapter
      */
     protected function storeTermDocument(string $term, int $siteId, int $elementId, int $freq): void
     {
-        $termPath = $this->termsDir . "/{$term}.dat";
-        $docId = "{$siteId}:{$elementId}";
+        $this->withPublicationGuard(function() use ($term, $siteId, $elementId, $freq): void {
+            $this->withFileLock($this->termsDir . "/$term.dat", function() use ($term, $siteId, $elementId, $freq): void {
+                $termPath = $this->termsDir . "/{$term}.dat";
+                $docId = "{$siteId}:{$elementId}";
 
-        // Get existing term data
-        $data = $this->readFile($termPath);
-        $docs = [];
-
-        if ($data !== false) {
-            $docs = $this->decodeData($data);
-
-            // Handle decode failure
-            if ($docs === false) {
+                // Get existing term data
+                $data = $this->readFile($termPath);
                 $docs = [];
-            }
-        }
 
-        // Add or update document frequency
-        $docs[$docId] = $freq;
+                if ($data !== false) {
+                    $docs = $this->decodeData($data);
 
-        // Write updated term data
-        $this->writeFile($termPath, $this->encodeData($docs));
+                    // Handle decode failure
+                    if ($docs === false) {
+                        $docs = [];
+                    }
+                }
 
-        // Update the all terms index
-        $this->addTermToIndex($term);
+                // Add or update document frequency
+                $docs[$docId] = $freq;
+
+                // Write updated term data
+                $this->writeFile($termPath, $this->encodeData($docs));
+
+                // Update the all terms index
+                $this->addTermToIndex($term);
+            });
+        });
     }
 
     /**
@@ -604,27 +724,31 @@ class FileSearchAdapter extends BaseSearchAdapter
      */
     protected function addDocumentToIndex(int $siteId, int $elementId): void
     {
-        $metaPath = $this->metaDir . "/docs.dat";
-        $docId = "{$siteId}:{$elementId}";
+        $this->withPublicationGuard(function() use ($siteId, $elementId): void {
+            $this->withFileLock($this->metaDir . "/docs.dat", function() use ($siteId, $elementId): void {
+                $metaPath = $this->metaDir . "/docs.dat";
+                $docId = "{$siteId}:{$elementId}";
 
-        // Get existing docs
-        $data = $this->readFile($metaPath);
-        $docs = [];
-
-        if ($data !== false) {
-            $docs = $this->decodeData($data);
-
-            // Handle decode failure
-            if ($docs === false) {
+                // Get existing docs
+                $data = $this->readFile($metaPath);
                 $docs = [];
-            }
-        }
 
-        // Add document if not already in the index
-        if (!in_array($docId, $docs)) {
-            $docs[] = $docId;
-            $this->writeFile($metaPath, $this->encodeData($docs));
-        }
+                if ($data !== false) {
+                    $docs = $this->decodeData($data);
+
+                    // Handle decode failure
+                    if ($docs === false) {
+                        $docs = [];
+                    }
+                }
+
+                // Add document if not already in the index
+                if (!in_array($docId, $docs)) {
+                    $docs[] = $docId;
+                    $this->writeFile($metaPath, $this->encodeData($docs));
+                }
+            });
+        });
     }
 
     // =========================================================================
@@ -638,25 +762,29 @@ class FileSearchAdapter extends BaseSearchAdapter
      */
     protected function updateTotalDocCount(): void
     {
-        $metaPath = $this->metaDir . "/docs.dat";
-        $data = $this->readFile($metaPath);
+        $this->withPublicationGuard(function(): void {
+            $this->withFileLock($this->metaDir . "/docs.dat", function(): void {
+                $metaPath = $this->metaDir . "/docs.dat";
+                $data = $this->readFile($metaPath);
 
-        if ($data === false) {
-            // No documents yet
-            $count = 0;
-        } else {
-            $docs = $this->decodeData($data);
+                if ($data === false) {
+                    // No documents yet
+                    $count = 0;
+                } else {
+                    $docs = $this->decodeData($data);
 
-            // Handle decode failure
-            if ($docs === false || !is_array($docs)) {
-                $count = 0;
-            } else {
-                $count = count($docs);
-            }
-        }
+                    // Handle decode failure
+                    if ($docs === false || !is_array($docs)) {
+                        $count = 0;
+                    } else {
+                        $count = count($docs);
+                    }
+                }
 
-        $countPath = $this->metaDir . "/count.dat";
-        $this->writeFile($countPath, $this->encodeData($count));
+                $countPath = $this->metaDir . "/count.dat";
+                $this->writeFile($countPath, $this->encodeData($count));
+            });
+        });
     }
 
     /**
@@ -667,24 +795,28 @@ class FileSearchAdapter extends BaseSearchAdapter
      */
     protected function updateTotalLength(int $docLen): void
     {
-        $lengthPath = $this->metaDir . "/length.dat";
-        $data = $this->readFile($lengthPath);
+        $this->withPublicationGuard(function() use ($docLen): void {
+            $this->withFileLock($this->metaDir . "/length.dat", function() use ($docLen): void {
+                $lengthPath = $this->metaDir . "/length.dat";
+                $data = $this->readFile($lengthPath);
 
-        if ($data === false) {
-            // No total length yet
-            $totalLength = $docLen;
-        } else {
-            $totalLength = $this->decodeData($data);
+                if ($data === false) {
+                    // No total length yet
+                    $totalLength = $docLen;
+                } else {
+                    $totalLength = $this->decodeData($data);
 
-            // Handle decode failure
-            if ($totalLength === false || !is_numeric($totalLength)) {
-                $totalLength = $docLen;
-            } else {
-                $totalLength += $docLen;
-            }
-        }
+                    // Handle decode failure
+                    if ($totalLength === false || !is_numeric($totalLength)) {
+                        $totalLength = $docLen;
+                    } else {
+                        $totalLength += $docLen;
+                    }
+                }
 
-        $this->writeFile($lengthPath, $this->encodeData($totalLength));
+                $this->writeFile($lengthPath, $this->encodeData($totalLength));
+            });
+        });
     }
 
     /**
@@ -694,21 +826,11 @@ class FileSearchAdapter extends BaseSearchAdapter
      */
     protected function getTotalDocCount(): int
     {
-        $countPath = $this->metaDir . "/count.dat";
-        $data = $this->readFile($countPath);
+        $this->ensureIndexMetadata();
+        $data = $this->readFile($this->metaDir . '/count.dat');
+        $value = $data === false ? false : $this->decodeData($data);
 
-        if ($data === false) {
-            return 0;
-        }
-
-        $count = $this->decodeData($data);
-
-        // Handle decode failure
-        if ($count === false || !is_numeric($count)) {
-            return 0;
-        }
-
-        return (int)$count;
+        return $this->requireMetadataCounter($value);
     }
 
     /**
@@ -718,21 +840,11 @@ class FileSearchAdapter extends BaseSearchAdapter
      */
     protected function getTotalLength(): int
     {
-        $lengthPath = $this->metaDir . "/length.dat";
-        $data = $this->readFile($lengthPath);
+        $this->ensureIndexMetadata();
+        $data = $this->readFile($this->metaDir . '/length.dat');
+        $value = $data === false ? false : $this->decodeData($data);
 
-        if ($data === false) {
-            return 0;
-        }
-
-        $length = $this->decodeData($data);
-
-        // Handle decode failure
-        if ($length === false || !is_numeric($length)) {
-            return 0;
-        }
-
-        return (int)$length;
+        return $this->requireMetadataCounter($value);
     }
 
     // =========================================================================
@@ -803,24 +915,24 @@ class FileSearchAdapter extends BaseSearchAdapter
         }
 
         $lengths = [];
-        
+
         foreach ($docIds as $docId) {
             [$siteId, $elementId] = explode(':', $docId);
             $docPath = $this->docsDir . "/{$siteId}_{$elementId}.dat";
             $data = $this->readFile($docPath);
-            
+
             if ($data === false) {
                 $lengths[$docId] = 0;
                 continue;
             }
-            
+
             $doc = $this->decodeData($data);
-            
+
             if ($doc === false || !is_array($doc)) {
                 $lengths[$docId] = 0;
                 continue;
             }
-            
+
             $lengths[$docId] = (int)($doc['_length'] ?? 0);
         }
 
@@ -859,24 +971,29 @@ class FileSearchAdapter extends BaseSearchAdapter
      */
     protected function addTermToIndex(string $term): void
     {
-        $termsPath = $this->metaDir . "/terms.dat";
-        $data = $this->readFile($termsPath);
-        $terms = [];
-
-        if ($data !== false) {
-            $terms = $this->decodeData($data);
-
-            // Handle decode failure
-            if ($terms === false) {
+        $this->withPublicationGuard(function() use ($term): void {
+            $this->withFileLock($this->metaDir . "/terms.dat", function() use ($term): void {
+                $termsPath = $this->metaDir . "/terms.dat";
+                $data = $this->readFile($termsPath);
                 $terms = [];
-            }
-        }
 
-        // Add term if not already in the index
-        if (!in_array($term, $terms)) {
-            $terms[] = $term;
-            $this->writeFile($termsPath, $this->encodeData($terms));
-        }
+                if ($data !== false) {
+                    $terms = $this->decodeData($data);
+
+                    // Handle decode failure
+                    if ($terms === false) {
+                        $terms = [];
+                    }
+                }
+
+                // Add term if not already in the index
+                $terms = array_map('strval', $terms);
+                if (!in_array($term, $terms, true)) {
+                    $terms[] = $term;
+                    $this->writeFile($termsPath, $this->encodeData($terms));
+                }
+            });
+        });
     }
 
     /**
@@ -887,31 +1004,36 @@ class FileSearchAdapter extends BaseSearchAdapter
      */
     protected function removeTermFromIndex(string $term): void
     {
-        $termsPath = $this->metaDir . "/terms.dat";
-        $data = $this->readFile($termsPath);
+        $this->withPublicationGuard(function() use ($term): void {
+            $this->withFileLock($this->metaDir . "/terms.dat", function() use ($term): void {
+                $termsPath = $this->metaDir . "/terms.dat";
+                $data = $this->readFile($termsPath);
 
-        if ($data === false) {
-            return;
-        }
+                if ($data === false) {
+                    return;
+                }
 
-        $terms = $this->decodeData($data);
+                $terms = $this->decodeData($data);
 
-        // Handle decode failure
-        if ($terms === false || !is_array($terms)) {
-            return;
-        }
+                // Handle decode failure
+                if ($terms === false || !is_array($terms)) {
+                    return;
+                }
 
-        // Remove term from the index
-        $key = array_search($term, $terms);
-        if ($key !== false) {
-            unset($terms[$key]);
-            $terms = array_values($terms); // Reindex array
-            $this->writeFile($termsPath, $this->encodeData($terms));
-        }
+                // Remove term from the index
+                $terms = array_map('strval', $terms);
+                $key = array_search($term, $terms, true);
+                if ($key !== false) {
+                    unset($terms[$key]);
+                    $terms = array_values($terms); // Reindex array
+                    $this->writeFile($termsPath, $this->encodeData($terms));
+                }
 
-        // Delete the term file
-        $termPath = $this->termsDir . "/{$term}.dat";
-        $this->deleteFile($termPath);
+                // Delete the term file
+                $termPath = $this->termsDir . "/{$term}.dat";
+                $this->deleteFile($termPath);
+            });
+        });
     }
 
     // =========================================================================
@@ -1017,29 +1139,33 @@ class FileSearchAdapter extends BaseSearchAdapter
      */
     protected function removeDocumentFromIndex(int $siteId, int $elementId): void
     {
-        $metaPath = $this->metaDir . "/docs.dat";
-        $data = $this->readFile($metaPath);
+        $this->withPublicationGuard(function() use ($siteId, $elementId): void {
+            $this->withFileLock($this->metaDir . "/docs.dat", function() use ($siteId, $elementId): void {
+                $metaPath = $this->metaDir . "/docs.dat";
+                $data = $this->readFile($metaPath);
 
-        if ($data === false) {
-            return;
-        }
+                if ($data === false) {
+                    return;
+                }
 
-        $docs = $this->decodeData($data);
+                $docs = $this->decodeData($data);
 
-        // Handle decode failure
-        if ($docs === false || !is_array($docs)) {
-            return;
-        }
+                // Handle decode failure
+                if ($docs === false || !is_array($docs)) {
+                    return;
+                }
 
-        $docId = "{$siteId}:{$elementId}";
+                $docId = "{$siteId}:{$elementId}";
 
-        // Remove document from the index
-        $key = array_search($docId, $docs);
-        if ($key !== false) {
-            unset($docs[$key]);
-            $docs = array_values($docs); // Reindex array
-            $this->writeFile($metaPath, $this->encodeData($docs));
-        }
+                // Remove document from the index
+                $key = array_search($docId, $docs);
+                if ($key !== false) {
+                    unset($docs[$key]);
+                    $docs = array_values($docs); // Reindex array
+                    $this->writeFile($metaPath, $this->encodeData($docs));
+                }
+            });
+        });
     }
 
     /**
@@ -1049,8 +1175,12 @@ class FileSearchAdapter extends BaseSearchAdapter
      */
     protected function resetTotalLength(): void
     {
-        $lengthPath = $this->metaDir . "/length.dat";
-        $this->writeFile($lengthPath, $this->encodeData(0));
+        $this->withPublicationGuard(function(): void {
+            $this->withFileLock($this->metaDir . "/length.dat", function(): void {
+                $lengthPath = $this->metaDir . "/length.dat";
+                $this->writeFile($lengthPath, $this->encodeData(0));
+            });
+        });
     }
 
     // =========================================================================

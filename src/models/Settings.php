@@ -3,6 +3,7 @@
 namespace MadeByBramble\BrambleSearch\models;
 
 use craft\base\Model;
+use MadeByBramble\BrambleSearch\helpers\TitleAliases;
 
 /**
  * Bramble Search Settings Model
@@ -99,6 +100,18 @@ class Settings extends Model
      */
     public bool $siteSearchAsYouType = false;
 
+    public array $titleAliases = [];
+
+    public function validateTitleAliases(string $attribute): void
+    {
+        $bundled = require dirname(__DIR__) . '/stopwords/en.php';
+        try {
+            TitleAliases::compile($this->titleAliases, self::mergeStopWordLists($bundled, $this->extraStopWords, $this->removeStopWords));
+        } catch (\InvalidArgumentException $exception) {
+            $this->addError($attribute, $exception->getMessage());
+        }
+    }
+
     /**
      * Additional stop words merged into the bundled English list.
      *
@@ -189,6 +202,7 @@ class Settings extends Model
       ['fuzzySearchMaxCandidates', 'integer', 'min' => 10, 'max' => 1000],
       ['commonTermDemotionThreshold', 'number', 'min' => 0.0, 'max' => 1.0],
       ['siteSearchAsYouType', 'boolean'],
+      ['titleAliases', 'validateTitleAliases'],
       [['extraStopWords', 'removeStopWords'], 'each', 'rule' => ['string']],
     ];
     }

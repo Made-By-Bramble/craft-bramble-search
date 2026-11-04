@@ -6,8 +6,9 @@ use Craft;
 use craft\base\ElementInterface;
 use craft\db\Query;
 use craft\db\Table;
-use craft\helpers\ElementHelper;
+use craft\elements\db\ElementQuery;
 use craft\helpers\StringHelper;
+use craft\search\SearchQuery;
 use yii\db\Expression;
 
 /**
@@ -19,6 +20,328 @@ use yii\db\Expression;
  */
 class MySqlSearchAdapter extends BaseSearchAdapter
 {
+    protected function retireDerivedSiteStep(int $siteId): bool
+    {
+        return $this->deleteSiteSnapshot($siteId);
+    }
+
+    protected function documentIsCatalogued(int $siteId, int $elementId): bool
+    {
+        return $this->createIndexReadCommand((new Query())->select(new Expression('1'))->from($this->tablePrefix . 'metadata}}')->where(['key' => 'doc', 'value' => "$siteId:$elementId"])->limit(1))->queryScalar() !== false;
+    }
+    protected function repairIndexMetadata(array $publication): array
+    {
+        if ($publication['pending'] !== []) {
+            return parent::repairIndexMetadata($publication);
+        }
+        if (!$publication['dirty'] && ($publication['initialized'] ?? false)) {
+            return $publication;
+        }
+        $count = (int)$this->createIndexReadCommand((new Query())->select(new Expression('COUNT(DISTINCT [[value]])'))->from($this->tablePrefix . 'metadata}}')->where(['key' => 'doc']))->queryScalar();
+        $catalogue = (new Query())->select(new Expression('1'))->from(['m' => $this->tablePrefix . 'metadata}}'])->where(['m.key' => 'doc'])->andWhere(new Expression("[[m.value]] = CONCAT([[d.siteId]], ':', [[d.elementId]])"));
+        $length = (int)$this->createIndexReadCommand((new Query())->select(new Expression('SUM([[d.frequency]])'))->from(['d' => $this->tablePrefix . 'documents}}'])->where(['d.term' => '_length'])->andWhere(['exists', $catalogue]))->queryScalar();
+        $this->writeIndexTotals($count, $length);
+        $publication['dirty'] = false;
+        $publication['initialized'] = true;
+        $this->writeIndexRecord('publication', $publication);
+
+        return $publication;
+    }
+
+    protected function refreshCommittedTotals(): void
+    {
+        $this->withPublicationGuard(fn(): bool => $this->runDocumentTransaction(function(): bool {
+            $publication = $this->publicationState();
+            $publication['dirty'] = true;
+            $this->writeIndexRecord('publication', $publication);
+            $this->repairIndexMetadata($publication);
+
+            return true;
+        }));
+    }
+
+    protected function deleteSiteSnapshot(int $siteId): bool
+    {
+        return $this->withPublicationGuard(fn(): bool => $this->runDocumentTransaction(function() use ($siteId): bool {
+            \MadeByBramble\BrambleSearch\helpers\RebuildState::cancel($this->getIndexIdentity(), $siteId);
+            $this->clearSearchMemo();
+            $publication = $this->repairIndexMetadata($this->publicationState());
+            if ($publication['pending'] !== []) {
+                throw new \RuntimeException('SQL maintenance requires recovered source state.');
+            }
+            $count = $this->getTotalDocCount();
+            $length = $this->getTotalLength();
+            $db = Craft::$app->getDb();
+            $removedCount = (int)$this->createIndexReadCommand((new Query())->select(new Expression('COUNT(DISTINCT [[value]])'))->from($this->tablePrefix . 'metadata}}')->where(['key' => 'doc'])->andWhere(['like', 'value', "$siteId:%", false]))->queryScalar();
+            $removedLength = (int)$this->createIndexReadCommand((new Query())->select(new Expression('SUM([[frequency]])'))->from($this->tablePrefix . 'documents}}')->where(['siteId' => $siteId, 'term' => '_length']))->queryScalar();
+            $db->createCommand()->delete($this->tablePrefix . 'terms}}', ['like', 'docId', "$siteId:%", false])->execute();
+            foreach (['documents', 'titles'] as $table) {
+                $db->createCommand()->delete($this->tablePrefix . $table . '}}', ['siteId' => $siteId])->execute();
+            }
+            $db->createCommand()->delete($this->tablePrefix . 'metadata}}', ['or',
+                ['and', ['key' => 'doc'], ['like', 'value', "$siteId:%", false]],
+                ['like', 'key', "term_sources:$siteId:%", false],
+                ['like', 'key', "journal:$siteId:%", false],
+                ['like', 'key', "ngram:$siteId:%", false],
+            ])->execute();
+            $this->clearNgrams($siteId);
+            $this->mutationCheckpoint('bulkDeleted', $siteId, 0);
+            $this->writeIndexTotals($count - $removedCount, $length - $removedLength);
+            $this->writeIndexRecord('publication', $publication);
+            $this->clearSearchMemo();
+
+            return true;
+        }));
+    }
+    private array $deferredIndexLocks = [];
+    private ?string $memoTransactionSignature = null;
+    private int $readMemoDepth = 0;
+
+    private function withReadMemoScope(callable $callback): mixed
+    {
+        $outer = $this->readMemoDepth === 0;
+        if ($outer && Craft::$app->getDb()->getTransaction()?->getIsActive() === true) {
+            $this->clearSearchMemo();
+        }
+        $this->readMemoDepth++;
+        try {
+            return $callback();
+        } finally {
+            $this->readMemoDepth--;
+            if ($outer && Craft::$app->getDb()->getTransaction()?->getIsActive() === true) {
+                $this->clearSearchMemo();
+            }
+        }
+    }
+
+    public function searchElements(ElementQuery $elementQuery): array
+    {
+        return $this->withReadMemoScope(fn(): array => parent::searchElements($elementQuery));
+    }
+
+    public function createDbQuery(string|array|SearchQuery $searchQuery, ElementQuery $elementQuery): Query|false
+    {
+        return $this->withReadMemoScope(fn(): Query|false => parent::createDbQuery($searchQuery, $elementQuery));
+    }
+
+    protected function getSearchStatistics(): array
+    {
+        return $this->withReadMemoScope(fn(): array => parent::getSearchStatistics());
+    }
+
+    protected function synchronizeSearchMemo(): void
+    {
+        $transaction = Craft::$app->getDb()->getTransaction();
+        $signature = $transaction === null ? 'none' : spl_object_id($transaction) . ':' . $transaction->getLevel();
+        if ($signature !== $this->memoTransactionSignature || ($transaction !== null && $this->readMemoDepth === 0)) {
+            $this->clearSearchMemo();
+            $this->memoTransactionSignature = $signature;
+        }
+    }
+
+    protected function withDocumentIndexLock(int $siteId, int $elementId, callable $callback): bool
+    {
+        return (bool)$this->withPublicationGuard($callback);
+    }
+
+    protected function createIndexReadCommand(Query $query): \yii\db\Command
+    {
+        $db = Craft::$app->getDb();
+        $command = $query->createCommand($db);
+        $ownsNamespace = $this->publicationDepth > 0 || isset($this->deferredIndexLocks['bs:publish:' . substr($this->getIndexIdentity(), 0, 32)]);
+        if ($ownsNamespace && $db->getTransaction()?->getIsActive() === true) {
+            return $db->createCommand($command->getSql() . ' FOR UPDATE', $command->params);
+        }
+
+        return $command;
+    }
+
+    protected function withPublicationGuard(callable $callback): mixed
+    {
+        $name = 'bs:publish:' . substr($this->getIndexIdentity(), 0, 32);
+        if (!isset($this->deferredIndexLocks[$name])) {
+            return parent::withPublicationGuard($callback);
+        }
+        $this->publicationDepth++;
+        try {
+            return $callback();
+        } catch (\Throwable $exception) {
+            if (isset($this->deferredIndexLocks[$name])) {
+                $this->deferredIndexLocks[$name]['failure'] = $exception;
+            }
+            throw $exception;
+        } finally {
+            $this->publicationDepth--;
+        }
+    }
+
+    protected function releaseIndexLock(\yii\mutex\Mutex $mutex, string $name, callable $onReleased, ?\Throwable $failure = null): void
+    {
+        $db = Craft::$app->getDb();
+        if ($db->getTransaction()?->getIsActive() !== true) {
+            parent::releaseIndexLock($mutex, $name, $onReleased, $failure);
+
+            return;
+        }
+        $this->deferredIndexLocks[$name] = ['failure' => $failure];
+        $release = null;
+        $release = function() use ($db, $mutex, $name, $onReleased, &$release): void {
+            $db->off(\yii\db\Connection::EVENT_COMMIT_TRANSACTION, $release);
+            $db->off(\yii\db\Connection::EVENT_ROLLBACK_TRANSACTION, $release);
+            $failure = $this->deferredIndexLocks[$name]['failure'];
+            unset($this->deferredIndexLocks[$name]);
+            parent::releaseIndexLock($mutex, $name, $onReleased, $failure);
+            $this->clearSearchMemo();
+        };
+        $db->on(\yii\db\Connection::EVENT_COMMIT_TRANSACTION, $release);
+        $db->on(\yii\db\Connection::EVENT_ROLLBACK_TRANSACTION, $release);
+    }
+    protected function removePostingChanges(int $siteId, int $elementId, array $terms): void
+    {
+        if ($terms !== []) {
+            Craft::$app->getDb()->createCommand()->delete($this->tablePrefix . 'terms}}', ['docId' => "$siteId:$elementId", 'term' => $terms])->execute();
+        }
+    }
+
+    protected function cleanupRemovedTermState(int $siteId, array $terms): void
+    {
+        if ($terms === []) {
+            return;
+        }
+        $remaining = $this->createIndexReadCommand((new Query())->select(['term', 'docId'])->from($this->tablePrefix . 'terms}}')->where(['term' => $terms]))->queryAll();
+        $siteTerms = [];
+        foreach ($remaining as $row) {
+            if (str_starts_with($row['docId'], "$siteId:")) {
+                $siteTerms[$row['term']] = true;
+            }
+        }
+        $removed = array_values(array_diff($terms, array_map('strval', array_keys($siteTerms))));
+        if ($removed === []) {
+            return;
+        }
+        $db = Craft::$app->getDb();
+        foreach (['ngrams', 'ngram_index'] as $table) {
+            $db->createCommand()->delete($this->tablePrefix . $table . '}}', ['siteId' => $siteId, 'term' => $removed])->execute();
+        }
+        $db->createCommand()->delete($this->tablePrefix . 'metadata}}', ['key' => array_map(static fn(string $term): string => "ngram:$siteId:$term", $removed)])->execute();
+    }
+    protected function getIndexedDocumentIds(): array
+    {
+        return $this->createIndexReadCommand((new Query())->select('value')->distinct()->from($this->tablePrefix . 'metadata}}')->where(['key' => 'doc']))->queryColumn();
+    }
+    protected function documentExists(int $siteId, int $elementId): bool
+    {
+        return $this->createIndexReadCommand((new Query())->select(new Expression('1'))->from($this->tablePrefix . 'documents}}')->where(['siteId' => $siteId, 'elementId' => $elementId, 'term' => '_length'])->limit(1))->queryScalar() !== false;
+    }
+    protected function getStorageNamespace(): array
+    {
+        $db = Craft::$app->getDb();
+
+        return ['driver' => 'mysql', 'dsn' => preg_replace('/;(?:user(?:name)?|password)=[^;]*/i', '', $db->dsn), 'tables' => $db->getSchema()->getRawTableName($this->tablePrefix . 'metadata}}')];
+    }
+
+    protected function readIndexRecord(string $key): ?array
+    {
+        $value = $this->createIndexReadCommand((new Query())->select('value')->from($this->tablePrefix . 'metadata}}')->where(['key' => $key]))->queryScalar();
+
+        return $value === false ? null : json_decode($value, true, 512, JSON_THROW_ON_ERROR);
+    }
+
+    protected function readIndexRecordsBatch(array $keys): array
+    {
+        $rows = $this->createIndexReadCommand((new Query())->select(['key', 'value'])->from($this->tablePrefix . 'metadata}}')->where(['key' => $keys]))->queryAll();
+        $records = array_fill_keys($keys, null);
+        foreach ($rows as $row) {
+            $records[$row['key']] = json_decode($row['value'], true, 512, JSON_THROW_ON_ERROR);
+        }
+
+        return $records;
+    }
+
+    protected function writeIndexRecord(string $key, array $value): void
+    {
+        $this->upsertSingletonMeta($key, json_encode($value, JSON_THROW_ON_ERROR));
+    }
+
+    protected function deleteIndexRecord(string $key): void
+    {
+        Craft::$app->getDb()->createCommand()->delete($this->tablePrefix . 'metadata}}', ['key' => $key])->execute();
+    }
+
+    protected function writeIndexTotals(int $documents, int $length): void
+    {
+        $this->upsertSingletonMeta('totalDocs', (string)$documents);
+        $this->upsertSingletonMeta('totalLength', (string)$length);
+    }
+
+    protected function runDocumentTransaction(callable $callback): bool
+    {
+        try {
+            return $this->withDeadlockRetry(fn(): bool => Craft::$app->getDb()->transaction($callback));
+        } finally {
+            $this->clearSearchMemo();
+        }
+    }
+
+    protected function writeDocumentNgrams(int $siteId, array $terms, string $fingerprint): void
+    {
+        if ($terms === []) {
+            return;
+        }
+        $terms = array_map('strval', $terms);
+        $records = $this->readIndexRecordsBatch(array_map(static fn(string $term): string => "ngram:$siteId:$term", $terms));
+        $counts = array_column($this->createIndexReadCommand((new Query())->select(['term', 'count' => new Expression('COUNT(DISTINCT [[ngram]])')])->from($this->tablePrefix . 'ngrams}}')->where(['siteId' => $siteId, 'term' => $terms])->groupBy('term'))->queryAll(), null, 'term');
+        $changed = [];
+        $ngramRows = [];
+        $indexRows = [];
+        $stateRows = [];
+        $now = (new \DateTime())->format('Y-m-d H:i:s');
+        foreach ($terms as $term) {
+            $ngrams = $this->generateNgrams($term);
+            if (($records["ngram:$siteId:$term"]['fingerprint'] ?? null) === $fingerprint && (int)($counts[$term]['count'] ?? 0) === count($ngrams)) {
+                continue;
+            }
+            $changed[] = $term;
+            foreach ($ngrams as $ngram) {
+                $ngramRows[] = [$ngram, $term, mb_strlen($ngram, 'UTF-8'), $siteId, $now, $now, StringHelper::UUID()];
+            }
+            $indexRows[] = [$term, count($ngrams), $siteId, $now, $now, StringHelper::UUID()];
+            $stateRows[] = ["ngram:$siteId:$term", json_encode(['fingerprint' => $fingerprint], JSON_THROW_ON_ERROR), $now, $now, StringHelper::UUID()];
+        }
+        if ($changed === []) {
+            return;
+        }
+        $db = Craft::$app->getDb();
+        foreach (['ngrams', 'ngram_index'] as $table) {
+            $db->createCommand()->delete($this->tablePrefix . $table . '}}', ['siteId' => $siteId, 'term' => $changed])->execute();
+        }
+        $db->createCommand()->delete($this->tablePrefix . 'metadata}}', ['key' => array_column($stateRows, 0)])->execute();
+        foreach ([
+            ['ngrams', ['ngram', 'term', 'ngram_type', 'siteId', 'dateCreated', 'dateUpdated', 'uid'], $ngramRows],
+            ['ngram_index', ['term', 'ngram_count', 'siteId', 'dateCreated', 'dateUpdated', 'uid'], $indexRows],
+            ['metadata', ['key', 'value', 'dateCreated', 'dateUpdated', 'uid'], $stateRows],
+        ] as [$table, $columns, $rows]) {
+            foreach (array_chunk($rows, 1000) as $chunk) {
+                $db->createCommand()->batchInsert($this->tablePrefix . $table . '}}', $columns, $chunk)->execute();
+            }
+        }
+    }
+
+    protected function writePostingChanges(int $siteId, int $elementId, array $frequencies): void
+    {
+        if ($frequencies === []) {
+            return;
+        }
+        $db = Craft::$app->getDb();
+        $docId = "$siteId:$elementId";
+        $db->createCommand()->delete($this->tablePrefix . 'terms}}', ['docId' => $docId, 'term' => array_map('strval', array_keys($frequencies))])->execute();
+        $now = (new \DateTime())->format('Y-m-d H:i:s');
+        $rows = [];
+        foreach ($frequencies as $term => $frequency) {
+            $rows[] = [(string)$term, $docId, $frequency, $now, $now, StringHelper::UUID()];
+        }
+        $db->createCommand()->batchInsert($this->tablePrefix . 'terms}}', ['term', 'docId', 'frequency', 'dateCreated', 'dateUpdated', 'uid'], $rows)->execute();
+    }
     // =========================================================================
     // PROPERTIES
     // =========================================================================
@@ -82,60 +405,22 @@ class MySqlSearchAdapter extends BaseSearchAdapter
      */
     private function upsertSingletonMeta(string $key, string $value): void
     {
-        $db = Craft::$app->getDb();
-        $table = $this->tablePrefix . 'metadata}}';
-        $now = new \DateTime();
-        $dateTime = $now->format('Y-m-d H:i:s');
-        $mutex = Craft::$app->getMutex();
-        $mutexName = "bramble-search:metadata:$key";
+        $this->withPublicationGuard(function() use ($key, $value): void {
+            $db = Craft::$app->getDb();
+            $table = $this->tablePrefix . 'metadata}}';
+            $ids = $this->createIndexReadCommand((new Query())->select('id')->from($table)->where(['key' => $key])->orderBy(['id' => SORT_ASC]))->queryColumn();
+            $now = (new \DateTime())->format('Y-m-d H:i:s');
+            if ($ids === []) {
+                $db->createCommand()->insert($table, ['key' => $key, 'value' => $value, 'dateCreated' => $now, 'dateUpdated' => $now, 'uid' => StringHelper::UUID()])->execute();
 
-        if (!$mutex->acquire($mutexName, 5)) {
-            throw new \RuntimeException("Unable to acquire Bramble Search metadata lock for $key.");
-        }
-
-        try {
-            $this->withDeadlockRetry(function() use ($db, $table, $key, $value, $dateTime) {
-                $db->transaction(function() use ($db, $table, $key, $value, $dateTime) {
-                    $ids = (new Query())
-                        ->select(['id'])
-                        ->from($table)
-                        ->where(['key' => $key])
-                        ->orderBy(['id' => SORT_ASC])
-                        ->column($db);
-
-                    if (empty($ids)) {
-                        $db->createCommand()
-                            ->insert($table, [
-                                'key' => $key,
-                                'value' => $value,
-                                'dateCreated' => $dateTime,
-                                'dateUpdated' => $dateTime,
-                                'uid' => StringHelper::UUID(),
-                            ])
-                            ->execute();
-                        return;
-                    }
-
-                    $keepId = (int)array_shift($ids);
-                    if (!empty($ids)) {
-                        $db->createCommand()
-                            ->delete($table, ['id' => array_map('intval', $ids)])
-                            ->execute();
-                    }
-
-                    $db->createCommand()
-                        ->update($table, [
-                            'value' => $value,
-                            'dateUpdated' => $dateTime,
-                        ], [
-                            'id' => $keepId,
-                        ])
-                        ->execute();
-                });
-            });
-        } finally {
-            $mutex->release($mutexName);
-        }
+                return;
+            }
+            $keep = (int)array_shift($ids);
+            if ($ids !== []) {
+                $db->createCommand()->delete($table, ['id' => array_map('intval', $ids)])->execute();
+            }
+            $db->createCommand()->update($table, ['value' => $value, 'dateUpdated' => $now], ['id' => $keep])->execute();
+        });
     }
 
     // =========================================================================
@@ -151,27 +436,11 @@ class MySqlSearchAdapter extends BaseSearchAdapter
      */
     protected function getDocumentTerms(int $siteId, int $elementId): array
     {
-        $terms = (new Query())
-            ->select(['term', 'frequency'])
-            ->from($this->tablePrefix . 'documents}}')
-            ->where(['siteId' => $siteId, 'elementId' => $elementId])
-            ->all();
+        $rows = $this->createIndexReadCommand((new Query())->select(['term', 'frequency'])->from($this->tablePrefix . 'documents}}')->where(['siteId' => $siteId, 'elementId' => $elementId]))->queryAll();
+        $terms = array_map('intval', array_column($rows, 'frequency', 'term'));
+        unset($terms['_length']);
 
-        if (empty($terms)) {
-            return [];
-        }
-
-        $result = [];
-        foreach ($terms as $term) {
-            $result[$term['term']] = (int)$term['frequency'];
-        }
-
-        // Remove the _length key which isn't a term
-        if (isset($result['_length'])) {
-            unset($result['_length']);
-        }
-
-        return $result;
+        return $terms;
     }
 
     /**
@@ -245,24 +514,10 @@ class MySqlSearchAdapter extends BaseSearchAdapter
      */
     protected function getDocumentLength(string $docId): int
     {
-        [$siteId, $elementId] = explode(':', $docId);
+        [$siteId, $elementId] = array_map('intval', explode(':', $docId, 2));
+        $length = $this->createIndexReadCommand((new Query())->select('frequency')->from($this->tablePrefix . 'documents}}')->where(['siteId' => $siteId, 'elementId' => $elementId, 'term' => '_length']))->queryScalar();
 
-        $result = (new Query())
-            ->select(['frequency'])
-            ->from($this->tablePrefix . 'documents}}')
-            ->where([
-                'siteId' => $siteId,
-                'elementId' => $elementId,
-                'term' => '_length',
-            ])
-            ->scalar();
-
-        // Handle false return
-        if ($result === false || !is_numeric($result)) {
-            return 0;
-        }
-
-        return (int)$result;
+        return $length === false ? 0 : (int)$length;
     }
 
     /**
@@ -318,30 +573,14 @@ class MySqlSearchAdapter extends BaseSearchAdapter
      */
     protected function addDocumentToIndex(int $siteId, int $elementId): void
     {
-        $now = new \DateTime();
-        $dateTime = $now->format('Y-m-d H:i:s');
-        $docId = "{$siteId}:{$elementId}";
-
-        $this->withDeadlockRetry(function() use ($docId, $dateTime) {
-            $db = Craft::$app->getDb();
-            $db->transaction(function() use ($db, $docId, $dateTime) {
-                $db->createCommand()
-                    ->delete($this->tablePrefix . 'metadata}}', [
-                        'key' => 'doc',
-                        'value' => $docId,
-                    ])
-                    ->execute();
-
-                $db->createCommand()
-                    ->insert($this->tablePrefix . 'metadata}}', [
-                        'key' => 'doc',
-                        'value' => $docId,
-                        'dateCreated' => $dateTime,
-                        'dateUpdated' => $dateTime,
-                        'uid' => StringHelper::UUID(),
-                    ])
-                    ->execute();
-            });
+        $this->withPublicationGuard(function() use ($siteId, $elementId): void {
+            $table = $this->tablePrefix . 'metadata}}';
+            $docId = "$siteId:$elementId";
+            if ($this->createIndexReadCommand((new Query())->select(new Expression('1'))->from($table)->where(['key' => 'doc', 'value' => $docId])->limit(1))->queryScalar() !== false) {
+                return;
+            }
+            $now = (new \DateTime())->format('Y-m-d H:i:s');
+            Craft::$app->getDb()->createCommand()->insert($table, ['key' => 'doc', 'value' => $docId, 'dateCreated' => $now, 'dateUpdated' => $now, 'uid' => StringHelper::UUID()])->execute();
         });
     }
 
@@ -350,7 +589,7 @@ class MySqlSearchAdapter extends BaseSearchAdapter
      */
     public function refreshTotalDocCount(): void
     {
-        $this->updateTotalDocCount();
+        $this->refreshCommittedTotals();
     }
 
     /**
@@ -359,13 +598,7 @@ class MySqlSearchAdapter extends BaseSearchAdapter
      */
     public function refreshTotalLength(): void
     {
-        $result = (new Query())
-            ->from($this->tablePrefix . 'documents}}')
-            ->where(['term' => '_length'])
-            ->sum('frequency');
-
-        $totalLength = $result ? (int)$result : 0;
-        $this->upsertSingletonMeta('totalLength', (string)$totalLength);
+        $this->refreshCommittedTotals();
     }
 
     /**
@@ -374,13 +607,7 @@ class MySqlSearchAdapter extends BaseSearchAdapter
      */
     protected function updateTotalDocCount(): void
     {
-        $count = (new Query())
-            ->select(new Expression('COUNT(DISTINCT [[value]])'))
-            ->from($this->tablePrefix . 'metadata}}')
-            ->where(['key' => 'doc'])
-            ->scalar();
-
-        $this->upsertSingletonMeta('totalDocs', (string)((int)$count));
+        $this->refreshCommittedTotals();
     }
 
     /**
@@ -392,61 +619,10 @@ class MySqlSearchAdapter extends BaseSearchAdapter
      */
     protected function updateTotalLength(int $docLen): void
     {
-        $db = Craft::$app->getDb();
-        $table = $this->tablePrefix . 'metadata}}';
-        $now = new \DateTime();
-        $dateTime = $now->format('Y-m-d H:i:s');
-        $mutex = Craft::$app->getMutex();
-        $mutexName = 'bramble-search:metadata:totalLength';
-
-        if (!$mutex->acquire($mutexName, 5)) {
-            throw new \RuntimeException('Unable to acquire Bramble Search metadata lock for totalLength.');
-        }
-
-        try {
-            $this->withDeadlockRetry(function() use ($db, $table, $docLen, $dateTime) {
-                $db->transaction(function() use ($db, $table, $docLen, $dateTime) {
-                    $rows = (new Query())
-                        ->select(['id', 'value'])
-                        ->from($table)
-                        ->where(['key' => 'totalLength'])
-                        ->orderBy(['dateUpdated' => SORT_DESC, 'id' => SORT_DESC])
-                        ->all($db);
-
-                    if (empty($rows)) {
-                        $db->createCommand()
-                            ->insert($table, [
-                                'key' => 'totalLength',
-                                'value' => (string)max(0, $docLen),
-                                'dateCreated' => $dateTime,
-                                'dateUpdated' => $dateTime,
-                                'uid' => StringHelper::UUID(),
-                            ])
-                            ->execute();
-                        return;
-                    }
-
-                    $keep = array_shift($rows);
-                    if (!empty($rows)) {
-                        $db->createCommand()
-                            ->delete($table, ['id' => array_map(fn(array $row): int => (int)$row['id'], $rows)])
-                            ->execute();
-                    }
-
-                    $totalLength = max(0, (int)$keep['value'] + $docLen);
-                    $db->createCommand()
-                        ->update($table, [
-                            'value' => (string)$totalLength,
-                            'dateUpdated' => $dateTime,
-                        ], [
-                            'id' => (int)$keep['id'],
-                        ])
-                        ->execute();
-                });
-            });
-        } finally {
-            $mutex->release($mutexName);
-        }
+        $this->withPublicationGuard(function() use ($docLen): void {
+            $this->repairIndexMetadata($this->publicationState());
+            $this->upsertSingletonMeta('totalLength', (string)max(0, $this->getTotalLength() + $docLen));
+        });
     }
 
     /**
@@ -456,19 +632,10 @@ class MySqlSearchAdapter extends BaseSearchAdapter
      */
     protected function getTotalDocCount(): int
     {
-        $result = (new Query())
-            ->select(['value'])
-            ->from($this->tablePrefix . 'metadata}}')
-            ->where(['key' => 'totalDocs'])
-            ->orderBy(['dateUpdated' => SORT_DESC, 'id' => SORT_DESC])
-            ->scalar();
+        $this->ensureIndexMetadata();
+        $value = $this->createIndexReadCommand((new Query())->select('value')->from($this->tablePrefix . 'metadata}}')->where(['key' => 'totalDocs'])->limit(1))->queryScalar();
 
-        // Handle false return
-        if ($result === false || !is_numeric($result)) {
-            return 0;
-        }
-
-        return (int)$result;
+        return $this->requireMetadataCounter($value);
     }
 
     /**
@@ -478,19 +645,10 @@ class MySqlSearchAdapter extends BaseSearchAdapter
      */
     protected function getTotalLength(): int
     {
-        $result = (new Query())
-            ->select(['value'])
-            ->from($this->tablePrefix . 'metadata}}')
-            ->where(['key' => 'totalLength'])
-            ->orderBy(['dateUpdated' => SORT_DESC, 'id' => SORT_DESC])
-            ->scalar();
+        $this->ensureIndexMetadata();
+        $value = $this->createIndexReadCommand((new Query())->select('value')->from($this->tablePrefix . 'metadata}}')->where(['key' => 'totalLength'])->limit(1))->queryScalar();
 
-        // Handle false return
-        if ($result === false || !is_numeric($result)) {
-            return 0;
-        }
-
-        return (int)$result;
+        return $this->requireMetadataCounter($value);
     }
 
     // =========================================================================
@@ -507,19 +665,17 @@ class MySqlSearchAdapter extends BaseSearchAdapter
      */
     protected function storeTermDocument(string $term, int $siteId, int $elementId, int $freq): void
     {
-        $now = new \DateTime();
-        $dateTime = $now->format('Y-m-d H:i:s');
-
-        Craft::$app->getDb()->createCommand()
-            ->insert($this->tablePrefix . 'terms}}', [
+        $this->withPublicationGuard(function() use ($term, $siteId, $elementId, $freq): void {
+            $now = (new \DateTime())->format('Y-m-d H:i:s');
+            Craft::$app->getDb()->createCommand()->upsert($this->tablePrefix . 'terms}}', [
                 'term' => $term,
-                'docId' => "{$siteId}:{$elementId}",
+                'docId' => "$siteId:$elementId",
                 'frequency' => $freq,
-                'dateCreated' => $dateTime,
-                'dateUpdated' => $dateTime,
+                'dateCreated' => $now,
+                'dateUpdated' => $now,
                 'uid' => StringHelper::UUID(),
-            ])
-            ->execute();
+            ], ['frequency' => $freq, 'dateUpdated' => $now])->execute();
+        });
     }
 
     /**
@@ -537,6 +693,20 @@ class MySqlSearchAdapter extends BaseSearchAdapter
                 'docId' => "{$siteId}:{$elementId}",
             ])
             ->execute();
+    }
+
+    protected function getTermDocumentsBatch(array $terms): array
+    {
+        $terms = array_map('strval', $terms);
+        $result = array_fill_keys($terms, []);
+        if ($terms === []) {
+            return $result;
+        }
+        foreach ($this->createIndexReadCommand((new Query())->select(['term', 'docId', 'frequency'])->from($this->tablePrefix . 'terms}}')->where(['term' => $terms]))->queryAll() as $row) {
+            $result[$row['term']][$row['docId']] = (int)$row['frequency'];
+        }
+
+        return $result;
     }
 
     /**
@@ -591,6 +761,9 @@ class MySqlSearchAdapter extends BaseSearchAdapter
      */
     protected function getTermsByPrefix(string $prefix, int $siteId, int $limit = 100): array
     {
+        if ($prefix === '' || $limit <= 0) {
+            return [];
+        }
         $terms = (new Query())
             ->select(['term'])
             ->distinct()
@@ -736,22 +909,7 @@ class MySqlSearchAdapter extends BaseSearchAdapter
      */
     protected function getSiteDocuments(int $siteId): array
     {
-        $results = (new Query())
-            ->select(['value'])
-            ->distinct()
-            ->from($this->tablePrefix . 'metadata}}')
-            ->where([
-                'AND',
-                ['key' => 'doc'],
-                ['LIKE', 'value', "$siteId:%", false],
-            ])
-            ->column();
-
-        if (empty($results)) {
-            return [];
-        }
-
-        return array_values(array_map('strval', $results));
+        return $this->createIndexReadCommand((new Query())->select('value')->distinct()->from($this->tablePrefix . 'metadata}}')->where(['key' => 'doc'])->andWhere(['like', 'value', "$siteId:%", false]))->queryColumn();
     }
 
     /**
@@ -788,87 +946,7 @@ class MySqlSearchAdapter extends BaseSearchAdapter
      */
     public function pruneIndexForSite(int $siteId, array $activeElementIds): bool
     {
-        try {
-            $activeDocIds = [];
-            foreach ($activeElementIds as $elementId) {
-                $elementId = (int)$elementId;
-                if ($elementId > 0) {
-                    $activeDocIds["$siteId:$elementId"] = true;
-                }
-            }
-
-            $staleDocIds = array_values(array_diff($this->getSiteDocuments($siteId), array_keys($activeDocIds)));
-            if (empty($staleDocIds)) {
-                $this->updateTotalDocCount();
-                Craft::info("Search index pruned for site ID: $siteId; removed 0 stale documents", __METHOD__);
-                return true;
-            }
-
-            $db = Craft::$app->getDb();
-            $staleElementIds = array_values(array_unique(array_map(
-                fn(string $docId): int => (int)explode(':', $docId, 2)[1],
-                $staleDocIds
-            )));
-
-            $totalLength = (new Query())
-                ->from($this->tablePrefix . 'documents}}')
-                ->where([
-                    'siteId' => $siteId,
-                    'elementId' => $staleElementIds,
-                    'term' => '_length',
-                ])
-                ->sum('frequency');
-
-            foreach (array_chunk($staleDocIds, 500) as $docIdChunk) {
-                $db->createCommand()
-                    ->delete($this->tablePrefix . 'terms}}', ['docId' => $docIdChunk])
-                    ->execute();
-
-                $db->createCommand()
-                    ->delete($this->tablePrefix . 'metadata}}', [
-                        'key' => 'doc',
-                        'value' => $docIdChunk,
-                    ])
-                    ->execute();
-            }
-
-            foreach (array_chunk($staleElementIds, 500) as $elementIdChunk) {
-                $db->createCommand()
-                    ->delete($this->tablePrefix . 'documents}}', [
-                        'siteId' => $siteId,
-                        'elementId' => $elementIdChunk,
-                    ])
-                    ->execute();
-
-                $db->createCommand()
-                    ->delete($this->tablePrefix . 'titles}}', [
-                        'siteId' => $siteId,
-                        'elementId' => $elementIdChunk,
-                    ])
-                    ->execute();
-            }
-
-            if ($totalLength) {
-                $this->updateTotalLength(-(int)$totalLength);
-            }
-
-            $this->updateTotalDocCount();
-
-            Craft::info(
-                sprintf(
-                    'Search index pruned for site ID: %d; removed %d stale document%s',
-                    $siteId,
-                    count($staleDocIds),
-                    count($staleDocIds) === 1 ? '' : 's'
-                ),
-                __METHOD__
-            );
-
-            return true;
-        } catch (\Throwable $e) {
-            Craft::error("Error pruning search index: " . $e->getMessage(), __METHOD__);
-            return false;
-        }
+        return parent::pruneIndexForSite($siteId, $activeElementIds);
     }
 
     // =========================================================================
@@ -1093,170 +1171,7 @@ class MySqlSearchAdapter extends BaseSearchAdapter
      */
     protected function indexElementAttributesUnlocked(ElementInterface $element, array|null $fieldHandles = null): bool
     {
-        if (!$element->id || !$element->siteId) {
-            return true;
-        }
-
-        if (($element->dateDeleted ?? null) !== null || !$element->enabled || !$element->getEnabledForSite()) {
-            return $this->removeElementFromIndexAndUpdateMetadata($element);
-        }
-
-        if (ElementHelper::isDraftOrRevision($element)) {
-            return $this->removeElementFromIndexAndUpdateMetadata($element);
-        }
-
-        if (property_exists($element, 'isProvisionalDraft') && $element->isProvisionalDraft) {
-            return $this->removeElementFromIndexAndUpdateMetadata($element);
-        }
-
-        $elementType = get_class($element);
-        if ($elementType::hasTitles() && empty($element->title)) {
-            return $this->removeElementFromIndexAndUpdateMetadata($element);
-        }
-
-        $db = Craft::$app->getDb();
-        $now = (new \DateTime())->format('Y-m-d H:i:s');
-
-        $title = $element->title ?? '';
-        $titleTokens = $this->tokenize($title);
-        $titleTerms = array_flip($titleTokens);
-
-        $fieldHandles = $this->resolveFieldHandlesForIndexing($element, $fieldHandles);
-        $attributesOnly = $fieldHandles === [];
-        $termSources = [];
-
-        $text = '';
-        foreach (ElementHelper::searchableAttributes($element) as $attribute) {
-            $value = $this->normalizeIndexKeywords($element, $element->getSearchKeywords($attribute), $attribute);
-            if (!empty($value)) {
-                $text .= ' ' . $value;
-                foreach ($this->tokenize($value) as $sourceTerm) {
-                    $termSources[$sourceTerm][] = "attr:$attribute";
-                }
-            }
-        }
-
-        if (!$attributesOnly) {
-            foreach ($fieldHandles as $handle) {
-                $fieldLayout = $element->getFieldLayout();
-                $field = $fieldLayout?->getFieldByHandle($handle);
-                if (!$field || !$field->searchable) {
-                    continue;
-                }
-
-                $fieldValue = $element->getFieldValue($handle);
-                if ($fieldValue) {
-                    $keywords = $this->normalizeIndexKeywords(
-                        $element,
-                        $field->getSearchKeywords($fieldValue, $element),
-                        null,
-                        (int)$field->id
-                    );
-                    if (!empty($keywords)) {
-                        $text .= ' ' . $keywords;
-                        foreach ($this->tokenize($keywords) as $sourceTerm) {
-                            $termSources[$sourceTerm][] = "field:$handle";
-                        }
-                    }
-                }
-            }
-        } else {
-            $termSources = $this->mergeTermSourcesWithExistingFieldTerms($element->siteId, $element->id, $termSources);
-            $text .= $this->getExistingFieldTextFromIndex($element->siteId, $element->id);
-        }
-
-        $termFreqs = $this->buildIndexedTermFrequencies($text, $titleTokens);
-        $docLen = array_sum($termFreqs);
-
-        $siteId = $element->siteId;
-        $elementId = $element->id;
-        $oldDocLength = $this->getDocumentLength("$siteId:$elementId");
-
-        $db->createCommand()->delete($this->tablePrefix . 'terms}}', [
-            'docId' => "$siteId:$elementId",
-        ])->execute();
-        $this->deleteDocument($siteId, $elementId);
-        $this->deleteTitleTerms($siteId, $elementId);
-        $this->removeDocumentFromIndex($siteId, $elementId);
-
-        $this->storeDocument($siteId, $elementId, $termFreqs, $docLen);
-        $this->storeTitleTerms($siteId, $elementId, $titleTerms);
-        $this->storeDocumentTermSources($siteId, $elementId, $termSources);
-
-        if (!empty($termFreqs)) {
-            $termBatch = [];
-            foreach ($termFreqs as $term => $freq) {
-                $termBatch[] = [
-                    'term' => $term,
-                    'docId' => "$siteId:$elementId",
-                    'frequency' => $freq,
-                    'dateCreated' => $now,
-                    'dateUpdated' => $now,
-                    'uid' => StringHelper::UUID(),
-                ];
-            }
-            $db->createCommand()->batchInsert(
-                $this->tablePrefix . 'terms}}',
-                ['term', 'docId', 'frequency', 'dateCreated', 'dateUpdated', 'uid'],
-                $termBatch
-            )->execute();
-        }
-
-        $ngramBatch = [];
-        $ngramIndexBatch = [];
-        foreach (array_keys($termFreqs) as $term) {
-            // Same stale-n-gram guard as the base indexElementAttributesUnlocked(): existence
-            // alone isn't enough after an ngramSizes setting change.
-            if (!$this->termNgramsCurrent($term, $siteId)) {
-                $ngrams = $this->generateNgrams($term);
-                if (!empty($ngrams)) {
-                    foreach ($ngrams as $ngram) {
-                        $ngramBatch[] = [
-                            'ngram' => $ngram,
-                            'term' => $term,
-                            'ngram_type' => mb_strlen($ngram, 'UTF-8'),
-                            'siteId' => $siteId,
-                            'dateCreated' => $now,
-                            'dateUpdated' => $now,
-                            'uid' => StringHelper::UUID(),
-                        ];
-                    }
-                    $ngramIndexBatch[] = [
-                        'term' => $term,
-                        'ngram_count' => count($ngrams),
-                        'siteId' => $siteId,
-                        'dateCreated' => $now,
-                        'dateUpdated' => $now,
-                        'uid' => StringHelper::UUID(),
-                    ];
-                }
-            }
-        }
-        if (!empty($ngramBatch)) {
-            $db->createCommand()->batchInsert(
-                $this->tablePrefix . 'ngrams}}',
-                ['ngram', 'term', 'ngram_type', 'siteId', 'dateCreated', 'dateUpdated', 'uid'],
-                $ngramBatch
-            )->execute();
-        }
-        if (!empty($ngramIndexBatch)) {
-            foreach ($ngramIndexBatch as $row) {
-                $db->createCommand()->upsert(
-                    $this->tablePrefix . 'ngram_index}}',
-                    $row,
-                    ['ngram_count' => $row['ngram_count'], 'dateUpdated' => $now]
-                )->execute();
-            }
-        }
-
-        $this->addDocumentToIndex($siteId, $elementId);
-        $this->updateTotalLength($docLen - $oldDocLength);
-
-        if (!$this->bulkMode) {
-            $this->updateTotalDocCount();
-        }
-
-        return true;
+        return $this->mutateDocument($element, $fieldHandles);
     }
 
     // =========================================================================
@@ -1275,45 +1190,10 @@ class MySqlSearchAdapter extends BaseSearchAdapter
     public function clearIndex(int $siteId): bool
     {
         try {
-            $db = Craft::$app->getDb();
+            return $this->deleteSiteSnapshot($siteId);
+        } catch (\Throwable $exception) {
+            Craft::error('Unable to clear the search index: ' . $exception->getMessage(), __METHOD__);
 
-            // Bulk delete all documents for this site
-            $db->createCommand()
-                ->delete($this->tablePrefix . 'documents}}', ['siteId' => $siteId])
-                ->execute();
-
-            // Bulk delete all titles for this site
-            $db->createCommand()
-                ->delete($this->tablePrefix . 'titles}}', ['siteId' => $siteId])
-                ->execute();
-
-            // Bulk delete all terms whose docId starts with this siteId
-            $db->createCommand()
-                ->delete($this->tablePrefix . 'terms}}', [
-                    'LIKE', 'docId', "$siteId:%", false,
-                ])
-                ->execute();
-
-            // Bulk delete metadata doc entries for this site
-            $db->createCommand()
-                ->delete($this->tablePrefix . 'metadata}}', [
-                    'AND',
-                    ['key' => 'doc'],
-                    ['LIKE', 'value', "$siteId:%", false],
-                ])
-                ->execute();
-
-            // Clear n-grams for this site
-            $this->clearNgrams($siteId);
-
-            // Refresh totals across all remaining sites
-            $this->refreshTotalLength();
-            $this->updateTotalDocCount();
-
-            Craft::info("Search index cleared (bulk) for site ID: $siteId", __METHOD__);
-            return true;
-        } catch (\Throwable $e) {
-            Craft::error("Error clearing search index: " . $e->getMessage(), __METHOD__);
             return false;
         }
     }
@@ -1349,17 +1229,7 @@ class MySqlSearchAdapter extends BaseSearchAdapter
      */
     protected function getDocumentTermSources(int $siteId, int $elementId): array
     {
-        $value = (new Query())
-            ->select(['value'])
-            ->from($this->tablePrefix . 'metadata}}')
-            ->where(['key' => "term_sources:$siteId:$elementId"])
-            ->scalar();
-
-        if (!$value) {
-            return [];
-        }
-
-        return json_decode((string)$value, true, 512, JSON_THROW_ON_ERROR) ?: [];
+        return parent::getDocumentTermSources($siteId, $elementId);
     }
 
     protected function deleteDocumentTermSources(int $siteId, int $elementId): void

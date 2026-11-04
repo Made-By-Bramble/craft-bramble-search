@@ -14,9 +14,12 @@ use craft\helpers\ElementHelper;
 use craft\helpers\Search as SearchHelper;
 use craft\search\SearchQuery;
 use craft\services\Search;
+use MadeByBramble\BrambleSearch\helpers\IndexableElements;
+use MadeByBramble\BrambleSearch\helpers\NumericTerm;
+use MadeByBramble\BrambleSearch\helpers\RebuildState;
 use MadeByBramble\BrambleSearch\helpers\SearchQueryParser;
+use MadeByBramble\BrambleSearch\helpers\TitleAliases;
 use MadeByBramble\BrambleSearch\models\Settings;
-use yii\log\Logger;
 
 /**
  * Base Search Adapter
@@ -27,6 +30,8 @@ use yii\log\Logger;
  */
 abstract class BaseSearchAdapter extends Search
 {
+    use DocumentStateTrait;
+    use PrefixLifecycleTrait;
     // =========================================================================
     // PROPERTIES
     // =========================================================================
@@ -88,6 +93,8 @@ abstract class BaseSearchAdapter extends Search
      */
     protected bool $siteSearchAsYouType = false;
 
+    protected array $titleAliases = [];
+
     /**
      * Request-scoped read caches, cleared whenever the index is mutated
      */
@@ -128,6 +135,7 @@ abstract class BaseSearchAdapter extends Search
         }
 
         $this->stopWords = Settings::mergeStopWordLists($bundled, $extra, $remove);
+        $this->titleAliases = TitleAliases::compile($plugin?->getSettings()->titleAliases ?? [], $this->stopWords);
     }
 
     /**
@@ -169,6 +177,9 @@ abstract class BaseSearchAdapter extends Search
      */
     public function indexElementAttributes(ElementInterface $element, array|null $fieldHandles = null): bool
     {
+        if ($element->id && $element->siteId && !$element::isLocalized() && Craft::$app->getSites()->getPrimarySite()->id !== $element->siteId) {
+            throw new \RuntimeException('Primary-only elements cannot be indexed on a secondary site.');
+        }
         return $this->withElementIndexLock(
             $element,
             fn() => $this->indexElementAttributesUnlocked($element, $fieldHandles)
@@ -198,23 +209,62 @@ abstract class BaseSearchAdapter extends Search
      */
     protected function withElementIndexLock(ElementInterface $element, callable $callback): bool
     {
-        if (!$element->id || !$element->siteId) {
+        return !$element->id || !$element->siteId ? true : $this->withElementIndexLockById($element->id, $element->siteId, $callback);
+    }
+
+    protected function withElementIndexLockById(int $id, int $siteId, callable $callback): bool
+    {
+        return $this->withDocumentIndexLock($siteId, $id, $callback);
+    }
+
+    public function indexPersistedElement(string $type, int $id, int $siteId, ?array $fieldHandles = null): bool
+    {
+        if ($id <= 0 || $siteId <= 0) {
+            throw new \InvalidArgumentException('Persisted indexing requires a positive element and site ID.');
+        }
+        IndexableElements::assertFreshReadContext();
+        $siteId = IndexableElements::siteIdForType($type, $siteId);
+
+        return $this->withElementIndexLockById($id, $siteId, fn(): bool => $this->indexPersistedElementUnlocked($type, $id, $siteId, $fieldHandles));
+    }
+
+    public function indexElementIfQueued(int $elementId, int $siteId, ?string $elementType = null): void
+    {
+        if (!method_exists(Search::class, __FUNCTION__)) {
+            throw new \RuntimeException('Native queued indexing requires Craft 5.7 or later.');
+        }
+        IndexableElements::assertFreshReadContext();
+        $elementType ??= Craft::$app->getElements()->getElementTypeById($elementId);
+        if ($elementType !== null) {
+            $siteId = IndexableElements::siteIdForType($elementType, $siteId);
+        }
+        $this->withElementIndexLockById($elementId, $siteId, function() use ($elementId, $siteId, $elementType): bool {
+            parent::indexElementIfQueued($elementId, $siteId, $elementType);
+
             return true;
-        }
+        });
+    }
 
-        $mutex = Craft::$app->getMutex();
-        $lockKey = "searchindex:$element->id:$element->siteId";
+    protected function indexPersistedElementUnlocked(string $type, int $id, int $siteId, ?array $fieldHandles): bool
+    {
+        $element = IndexableElements::load($type, $id, $siteId);
 
-        if (!$mutex->acquire($lockKey)) {
-            // Match Craft's behavior: assume the concurrent writer has the freshest state.
-            return true;
-        }
+        return $element === null || !IndexableElements::isEligible($element)
+            ? $this->publishDocumentDeletion($siteId, $id)
+            : $this->indexElementAttributesUnlocked($element, $fieldHandles);
+    }
 
-        try {
-            return (bool)$callback();
-        } finally {
-            $mutex->release($lockKey);
-        }
+    public function auditIndexMetadata(): array
+    {
+        return $this->withPublicationGuard(function(): array {
+            $publication = $this->publicationState();
+            $publication['dirty'] = true;
+            $this->writeIndexRecord('publication', $publication);
+            $this->repairIndexMetadata($publication);
+            $this->clearSearchMemo();
+
+            return ['documents' => $this->getTotalDocCount(), 'length' => $this->getTotalLength()];
+        });
     }
 
     /**
@@ -226,160 +276,7 @@ abstract class BaseSearchAdapter extends Search
      */
     protected function indexElementAttributesUnlocked(ElementInterface $element, array|null $fieldHandles = null): bool
     {
-        // Skip elements without ID or site ID
-        if (!$element->id || !$element->siteId) {
-            return true;
-        }
-
-        $this->clearSearchMemo();
-
-        if (($element->dateDeleted ?? null) !== null || !$element->enabled || !$element->getEnabledForSite()) {
-            return $this->removeElementFromIndexAndUpdateMetadata($element);
-        }
-
-        // Skip drafts and revisions
-        if (ElementHelper::isDraftOrRevision($element)) {
-            return $this->removeElementFromIndexAndUpdateMetadata($element);
-        }
-
-        // Skip provisional drafts
-        if (property_exists($element, 'isProvisionalDraft') && $element->isProvisionalDraft) {
-            return $this->removeElementFromIndexAndUpdateMetadata($element);
-        }
-
-        // Skip elements that should have titles but don't (e.g., section entries in Craft 5)
-        // Only apply this check to element types that explicitly support titles
-        $elementType = get_class($element);
-        if ($elementType::hasTitles() && empty($element->title)) {
-            return $this->removeElementFromIndexAndUpdateMetadata($element);
-        }
-
-        // Prepare log data
-        $logData = [
-            'elementId' => $element->id,
-            'siteId' => $element->siteId,
-            'elementType' => get_class($element),
-            'title' => $element->title ?? '(no title)',
-            'fields' => [],
-        ];
-
-        // Process title for special handling
-        $title = $element->title ?? '';
-        $titleTokens = $this->tokenize($title);
-        $titleTerms = array_flip($titleTokens); // Convert to associative array for faster lookups
-
-        $logData['titleTokens'] = $titleTokens;
-
-        $fieldHandles = $this->resolveFieldHandlesForIndexing($element, $fieldHandles);
-        $attributesOnly = $fieldHandles === [];
-        $termSources = [];
-
-        // Process all content using Craft's searchable attributes
-        $text = '';
-
-        // Process element attributes
-        foreach (ElementHelper::searchableAttributes($element) as $attribute) {
-            $value = $this->normalizeIndexKeywords($element, $element->getSearchKeywords($attribute), $attribute);
-            if (!empty($value)) {
-                $text .= ' ' . $value;
-                $logData['fields'][$attribute] = $value;
-                foreach ($this->tokenize($value) as $sourceTerm) {
-                    $termSources[$sourceTerm][] = "attr:$attribute";
-                }
-            }
-        }
-
-        // Process custom fields when not attributes-only
-        if (!$attributesOnly) {
-            foreach ($fieldHandles as $handle) {
-                $fieldLayout = $element->getFieldLayout();
-                $field = $fieldLayout?->getFieldByHandle($handle);
-                if (!$field || !$field->searchable) {
-                    continue;
-                }
-
-                $fieldValue = $element->getFieldValue($handle);
-                if ($fieldValue) {
-                    $keywords = $this->normalizeIndexKeywords(
-                        $element,
-                        $field->getSearchKeywords($fieldValue, $element),
-                        null,
-                        (int)$field->id
-                    );
-                    if (!empty($keywords)) {
-                        $text .= ' ' . $keywords;
-                        $logData['fields'][$handle] = $keywords;
-                        foreach ($this->tokenize($keywords) as $sourceTerm) {
-                            $termSources[$sourceTerm][] = "field:$handle";
-                        }
-                    }
-                }
-            }
-        } elseif ($element->id && $element->siteId) {
-            $termSources = $this->mergeTermSourcesWithExistingFieldTerms(
-                $element->siteId,
-                $element->id,
-                $termSources
-            );
-            $text .= $this->getExistingFieldTextFromIndex($element->siteId, $element->id);
-        }
-
-        $termFreqs = $this->buildIndexedTermFrequencies($text, $titleTokens);
-        $docLen = array_sum($termFreqs);
-
-        // Add tokenization results to log data
-        $logData['allTokens'] = array_keys($termFreqs);
-        $logData['termFrequencies'] = $termFreqs;
-        $logData['documentLength'] = $docLen;
-
-        $oldDocLength = $this->getDocumentLength("{$element->siteId}:{$element->id}");
-
-        // Get old terms to clean up
-        $oldTerms = $this->getDocumentTerms($element->siteId, $element->id);
-        $logData['oldTerms'] = $oldTerms;
-
-        foreach ($oldTerms as $term => $freq) {
-            $this->removeTermDocument($term, $element->siteId, $element->id);
-        }
-
-        // Delete the old document and title terms
-        $this->deleteDocument($element->siteId, $element->id);
-        $this->deleteTitleTerms($element->siteId, $element->id);
-
-        // Store new document data and title terms
-        $this->storeDocument($element->siteId, $element->id, $termFreqs, $docLen);
-        $this->storeTitleTerms($element->siteId, $element->id, $titleTerms);
-        $this->storeDocumentTermSources($element->siteId, $element->id, $termSources);
-
-        // Update term indices
-        foreach ($termFreqs as $term => $freq) {
-            $this->storeTermDocument($term, $element->siteId, $element->id, $freq);
-        }
-
-        // Generate and store n-grams for fuzzy search
-        foreach (array_keys($termFreqs) as $term) {
-            // Only regenerate n-grams for terms that don't already have current ones
-            if (!$this->termNgramsCurrent($term, $element->siteId)) {
-                $ngrams = $this->generateNgrams($term);
-                if (!empty($ngrams)) {
-                    $this->storeTermNgrams($term, $ngrams, $element->siteId);
-                }
-            }
-        }
-
-        // Update metadata
-        $this->addDocumentToIndex($element->siteId, $element->id);
-        $this->updateTotalDocCount();
-        $this->updateTotalLength($docLen - $oldDocLength);
-
-        // Log the indexing operation with all collected data
-        Craft::getLogger()->log(
-            $this->formatLogMessage($logData),
-            Logger::LEVEL_TRACE,
-            'bramble-search'
-        );
-
-        return true;
+        return $this->mutateDocument($element, $fieldHandles);
     }
 
     /**
@@ -387,58 +284,18 @@ abstract class BaseSearchAdapter extends Search
      */
     protected function removeElementFromIndexAndUpdateMetadata(ElementInterface $element): bool
     {
-        if (!$element->id || !$element->siteId) {
-            return true;
-        }
-
-        $this->clearSearchMemo();
-
-        $oldDocLength = $this->getDocumentLength("{$element->siteId}:{$element->id}");
-        if (!$this->deleteElementFromIndex($element->id, $element->siteId)) {
-            return false;
-        }
-
-        if ($oldDocLength > 0) {
-            $this->updateTotalLength(-$oldDocLength);
-        }
-        $this->updateTotalDocCount();
-
-        return true;
+        return !$element->id || !$element->siteId || $this->deleteElementFromIndex($element->id, $element->siteId);
     }
 
     /**
-     * Always use searchElements() for searches since we don't populate Craft's native searchindex table.
-     *
-     * Only returns true when there's actually a search query, to avoid Craft's code path that
-     * assumes orderBy['score'] exists when shouldCallSearchElements() returns true.
+     * Explicit score ordering uses the scored event boundary; other queries share its resolver.
      *
      * @param ElementQuery $elementQuery
      * @return bool
      */
     public function shouldCallSearchElements(ElementQuery $elementQuery): bool
     {
-        if (empty($elementQuery->search)) {
-            return false;
-        }
-
-        if (isset($elementQuery->orderBy['score'])) {
-            return true;
-        }
-
-        $parsed = SearchQueryParser::parse($elementQuery->search);
-
-        foreach ($parsed['andGroups'] as $group) {
-            if (count($group['terms']) > 1) {
-                return true;
-            }
-            foreach ($group['terms'] as $term) {
-                if (!empty($term['attribute']) || !empty($term['subLeft']) || !empty($term['exact'])) {
-                    return true;
-                }
-            }
-        }
-
-        return false;
+        return $elementQuery->search !== null && isset($elementQuery->orderBy['score']);
     }
 
     /**
@@ -457,40 +314,38 @@ abstract class BaseSearchAdapter extends Search
         $parsed = SearchQueryParser::parse($searchQuery);
         $parsed = $this->expandMultiTokenTerms($parsed);
         $parsed = $this->filterStopWordGroups($parsed);
-        $siteIds = $this->resolveQuerySiteIds($elementQuery);
-        $elementIds = [];
-
-        foreach ($siteIds as $siteId) {
-            $docIds = $this->findMatchingDocIdsForParsedQuery(
-                $parsed,
-                $siteId,
-                $elementQuery,
-                scored: false
-            );
-            foreach ($docIds as $docId) {
-                [, $elementId] = explode(':', (string)$docId, 2);
-                $elementIds[] = (int)$elementId;
+        $matches = [];
+        if ($this->hasEventHandlers(self::EVENT_BEFORE_SEARCH)
+            || $this->hasEventHandlers(self::EVENT_BEFORE_SCORE_RESULTS)
+            || $this->hasEventHandlers(self::EVENT_AFTER_SEARCH)) {
+            $eventQuery = clone $elementQuery;
+            $eventQuery->search($searchQuery);
+            foreach (array_keys($this->searchElements($eventQuery)) as $key) {
+                if (preg_match('/\A([1-9][0-9]*)-([1-9][0-9]*)\z/D', (string)$key, $parts) === 1) {
+                    $matches[(int)$parts[2]][] = (int)$parts[1];
+                }
+            }
+        } else {
+            foreach ($this->resolveQuerySiteIds($elementQuery) as $siteId) {
+                foreach ($this->findMatchingDocIdsForParsedQuery($parsed, $siteId, $elementQuery, false) as $docId) {
+                    [, $elementId] = explode(':', (string)$docId, 2);
+                    $matches[$siteId][] = (int)$elementId;
+                }
             }
         }
-
-        $elementIds = array_values(array_unique(array_filter($elementIds)));
-        if (empty($elementIds)) {
+        if ($matches === []) {
             return false;
         }
-
-        $query = (new Query())
-            ->select(['elementId' => 'elementId', 'siteId' => 'siteId'])
-            ->from(['{{%elements_sites}}'])
-            ->where(['elementId' => $elementIds]);
-
-        if ($elementQuery->siteId !== null && $elementQuery->siteId !== '*') {
-            $siteFilter = is_array($elementQuery->siteId)
-                ? $elementQuery->siteId
-                : [$elementQuery->siteId];
-            $query->andWhere(['siteId' => $siteFilter]);
+        $condition = ['or'];
+        foreach ($matches as $siteId => $ids) {
+            $condition[] = ['bs_matches.siteId' => $siteId, 'bs_matches.elementId' => array_values(array_unique($ids))];
         }
 
-        return $query;
+        return (new Query())
+            ->select(['elementId' => 'bs_matches.elementId', 'siteId' => 'bs_matches.siteId'])
+            ->from(['bs_matches' => '{{%elements_sites}}'])
+            ->where($condition)
+            ->andWhere(new \yii\db\Expression('[[bs_matches.siteId]] = [[elements_sites.siteId]]'));
     }
 
     /**
@@ -503,7 +358,7 @@ abstract class BaseSearchAdapter extends Search
     }
 
     /**
-     * @return list<int>
+     * @return list<string|null>
      */
     public function getSearchableFieldHandles(ElementInterface $element): array
     {
@@ -541,6 +396,7 @@ abstract class BaseSearchAdapter extends Search
         $this->memoTitleTerms = [];
         $this->memoDocTerms = [];
         $this->memoSearchStats = null;
+        $this->memoSourceStates = [];
     }
 
     /**
@@ -548,6 +404,7 @@ abstract class BaseSearchAdapter extends Search
      */
     protected function termDocumentsCached(string $term): array
     {
+        $this->synchronizeSearchMemo();
         return $this->memoTermDocs[$term] ??= $this->getTermDocuments($term);
     }
 
@@ -556,6 +413,7 @@ abstract class BaseSearchAdapter extends Search
      */
     protected function titleTermsCached(string $docId): array
     {
+        $this->synchronizeSearchMemo();
         return $this->memoTitleTerms[$docId] ??= $this->getTitleTerms($docId);
     }
 
@@ -564,6 +422,7 @@ abstract class BaseSearchAdapter extends Search
      */
     protected function documentTermsCached(int $siteId, int $elementId): array
     {
+        $this->synchronizeSearchMemo();
         return $this->memoDocTerms["$siteId:$elementId"] ??= $this->getDocumentTerms($siteId, $elementId);
     }
 
@@ -574,6 +433,7 @@ abstract class BaseSearchAdapter extends Search
      */
     protected function warmTermDocuments(array $terms): void
     {
+        $this->synchronizeSearchMemo();
         $missing = [];
         foreach ($terms as $term) {
             $term = (string)$term;
@@ -594,6 +454,7 @@ abstract class BaseSearchAdapter extends Search
      */
     protected function warmTitleTerms(array $docIds): void
     {
+        $this->synchronizeSearchMemo();
         $missing = [];
         foreach ($docIds as $docId) {
             $docId = (string)$docId;
@@ -614,6 +475,7 @@ abstract class BaseSearchAdapter extends Search
      */
     protected function warmDocumentTerms(array $docIds): void
     {
+        $this->synchronizeSearchMemo();
         $missing = [];
         foreach ($docIds as $docId) {
             $docId = (string)$docId;
@@ -682,7 +544,6 @@ abstract class BaseSearchAdapter extends Search
         $parsed = $this->expandMultiTokenTerms($parsed);
         $parsed = $this->filterStopWordGroups($parsed);
         $searchQuery = $parsed['rawQuery'];
-        $siteIds = $this->resolveQuerySiteIds($elementQuery);
 
         $filteredQuery = (clone $elementQuery)
             ->select('elements.id')
@@ -698,20 +559,24 @@ abstract class BaseSearchAdapter extends Search
             ]));
         }
 
+        $siteIds = $this->resolveQuerySiteIds($filteredQuery);
         $filteredScores = [];
+        $promotions = [];
         foreach ($siteIds as $siteId) {
             $siteScores = $this->searchElementsForSite(
-                $elementQuery,
+                $filteredQuery,
                 $siteId,
                 $parsed,
-                $searchQuery
+                $searchQuery,
+                $promotions,
             );
             foreach ($siteScores as $docId => $score) {
                 $filteredScores[$docId] = ($filteredScores[$docId] ?? 0) + $score;
             }
         }
 
-        $filteredScores = $this->filterScoresByElementQuery($filteredScores, $elementQuery);
+        $filteredScores = $this->promoteDocumentScores($filteredScores, $promotions['numeric'] ?? []);
+        $filteredScores = $this->promoteDocumentScores($filteredScores, $promotions['aliases'] ?? [], $promotions['newAliases'] ?? []);
         if (empty($filteredScores)) {
             return [];
         }
@@ -726,6 +591,7 @@ abstract class BaseSearchAdapter extends Search
             ]);
             $this->trigger(self::EVENT_BEFORE_SCORE_RESULTS, $event);
             if ($event->scores !== null) {
+                $this->restrictPreparedResultSites($elementQuery, $event->scores);
                 return $event->scores;
             }
         }
@@ -752,13 +618,45 @@ abstract class BaseSearchAdapter extends Search
             }
         }
 
+        $this->restrictPreparedResultSites($elementQuery, $results);
+
         return $results;
+    }
+
+    protected function restrictPreparedResultSites(ElementQuery $query, array $scores): void
+    {
+        if ($query->subQuery === null) {
+            return;
+        }
+        if (($query->orderBy['score'] ?? null) === SORT_ASC) {
+            $scores = array_reverse($scores, true);
+        }
+        if (array_key_first($query->orderBy ?? []) === 'score') {
+            if (is_int($query->offset) && $query->offset !== 0) {
+                $scores = array_slice($scores, $query->offset, null, true);
+            }
+            if (is_int($query->limit) && $query->limit !== 0) {
+                $scores = array_slice($scores, 0, $query->limit, true);
+            }
+        }
+        $idsBySite = [];
+        foreach (array_keys($scores) as $key) {
+            if (preg_match('/\A([1-9][0-9]*)-([1-9][0-9]*)\z/D', (string)$key, $parts) !== 1) {
+                throw new \InvalidArgumentException('Search scores must identify both element and site.');
+            }
+            $idsBySite[(int)$parts[2]][] = (int)$parts[1];
+        }
+        $condition = ['or'];
+        foreach ($idsBySite as $siteId => $ids) {
+            $condition[] = ['elements_sites.siteId' => $siteId, 'elements.id' => array_values(array_unique($ids))];
+        }
+        $query->subQuery->andWhere(count($condition) > 1 ? $condition : '0=1');
     }
 
     /**
      * Score documents for a single site using parsed query semantics.
      *
-     * @param array{andGroups: list<array{terms: list<array<string, mixed>}>>, excludeTerms: list<array<string, mixed>>, rawQuery: string} $parsed
+     * @param array{andGroups: list<array{terms: list<array<string, mixed>>}>, excludeTerms: list<array<string, mixed>>, rawQuery: string} $parsed
      * @return array<string, float> docId => score
      */
     protected function searchElementsForSite(
@@ -766,88 +664,25 @@ abstract class BaseSearchAdapter extends Search
         int $siteId,
         array $parsed,
         string $searchQuery,
+        ?array &$promotions = null,
     ): array {
-        $rawTokens = $this->tokenize($searchQuery);
-        $isTypeaheadQuery = $this->isSearchAsYouTypeQuery($searchQuery, $rawTokens);
-
-        if (empty($parsed['andGroups'])) {
+        $resolved = $this->resolveMatchesForSite($elementQuery, $siteId, $parsed);
+        if ($resolved === []) {
             return [];
         }
-
+        $validDocs = $resolved['validDocs'];
+        $groupTermData = $resolved['groupTermData'];
+        $isTypeaheadQuery = $resolved['isTypeaheadQuery'];
+        $numericConstrained = $resolved['numericConstrained'] ?? false;
         $searchStats = $this->getSearchStatistics();
         $totalDocs = $searchStats['totalDocs'];
         $avgDocLength = $searchStats['avgDocLength'];
-
-        $groupMatches = [];
-        $groupMeta = [];
         $docScores = [];
-        $allDocuments = [];
-        $groupTermData = [];
-        $lastGroupIndex = array_key_last($parsed['andGroups']);
-
-        foreach ($parsed['andGroups'] as $groupIndex => $group) {
-            $groupMatches[$groupIndex] = [];
-            $groupTermData[$groupIndex] = [];
-
-            foreach ($group['terms'] as $termIndex => $termSpec) {
-                $termMatches = $this->findTermMatchesForSpec(
-                    $termSpec,
-                    $siteId,
-                    $isTypeaheadQuery,
-                    $isTypeaheadQuery
-                        && $groupIndex === $lastGroupIndex
-                        && $termIndex === array_key_last($group['terms']),
-                    $isTypeaheadQuery ? $this->collectCompletedTerms($parsed, $groupIndex, $termIndex) : [],
-                    $groupMatches,
-                    $groupIndex
-                );
-
-                foreach ($termMatches as $docId => $matchData) {
-                    $groupMatches[$groupIndex][$docId] = true;
-                    $allDocuments[$docId] = true;
-                    if (
-                        !isset($groupTermData[$groupIndex][$docId])
-                        || ($matchData['confidence'] ?? 0) > ($groupTermData[$groupIndex][$docId]['confidence'] ?? 0)
-                    ) {
-                        $groupTermData[$groupIndex][$docId] = $matchData;
-                    }
-                }
-            }
-
-            $groupMeta[$groupIndex] = [
-                'demotable' => !$this->containsExactSpec($group) && !($isTypeaheadQuery && $groupIndex === $lastGroupIndex),
-            ];
-        }
-
-        // Scope every group's doc set to the original query's element criteria BEFORE
-        // demotion/degradation runs, so those decisions can't be fooled by a cross-type
-        // match that the criteria filter would strip out later anyway (see
-        // filterDocIdsByElementQuery()'s docblock). One criteria query for the whole union.
-        $allowedDocIds = $this->filterDocIdsByElementQuery(array_keys($allDocuments), $elementQuery);
-        $scopedGroupMatches = [];
-        foreach ($groupMatches as $groupIndex => $docs) {
-            $scopedGroupMatches[$groupIndex] = array_intersect_key($docs, $allowedDocIds);
-        }
-
-        $groupMeta = $this->withGroupTitleHits($scopedGroupMatches, $groupTermData, $groupMeta);
-        $validDocs = $this->resolveValidDocsForGroups($scopedGroupMatches, $groupMeta, $totalDocs);
-        if (empty($validDocs)) {
-            return [];
-        }
-
-        foreach ($parsed['excludeTerms'] as $excludeSpec) {
-            $excludeMatches = $this->findTermMatchesForSpec($excludeSpec, $siteId, false, false, [], [], 0);
-            $validDocs = array_values(array_diff($validDocs, array_keys($excludeMatches)));
-            if (empty($validDocs)) {
-                return [];
-            }
-        }
-
-        $documentLengths = $this->getDocumentLengthsBatch(array_keys($allDocuments));
-        $this->warmTitleTerms(array_keys($allDocuments));
+        $documentLengths = $this->getDocumentLengthsBatch($validDocs);
+        $this->warmTitleTerms($validDocs);
         foreach ($groupTermData as $groupIndex => $documents) {
             foreach ($documents as $docId => $data) {
-                if (!in_array($docId, $validDocs, true)) {
+                if (!in_array($docId, $validDocs, true) || isset($resolved['newAliasDocs'][$docId])) {
                     continue;
                 }
                 if (!$this->termMatchesQueryScope($docId, $data, $elementQuery)) {
@@ -875,7 +710,7 @@ abstract class BaseSearchAdapter extends Search
 
             if (
                 $this->shouldBoostExactTitleTermSet($tokens, $isTypeaheadQuery)
-                && $this->containsExactTitleTermSet($docId, $tokens)
+                && $this->containsExactTitleTermSet($docId, $tokens, $numericConstrained)
             ) {
                 $docScores[$docId] *= $this->exactMatchBoostFactor * $this->titleBoostFactor;
                 $docScores[$docId] += $this->exactMatchBoostFactor * $this->titleBoostFactor * max(1, $totalDocs) * 10;
@@ -891,14 +726,63 @@ abstract class BaseSearchAdapter extends Search
                     $docScores[$docId] *= $this->exactMatchBoostFactor;
                 }
 
-                if ($this->containsTightTitleMatch($docId, $tokens, $isTypeaheadQuery)) {
+                if ($this->containsTightTitleMatch($docId, $tokens, $isTypeaheadQuery, $numericConstrained)) {
                     $docScores[$docId] *= $this->exactMatchBoostFactor * $this->titleBoostFactor;
                     $docScores[$docId] += $this->exactMatchBoostFactor * $this->titleBoostFactor * max(1, $totalDocs);
                 }
             }
         }
 
+        foreach ($resolved['aliasDocs'] ?? [] as $docId => $value) {
+            $promotions['aliases'][$docId] = true;
+            if (!isset($docScores[$docId])) {
+                $docScores[$docId] = 0.0;
+            }
+            if (isset($resolved['newAliasDocs'][$docId])) {
+                $promotions['newAliases'][$docId] = true;
+            }
+        }
+        foreach ($resolved['numericTitleDocs'] ?? [] as $docId => $value) {
+            $promotions['numeric'][$docId] = true;
+        }
+
         return array_intersect_key($docScores, array_flip($validDocs));
+    }
+
+    protected function promoteDocumentScores(array $scores, array $promoted, array $newDocuments = []): array
+    {
+        $promoted = array_intersect_key($promoted, $scores);
+        if ($promoted === []) {
+            return $scores;
+        }
+        arsort($scores);
+        $existing = array_keys(array_diff_key(array_intersect_key($scores, $promoted), $newDocuments));
+        $added = array_keys(array_intersect_key($newDocuments, $promoted));
+        usort($added, static function(string $left, string $right): int {
+            [$leftSite, $leftId] = array_map('intval', explode(':', $left, 2));
+            [$rightSite, $rightId] = array_map('intval', explode(':', $right, 2));
+
+            return [$leftSite, $leftId] <=> [$rightSite, $rightId];
+        });
+        $order = [...$existing, ...$added];
+        $maximum = max($scores);
+        $scale = max(1.0, abs($maximum));
+        if (!is_finite($scale) || $scale > PHP_FLOAT_MAX / 4) {
+            throw new \RuntimeException('Search scores cannot represent a finite promotion tier.');
+        }
+        $step = $scale / (count($order) + 1);
+        $previous = INF;
+        foreach ($order as $index => $docId) {
+            $score = $maximum + $scale + $step * (count($order) - $index);
+            if (!is_finite($score) || $score <= $maximum || $score >= $previous) {
+                throw new \RuntimeException('Search promotion scores must be finite and strictly ordered.');
+            }
+            $scores[$docId] = $score;
+            $previous = $score;
+        }
+        arsort($scores);
+
+        return $scores;
     }
 
     /**
@@ -918,7 +802,9 @@ abstract class BaseSearchAdapter extends Search
             return false;
         }
 
-        return true;
+        $request = Craft::$app->getRequest();
+
+        return ($request instanceof \craft\web\Request && $request->getIsCpRequest()) || $this->siteSearchAsYouType;
     }
 
     /**
@@ -1021,32 +907,30 @@ abstract class BaseSearchAdapter extends Search
             return [];
         }
 
-        $elementIds = [];
+        $idsBySite = [];
         foreach ($docIds as $docId) {
-            [, $elementId] = explode(':', (string)$docId, 2);
-            $elementIds[] = (int)$elementId;
+            [$siteId, $elementId] = explode(':', (string)$docId, 2);
+            $idsBySite[(int)$siteId][] = (int)$elementId;
         }
-        $elementIds = array_values(array_unique($elementIds));
-
-        $criteriaQuery = clone $elementQuery;
-        $criteriaQuery
-            ->search(null)
-            ->offset(null)
-            ->limit(null)
-            ->orderBy([]);
-        $criteriaQuery->andWhere(['elements.id' => $elementIds]);
-
-        try {
-            $allowedElementIds = array_fill_keys(array_map('intval', $criteriaQuery->ids()), true);
-        } catch (QueryAbortedException) {
-            return [];
-        }
-
         $allowed = [];
-        foreach ($docIds as $docId) {
-            [, $elementId] = explode(':', (string)$docId, 2);
-            if (isset($allowedElementIds[(int)$elementId])) {
-                $allowed[$docId] = true;
+        foreach ($idsBySite as $siteId => $elementIds) {
+            $criteriaQuery = clone $elementQuery;
+            $criteriaQuery
+                ->siteId($siteId)
+                ->search(null)
+                ->offset(null)
+                ->limit(null)
+                ->orderBy([]);
+            $criteriaQuery->andWhere(['elements.id' => array_values(array_unique($elementIds))]);
+            try {
+                $allowedElementIds = array_fill_keys(array_map('intval', $criteriaQuery->ids()), true);
+            } catch (QueryAbortedException) {
+                continue;
+            }
+            foreach ($elementIds as $elementId) {
+                if (isset($allowedElementIds[$elementId])) {
+                    $allowed["$siteId:$elementId"] = true;
+                }
             }
         }
 
@@ -1107,7 +991,14 @@ abstract class BaseSearchAdapter extends Search
             return [];
         }
 
-        return $this->getSearchableFieldHandles($element);
+        $searchable = $this->getSearchableFieldHandles($element);
+
+        return $fieldHandles === null ? $searchable : array_values(array_intersect($fieldHandles, $searchable));
+    }
+
+    protected function getIndexableAttributes(ElementInterface $element): array
+    {
+        return array_values(array_diff(ElementHelper::searchableAttributes($element), ['enabled', 'enabledForSite']));
     }
 
     /**
@@ -1130,7 +1021,7 @@ abstract class BaseSearchAdapter extends Search
             // ponytail: test fixtures may not have persisted sites
         }
 
-        $keywords = SearchHelper::normalizeKeywords($keywords, [], true, $language);
+        $keywords = SearchHelper::normalizeKeywords(NumericTerm::normalizeMeasurements($keywords), [], true, $language);
 
         if ($this->hasEventHandlers(self::EVENT_BEFORE_INDEX_KEYWORDS)) {
             $event = new IndexKeywordsEvent([
@@ -1152,46 +1043,6 @@ abstract class BaseSearchAdapter extends Search
     }
 
     /**
-     * @param array<string, list<string>> $attributeSources
-     * @return array<string, list<string>>
-     */
-    protected function mergeTermSourcesWithExistingFieldTerms(
-        int $siteId,
-        int $elementId,
-        array $attributeSources,
-    ): array {
-        $merged = $attributeSources;
-        foreach ($this->getDocumentTermSources($siteId, $elementId) as $term => $origins) {
-            foreach ($origins as $origin) {
-                if (str_starts_with($origin, 'field:')) {
-                    $merged[$term][] = $origin;
-                }
-            }
-        }
-
-        return $merged;
-    }
-
-    protected function getExistingFieldTextFromIndex(int $siteId, int $elementId): string
-    {
-        $terms = [];
-        foreach ($this->getDocumentTermSources($siteId, $elementId) as $term => $origins) {
-            foreach ($origins as $origin) {
-                if (str_starts_with($origin, 'field:')) {
-                    $terms[] = $term;
-                }
-            }
-        }
-
-        if (empty($terms)) {
-            $existingTerms = array_keys($this->getDocumentTerms($siteId, $elementId));
-            $terms = array_values(array_filter($existingTerms, fn(string $term): bool => $term !== '_length'));
-        }
-
-        return $terms === [] ? '' : (' ' . implode(' ', array_unique($terms)));
-    }
-
-    /**
      * @param array<string, list<string>> $termSources
      */
     protected function storeDocumentTermSources(int $siteId, int $elementId, array $termSources): void
@@ -1203,7 +1054,9 @@ abstract class BaseSearchAdapter extends Search
      */
     protected function getDocumentTermSources(int $siteId, int $elementId): array
     {
-        return [];
+        $state = $this->readDocumentSourceState($siteId, $elementId);
+
+        return $state !== null && ($state['version'] ?? null) === 2 ? $state['sources'] : ($state ?? []);
     }
 
     protected function deleteDocumentTermSources(int $siteId, int $elementId): void
@@ -1236,7 +1089,7 @@ abstract class BaseSearchAdapter extends Search
     }
 
     /**
-     * @param array{andGroups: list<array{terms: list<array<string, mixed>}>>, excludeTerms: list<array<string, mixed>>, rawQuery: string} $parsed
+     * @param array{andGroups: list<array{terms: list<array<string, mixed>>}>, excludeTerms: list<array<string, mixed>>, rawQuery: string} $parsed
      * @return list<string>
      */
     protected function flattenParsedTerms(array $parsed): array
@@ -1260,8 +1113,8 @@ abstract class BaseSearchAdapter extends Search
      * Splitting it into one AND group per token requires every token to match instead.
      * Exact terms and OR groups (multiple term specs) are left untouched.
      *
-     * @param array{andGroups: list<array{terms: list<array<string, mixed>}>>, excludeTerms: list<array<string, mixed>>, rawQuery: string} $parsed
-     * @return array{andGroups: list<array{terms: list<array<string, mixed>}>>, excludeTerms: list<array<string, mixed>>, rawQuery: string}
+     * @param array{andGroups: list<array{terms: list<array<string, mixed>>}>, excludeTerms: list<array<string, mixed>>, rawQuery: string} $parsed
+     * @return array{andGroups: list<array{terms: list<array<string, mixed>>}>, excludeTerms: list<array<string, mixed>>, rawQuery: string}
      */
     protected function expandMultiTokenTerms(array $parsed): array
     {
@@ -1311,8 +1164,8 @@ abstract class BaseSearchAdapter extends Search
      * word that is the only OTHER completed term (e.g. "your" in "your p") is kept too, matching
      * getSearchTokens()'s existing "keep the sole completed stop word" typeahead behaviour.
      *
-     * @param array{andGroups: list<array{terms: list<array<string, mixed>}>>, excludeTerms: list<array<string, mixed>>, rawQuery: string} $parsed
-     * @return array{andGroups: list<array{terms: list<array<string, mixed>}>>, excludeTerms: list<array<string, mixed>>, rawQuery: string}
+     * @param array{andGroups: list<array{terms: list<array<string, mixed>>}>, excludeTerms: list<array<string, mixed>>, rawQuery: string} $parsed
+     * @return array{andGroups: list<array{terms: list<array<string, mixed>>}>, excludeTerms: list<array<string, mixed>>, rawQuery: string}
      */
     protected function filterStopWordGroups(array $parsed): array
     {
@@ -1589,7 +1442,7 @@ abstract class BaseSearchAdapter extends Search
     }
 
     /**
-     * @param array{andGroups: list<array{terms: list<array<string, mixed>}>>, excludeTerms: list<array<string, mixed>>, rawQuery: string} $parsed
+     * @param array{andGroups: list<array{terms: list<array<string, mixed>>}>, excludeTerms: list<array<string, mixed>>, rawQuery: string} $parsed
      * @return list<string>
      */
     protected function findMatchingDocIdsForParsedQuery(
@@ -1602,27 +1455,95 @@ abstract class BaseSearchAdapter extends Search
             return array_keys($this->searchElementsForSite($elementQuery, $siteId, $parsed, $parsed['rawQuery']));
         }
 
+        return $this->resolveMatchesForSite($elementQuery, $siteId, $parsed)['validDocs'] ?? [];
+    }
+
+    protected function resolveMatchesForSite(ElementQuery $elementQuery, int $siteId, array $parsed): array
+    {
+        $resolved = $this->resolveOriginalMatchesForSite($elementQuery, $siteId, $parsed);
+        $aliases = $this->findTitleAliasDocuments($elementQuery, $siteId, $parsed);
+        if ($aliases === []) {
+            return $resolved;
+        }
+        if ($resolved === []) {
+            $resolved = ['validDocs' => [], 'groupTermData' => [], 'isTypeaheadQuery' => $this->isSearchAsYouTypeQuery($parsed['rawQuery'], $this->tokenize($parsed['rawQuery']))];
+        }
+        $resolved['newAliasDocs'] = array_diff_key($aliases, array_fill_keys($resolved['validDocs'], true));
+        $resolved['validDocs'] = array_values(array_unique([...$resolved['validDocs'], ...array_keys($aliases)]));
+        $resolved['aliasDocs'] = $aliases;
+
+        return $resolved;
+    }
+
+    protected function findTitleAliasDocuments(ElementQuery $elementQuery, int $siteId, array $parsed): array
+    {
+        if ($this->titleAliases === [] || $parsed['excludeTerms'] !== []) {
+            return [];
+        }
+        foreach ($parsed['andGroups'] as $group) {
+            if (count($group['terms']) !== 1) {
+                return [];
+            }
+            $spec = $group['terms'][0];
+            if (!empty($spec['exact']) || !empty($spec['phrase']) || !empty($spec['attribute']) || !empty($spec['subLeft'])) {
+                return [];
+            }
+        }
+        $input = TitleAliases::normalizeInput($parsed['rawQuery']);
+        $tokens = $input === null ? null : ($this->titleAliases[$input] ?? null);
+        if ($tokens === null) {
+            return [];
+        }
+        $this->warmTermDocuments($tokens);
+        $matches = null;
+        foreach ($tokens as $term) {
+            $documents = $this->filterDocumentsBySite($this->termDocumentsCached($term), $siteId);
+            $matches = $matches === null ? $documents : array_intersect_key($matches, $documents);
+            if ($matches === []) {
+                return [];
+            }
+        }
+        $this->warmTitleTerms(array_keys($matches));
+        $titleMatches = [];
+        foreach ($matches as $docId => $frequency) {
+            $title = $this->titleTermsCached($docId);
+            if (array_diff($tokens, array_map('strval', array_keys($title))) === []) {
+                $titleMatches[] = $docId;
+            }
+        }
+
+        return $this->filterDocIdsByElementQuery($titleMatches, $elementQuery);
+    }
+
+    protected function resolveOriginalMatchesForSite(ElementQuery $elementQuery, int $siteId, array $parsed): array
+    {
+        $searchQuery = $parsed['rawQuery'];
+        $rawTokens = $this->tokenize($searchQuery);
+        $isTypeaheadQuery = $this->isSearchAsYouTypeQuery($searchQuery, $rawTokens);
+
         if (empty($parsed['andGroups'])) {
             return [];
         }
 
-        $rawTokens = $this->tokenize($parsed['rawQuery']);
-        $isTypeaheadQuery = $this->isSearchAsYouTypeQuery($parsed['rawQuery'], $rawTokens);
-        $lastGroupIndex = array_key_last($parsed['andGroups']);
         $totalDocs = $this->getSearchStatistics()['totalDocs'];
 
         $groupMatches = [];
-        $groupDocSets = [];
         $groupMeta = [];
-        $groupTermData = [];
         $allDocuments = [];
+        $groupTermData = [];
+        $numericGroups = [];
+        $numericTitleHits = [];
+        $numericConstrained = false;
+        $lastGroupIndex = array_key_last($parsed['andGroups']);
 
         foreach ($parsed['andGroups'] as $groupIndex => $group) {
             $groupMatches[$groupIndex] = [];
             $groupTermData[$groupIndex] = [];
-            $groupDocIds = [];
+            $numericAlternatives = [];
 
             foreach ($group['terms'] as $termIndex => $termSpec) {
+                $finalTerm = $isTypeaheadQuery && $groupIndex === $lastGroupIndex && $termIndex === array_key_last($group['terms']);
+                $numericAlternatives[] = ($termSpec['numericEligible'] ?? true) && NumericTerm::classify((string)$termSpec['term'], $finalTerm && empty($termSpec['exact'])) !== null;
                 $termMatches = $this->findTermMatchesForSpec(
                     $termSpec,
                     $siteId,
@@ -1632,46 +1553,71 @@ abstract class BaseSearchAdapter extends Search
                         && $termIndex === array_key_last($group['terms']),
                     $isTypeaheadQuery ? $this->collectCompletedTerms($parsed, $groupIndex, $termIndex) : [],
                     $groupMatches,
-                    $groupIndex
+                    $groupIndex,
+                    collectFieldAlternatives: $elementQuery->customFields !== null,
+                    fieldScope: $elementQuery,
                 );
 
                 foreach ($termMatches as $docId => $matchData) {
                     $groupMatches[$groupIndex][$docId] = true;
-                    if ($this->termMatchesQueryScope($docId, $matchData, $elementQuery)) {
-                        $groupDocIds[] = $docId;
-                        $allDocuments[$docId] = true;
-                        if (
-                            !isset($groupTermData[$groupIndex][$docId])
-                            || ($matchData['confidence'] ?? 0) > ($groupTermData[$groupIndex][$docId]['confidence'] ?? 0)
-                        ) {
-                            $groupTermData[$groupIndex][$docId] = $matchData;
-                        }
+                    $allDocuments[$docId] = true;
+                    if ($matchData['numericTitle'] ?? false) {
+                        $numericTitleHits[$groupIndex][$docId] = true;
+                    }
+                    if ($elementQuery->customFields !== null) {
+                        $groupTermData[$groupIndex][$docId]['candidates'][] = $matchData;
+                    } elseif (
+                        !isset($groupTermData[$groupIndex][$docId])
+                        || ($matchData['confidence'] ?? 0) > ($groupTermData[$groupIndex][$docId]['confidence'] ?? 0)
+                    ) {
+                        $groupTermData[$groupIndex][$docId] = $matchData;
                     }
                 }
             }
 
-            $groupDocSets[$groupIndex] = array_fill_keys(array_values(array_unique($groupDocIds)), true);
             $groupMeta[$groupIndex] = [
-                'demotable' => !$this->containsExactSpec($group) && !($isTypeaheadQuery && $groupIndex === $lastGroupIndex),
+                'demotable' => !in_array(true, $numericAlternatives, true) && !$this->containsExactSpec($group) && !($isTypeaheadQuery && $groupIndex === $lastGroupIndex),
             ];
+            $numericConstrained = $numericConstrained || in_array(true, $numericAlternatives, true);
+            if ($numericAlternatives !== [] && !in_array(false, $numericAlternatives, true)) {
+                $numericGroups[] = $groupIndex;
+            }
         }
 
-        // See searchElementsForSite(): demotion/degradation must run on criteria-scoped
-        // doc sets, not the raw matches, or a cross-type match masks a genuine miss.
+        // Scope every group's doc set to the original query's element criteria BEFORE
+        // demotion/degradation runs, so those decisions can't be fooled by a cross-type
+        // match that the criteria filter would strip out later anyway (see
+        // filterDocIdsByElementQuery()'s docblock). One criteria query for the whole union.
+        [$groupMatches, $groupTermData] = $this->resolveFieldScopedMatches($groupMatches, $groupTermData, $elementQuery);
         $allowedDocIds = $this->filterDocIdsByElementQuery(array_keys($allDocuments), $elementQuery);
-        foreach ($groupDocSets as $groupIndex => $docSet) {
-            $groupDocSets[$groupIndex] = array_intersect_key($docSet, $allowedDocIds);
+        $scopedGroupMatches = [];
+        foreach ($groupMatches as $groupIndex => $docs) {
+            $scopedGroupMatches[$groupIndex] = array_intersect_key($docs, $allowedDocIds);
         }
 
-        $groupMeta = $this->withGroupTitleHits($groupDocSets, $groupTermData, $groupMeta);
-        $validDocs = $this->resolveValidDocsForGroups($groupDocSets, $groupMeta, $totalDocs);
+        $groupMeta = $this->withGroupTitleHits($scopedGroupMatches, $groupTermData, $groupMeta);
+        $validDocs = $this->resolveValidDocsForGroups($scopedGroupMatches, $groupMeta, $totalDocs);
+        if (empty($validDocs)) {
+            return [];
+        }
 
         foreach ($parsed['excludeTerms'] as $excludeSpec) {
-            $excludeMatches = $this->findTermMatchesForSpec($excludeSpec, $siteId, false, false, [], [], 0);
+            $excludeMatches = $this->resolveQueryScopedTermMatches($this->findTermMatchesForSpec($excludeSpec, $siteId, false, false, [], [], 0, collectFieldAlternatives: $elementQuery->customFields !== null, fieldScope: $elementQuery), $elementQuery);
             $validDocs = array_values(array_diff($validDocs, array_keys($excludeMatches)));
+            if (empty($validDocs)) {
+                return [];
+            }
         }
 
-        return $validDocs;
+        $numericTitleDocs = [];
+        if ($numericGroups !== []) {
+            $numericTitleDocs = array_fill_keys($validDocs, true);
+            foreach ($numericGroups as $groupIndex) {
+                $numericTitleDocs = array_intersect_key($numericTitleDocs, $numericTitleHits[$groupIndex] ?? []);
+            }
+        }
+
+        return compact('validDocs', 'groupTermData', 'isTypeaheadQuery', 'numericTitleDocs', 'numericConstrained');
     }
 
     /**
@@ -1690,6 +1636,8 @@ abstract class BaseSearchAdapter extends Search
         array $groupMatches,
         int $groupIndex,
         bool $allowTokenExpansion = true,
+        bool $collectFieldAlternatives = false,
+        ?ElementQuery $fieldScope = null,
     ): array {
         $term = (string)$termSpec['term'];
         $tokens = $this->getSearchTokens($term, $isTypeaheadTerm);
@@ -1715,8 +1663,14 @@ abstract class BaseSearchAdapter extends Search
                     $completedTerms,
                     $groupMatches,
                     $groupIndex,
-                    false // guard against re-expanding: a single token can only recurse one level
+                    false,
+                    $collectFieldAlternatives,
+                    $fieldScope,
                 );
+
+                if ($fieldScope !== null) {
+                    $tokenMatches = $this->resolveQueryScopedTermMatches($tokenMatches, $fieldScope);
+                }
 
                 if ($index === 0) {
                     $firstTokenMatches = $tokenMatches;
@@ -1735,8 +1689,17 @@ abstract class BaseSearchAdapter extends Search
         }
 
         $term = $tokens[0];
+        $numeric = ($termSpec['numericEligible'] ?? true) ? NumericTerm::classify($term, $isTypeaheadTerm && empty($termSpec['exact'])) : null;
+        if ($numeric !== null) {
+            $priorDocIds = $groupIndex > 0 ? $this->getDocsMatchingPreviousGroups($groupMatches, $groupIndex) : null;
+
+            return $this->findNumericTermMatches($numeric, $termSpec, $siteId, $isTypeaheadTerm, $fieldScope, $priorDocIds);
+        }
         $matches = [];
         $termDocs = $this->filterDocumentsBySite($this->termDocumentsCached($term), $siteId);
+        if (!empty($termSpec['attribute'])) {
+            $this->warmDocumentSourceStates(array_keys($termDocs));
+        }
 
         if (!empty($termDocs)) {
             $docFreq = count($termDocs);
@@ -1754,6 +1717,11 @@ abstract class BaseSearchAdapter extends Search
             }
         }
 
+        $exactMatches = $fieldScope !== null ? $this->resolveQueryScopedTermMatches($matches, $fieldScope) : $matches;
+        if (!empty($termSpec['exact'])) {
+            return $exactMatches;
+        }
+
         if ($isTypeaheadTerm) {
             $priorDocIds = $groupIndex > 0 ? $this->getDocsMatchingPreviousGroups($groupMatches, $groupIndex) : null;
             $typeaheadScores = $this->findTypeaheadMatchScores($term, $siteId, $priorDocIds, $completedTerms);
@@ -1768,11 +1736,17 @@ abstract class BaseSearchAdapter extends Search
                 $typeaheadDocIds += $docs;
             }
             $this->warmTitleTerms(array_keys($typeaheadDocIds));
+            if (!empty($termSpec['attribute'])) {
+                $this->warmDocumentSourceStates(array_keys($typeaheadDocIds));
+            }
 
             foreach ($typeaheadScores as $prefixTerm => $confidence) {
                 $prefixTerm = (string)$prefixTerm;
                 $docFreq = count($typeaheadDocs[$prefixTerm]);
                 foreach ($typeaheadDocs[$prefixTerm] as $docId => $freq) {
+                    if (!$this->termMatchesAttributeScope($docId, $prefixTerm, $termSpec)) {
+                        continue;
+                    }
                     if ($this->shouldSkipNonTitleTypeaheadMatch($term, $prefixTerm, (string)$docId)) {
                         continue;
                     }
@@ -1787,40 +1761,118 @@ abstract class BaseSearchAdapter extends Search
                         'attribute' => $termSpec['attribute'] ?? null,
                         'confidence' => $docConfidence,
                     ];
-                    if (
-                        isset($matches[$docId])
-                        && !$this->shouldReplaceSearchTermMatch($docId, $matches[$docId], $matchData)
-                    ) {
-                        continue;
-                    }
-                    $matches[$docId] = $matchData;
+                    $replace = !isset($matches[$docId]) || $this->shouldReplaceSearchTermMatch($docId, $matches[$docId], $matchData);
+                    $this->rememberTermMatch($matches, $docId, $matchData, $replace, $collectFieldAlternatives);
                 }
             }
         }
 
-        if (!$this->shouldFindFuzzyMatches($term, !empty($termDocs), count($termDocs))) {
+        if (!$this->shouldFindFuzzyMatches($term, $exactMatches !== [], count($exactMatches))) {
             return $matches;
         }
 
         $fuzzyScores = $this->findFuzzyMatchScores($term, siteId: $siteId);
         unset($fuzzyScores[$term]);
         $this->warmTermDocuments(array_keys($fuzzyScores));
+        if (!empty($termSpec['attribute'])) {
+            $sourceDocIds = [];
+            foreach (array_keys($fuzzyScores) as $candidate) {
+                $sourceDocIds += $this->filterDocumentsBySite($this->termDocumentsCached((string)$candidate), $siteId);
+            }
+            $this->warmDocumentSourceStates(array_keys($sourceDocIds));
+        }
 
         foreach ($fuzzyScores as $fuzzy => $confidence) {
             $fuzzy = (string)$fuzzy;
             $fuzzyDocs = $this->filterDocumentsBySite($this->termDocumentsCached($fuzzy), $siteId);
             $docFreq = count($fuzzyDocs);
             foreach ($fuzzyDocs as $docId => $freq) {
-                if (isset($matches[$docId]) || !$this->termMatchesAttributeScope($docId, $fuzzy, $termSpec)) {
+                if ((!$collectFieldAlternatives && isset($matches[$docId])) || !$this->termMatchesAttributeScope($docId, $fuzzy, $termSpec)) {
                     continue;
                 }
-                $matches[$docId] = [
+                $matchData = [
                     'freq' => $freq,
                     'docFreq' => $docFreq,
                     'actualTerm' => $fuzzy,
                     'attribute' => $termSpec['attribute'] ?? null,
                     'confidence' => $confidence,
                 ];
+                $this->rememberTermMatch($matches, $docId, $matchData, !isset($matches[$docId]), $collectFieldAlternatives);
+            }
+        }
+
+        return $matches;
+    }
+
+    protected function findNumericTermMatches(array $numeric, array $spec, int $siteId, bool $inProgress, ?ElementQuery $fieldScope, ?array $priorDocIds): array
+    {
+        $exact = !empty($spec['exact']);
+        $term = $numeric['digits'] . $numeric['unit'];
+        $candidates = array_fill_keys(NumericTerm::directCandidates($numeric, $exact), 1.0);
+        if ($inProgress && !$exact && $numeric['unit'] === '') {
+            if ($priorDocIds === null) {
+                $prefixTerms = $this->getTermsByPrefix($term, $siteId, $this->fuzzySearchMaxCandidates);
+            } else {
+                $this->warmDocumentTerms($priorDocIds);
+                $prefixTerms = [];
+                foreach ($priorDocIds as $docId) {
+                    [$documentSite, $elementId] = array_map('intval', explode(':', $docId, 2));
+                    if ($documentSite !== $siteId) {
+                        continue;
+                    }
+                    foreach (array_keys($this->documentTermsCached($documentSite, $elementId)) as $candidate) {
+                        $candidate = (string)$candidate;
+                        if (NumericTerm::accepts($numeric, $candidate, true)) {
+                            $prefixTerms[$candidate] = $this->calculateTypeaheadConfidence($term, $candidate);
+                        }
+                    }
+                }
+                arsort($prefixTerms);
+                $prefixTerms = array_slice($prefixTerms, 0, max($this->fuzzySearchMaxCandidates, 1000), true);
+            }
+            foreach ($prefixTerms as $candidate => $confidence) {
+                if (NumericTerm::accepts($numeric, (string)$candidate, true)) {
+                    $candidates[$candidate] = (float)$confidence;
+                }
+            }
+        }
+        $this->warmTermDocuments(array_keys($candidates));
+        $candidateDocs = [];
+        $allDocuments = [];
+        foreach ($candidates as $candidate => $confidence) {
+            if (!NumericTerm::accepts($numeric, (string)$candidate, $inProgress && !$exact, $exact)) {
+                continue;
+            }
+            $candidateDocs[$candidate] = $this->filterDocumentsBySite($this->termDocumentsCached((string)$candidate), $siteId);
+            $allDocuments += $candidateDocs[$candidate];
+        }
+        $this->warmTitleTerms(array_keys($allDocuments));
+        if (!empty($spec['attribute']) || $fieldScope?->customFields !== null) {
+            $this->warmDocumentSourceStates(array_keys($allDocuments));
+        }
+        $matches = [];
+        foreach ($candidateDocs as $candidate => $documents) {
+            $candidate = (string)$candidate;
+            foreach ($documents as $docId => $frequency) {
+                $data = [
+                    'freq' => $frequency,
+                    'docFreq' => count($documents),
+                    'actualTerm' => $candidate,
+                    'attribute' => $spec['attribute'] ?? null,
+                    'confidence' => (float)$candidates[$candidate],
+                    'numericTitle' => empty($spec['attribute']) || $spec['attribute'] === 'title',
+                ];
+                if (!$this->termMatchesAttributeScope($docId, $candidate, $spec)
+                    || ($fieldScope !== null && !$this->termMatchesQueryScope($docId, $data, $fieldScope))) {
+                    continue;
+                }
+                $title = $data['numericTitle'] && $this->isTermInTitle($candidate, $docId);
+                $data['numericTitle'] = $title || ($matches[$docId]['numericTitle'] ?? false);
+                if (!isset($matches[$docId]) || $this->shouldReplaceSearchTermMatch($docId, $matches[$docId], $data)) {
+                    $matches[$docId] = $data;
+                } else {
+                    $matches[$docId]['numericTitle'] = $data['numericTitle'];
+                }
             }
         }
 
@@ -1844,7 +1896,7 @@ abstract class BaseSearchAdapter extends Search
     }
 
     /**
-     * @param array{andGroups: list<array{terms: list<array<string, mixed>}>>, excludeTerms: list<array<string, mixed>>, rawQuery: string} $parsed
+     * @param array{andGroups: list<array{terms: list<array<string, mixed>>}>, excludeTerms: list<array<string, mixed>>, rawQuery: string} $parsed
      * @return list<string>
      */
     protected function collectCompletedTerms(array $parsed, int $groupIndex, int $termIndex): array
@@ -1906,7 +1958,7 @@ abstract class BaseSearchAdapter extends Search
             ));
         }
         if ($origins === []) {
-            return $attribute === null && ($sources === [] || $this->isTermInTitle($term, $docId));
+            return $attribute === null && $this->isTermInTitle($term, $docId);
         }
 
         $allowed = array_map(
@@ -2016,7 +2068,7 @@ abstract class BaseSearchAdapter extends Search
         array &$matches,
     ): void {
         $termLength = mb_strlen($term, 'UTF-8');
-        if ($termLength < 4) {
+        if ($termLength < 3) {
             return;
         }
 
@@ -2467,9 +2519,7 @@ abstract class BaseSearchAdapter extends Search
      */
     protected function tokenize(string $text): array
     {
-        $text = strtolower($text);
-        $text = preg_replace('/[^\p{L}\p{N}]+/u', ' ', $text);
-        return array_values(array_filter(explode(' ', $text)));
+        return SearchQueryParser::tokenize($text);
     }
 
     /**
@@ -2557,6 +2607,9 @@ abstract class BaseSearchAdapter extends Search
      */
     protected function getTermsByPrefix(string $prefix, int $siteId, int $limit = 100): array
     {
+        if ($prefix === '' || $limit <= 0) {
+            return [];
+        }
         $matches = [];
 
         foreach ($this->getAllTerms() as $term) {
@@ -2579,6 +2632,40 @@ abstract class BaseSearchAdapter extends Search
         arsort($matches);
 
         return $matches;
+    }
+
+    protected function pendingPrefixDocuments(int $siteId): array
+    {
+        return array_filter($this->publicationState()['pending'], static fn(string $docId): bool => str_starts_with($docId, "$siteId:"), ARRAY_FILTER_USE_KEY);
+    }
+
+    protected function prefixDocumentIdentity(string $docId, int $siteId): array
+    {
+        if (preg_match('/\A([1-9][0-9]*):([1-9][0-9]*)\z/D', $docId, $parts) !== 1 || (int)$parts[1] !== $siteId) {
+            throw new \RuntimeException('Invalid site prefix membership document identity.');
+        }
+
+        return [(int)$parts[1], (int)$parts[2]];
+    }
+
+    protected function normalizePrefixTerms(array $terms): array
+    {
+        $terms = array_values(array_unique(array_map('strval', $terms), SORT_STRING));
+        sort($terms, SORT_STRING);
+
+        return $terms;
+    }
+
+    protected function prefixByteSuccessor(string $prefix): ?string
+    {
+        for ($index = strlen($prefix) - 1; $index >= 0; $index--) {
+            $byte = ord($prefix[$index]);
+            if ($byte < 255) {
+                return substr($prefix, 0, $index) . chr($byte + 1);
+            }
+        }
+
+        return null;
     }
 
     /**
@@ -2718,13 +2805,13 @@ abstract class BaseSearchAdapter extends Search
      * @param bool $isTypeaheadQuery Whether the final token is a prefix
      * @return bool Whether the title is a tight query match
      */
-    protected function containsTightTitleMatch(string $docId, array $tokens, bool $isTypeaheadQuery): bool
+    protected function containsTightTitleMatch(string $docId, array $tokens, bool $isTypeaheadQuery, bool $preserveNumbers = false): bool
     {
         if (empty($tokens)) {
             return false;
         }
 
-        $titleTerms = $this->getComparableTitleTerms($docId, $this->containsStopWord($tokens));
+        $titleTerms = $this->getComparableTitleTerms($docId, $this->containsStopWord($tokens), $preserveNumbers);
         if (empty($titleTerms)) {
             return false;
         }
@@ -2773,14 +2860,14 @@ abstract class BaseSearchAdapter extends Search
      * @param array $tokens Search tokens
      * @return bool Whether the title term set exactly matches the query terms
      */
-    protected function containsExactTitleTermSet(string $docId, array $tokens): bool
+    protected function containsExactTitleTermSet(string $docId, array $tokens, bool $preserveNumbers = false): bool
     {
-        $titleTerms = $this->getComparableTitleTerms($docId);
+        $titleTerms = $this->getComparableTitleTerms($docId, preserveNumbers: $preserveNumbers);
         $queryTerms = [];
 
         foreach ($tokens as $token) {
             $token = (string)$token;
-            if (preg_match('/^\d+$/', $token)) {
+            if (!$preserveNumbers && preg_match('/^\d+$/', $token)) {
                 continue;
             }
             if (in_array($token, $this->stopWords, true)) {
@@ -2831,13 +2918,13 @@ abstract class BaseSearchAdapter extends Search
      * @param bool $preserveStopWords Whether stop words should remain comparable
      * @return array Comparable title terms keyed to true
      */
-    protected function getComparableTitleTerms(string $docId, bool $preserveStopWords = false): array
+    protected function getComparableTitleTerms(string $docId, bool $preserveStopWords = false, bool $preserveNumbers = false): array
     {
         $terms = [];
 
         foreach (array_keys($this->titleTermsCached($docId)) as $term) {
             $term = (string)$term;
-            if (preg_match('/^\d+$/', $term)) {
+            if (!$preserveNumbers && preg_match('/^\d+$/', $term)) {
                 continue;
             }
             if (!$preserveStopWords && in_array($term, $this->stopWords, true)) {
@@ -2940,6 +3027,7 @@ abstract class BaseSearchAdapter extends Search
      */
     protected function getSearchStatistics(): array
     {
+        $this->synchronizeSearchMemo();
         if ($this->memoSearchStats === null) {
             $totalDocs = max(1, $this->getTotalDocCount());
             $totalLength = max(1, $this->getTotalLength());
@@ -3022,6 +3110,124 @@ abstract class BaseSearchAdapter extends Search
      */
     abstract protected function getAllTerms(): array;
 
+    /** @internal */
+    public function removedSiteIds(): array
+    {
+        $current = array_fill_keys(array_map('intval', (new Query())->select('id')->from('{{%sites}}')->where(['dateDeleted' => null])->column()), true);
+        $removed = [];
+        foreach ($this->getIndexedDocumentIds() as $docId) {
+            [$siteId] = $this->indexDocumentIdentity((string)$docId);
+            if (!isset($current[$siteId])) {
+                $removed[$siteId] = true;
+            }
+        }
+        foreach ($this->publicationState()['pending'] as $docId => $marker) {
+            [$siteId] = $this->indexDocumentIdentity((string)$docId);
+            if (!isset($current[$siteId])) {
+                $removed[$siteId] = true;
+            }
+        }
+        foreach ((new Query())->select('siteId')->from(RebuildState::RUNS)->where(['indexIdentity' => $this->getIndexIdentity()])->column() as $siteId) {
+            if (!isset($current[(int)$siteId])) {
+                $removed[(int)$siteId] = true;
+            }
+        }
+        return array_keys($removed);
+    }
+
+    /** @internal */
+    public function removedSiteDocumentReferences(array $sites): iterable
+    {
+        foreach ($this->getIndexedDocumentIds() as $docId) {
+            [$siteId, $elementId] = $this->indexDocumentIdentity((string)$docId);
+            if (in_array($siteId, $sites, true)) {
+                yield [$elementId, $siteId];
+            }
+        }
+    }
+
+    /** @internal */
+    public function removedSitePendingReferences(array $sites): array
+    {
+        $references = [];
+        foreach ($this->publicationState()['pending'] as $docId => $marker) {
+            [$siteId, $elementId] = $this->indexDocumentIdentity((string)$docId);
+            if (in_array($siteId, $sites, true)) {
+                $references[] = [$elementId, $siteId];
+                if (count($references) === 20) {
+                    break;
+                }
+            }
+        }
+        return $references;
+    }
+
+    /** @internal */
+    public function fenceRemovedSite(int $siteId): void
+    {
+        $this->withRemovedSiteGuard($siteId, function() use ($siteId): void {
+            RebuildState::cancel($this->getIndexIdentity(), $siteId);
+            $this->cancelDerivedRebuild($siteId);
+        });
+    }
+
+    /** @internal */
+    public function deleteRemovedSiteReferences(array $references): void
+    {
+        if (count($references) > 20) {
+            throw new \RuntimeException('A removed-site cleanup batch exceeded its limit.');
+        }
+        foreach ($references as $reference) {
+            if (!is_array($reference) || !array_is_list($reference) || count($reference) !== 2 || !is_int($reference[0]) || !is_int($reference[1]) || min($reference) <= 0) {
+                throw new \RuntimeException('Invalid removed-site document reference.');
+            }
+            [$elementId, $siteId] = $reference;
+            $this->withRemovedSiteGuard($siteId, function() use ($siteId, $elementId): void {
+                if (!$this->deleteElementFromIndex($elementId, $siteId)) {
+                    throw new \RuntimeException('Unable to remove search data belonging to a deleted site.');
+                }
+            });
+        }
+    }
+
+    /** @internal */
+    public function retireRemovedSiteStep(int $siteId): bool
+    {
+        $done = $this->withRemovedSiteGuard($siteId, function() use ($siteId): bool {
+            if (!$this->retireDerivedSiteStep($siteId)) {
+                return false;
+            }
+            $owner = RebuildState::owner($this->getIndexIdentity(), $siteId);
+            if ($owner !== null) {
+                Craft::$app->getDb()->transaction(function() use ($owner, $siteId): void {
+                    Craft::$app->getDb()->createCommand()->delete(RebuildState::CHUNKS, ['runId' => $owner['runId']])->execute();
+                    Craft::$app->getDb()->createCommand()->delete(RebuildState::RUNS, ['indexIdentity' => $this->getIndexIdentity(), 'siteId' => $siteId, 'runId' => $owner['runId']])->execute();
+                });
+            }
+            return true;
+        });
+        return $done === null || $done;
+    }
+
+    protected function indexDocumentIdentity(string $docId): array
+    {
+        if (preg_match('/\A([1-9][0-9]*):([1-9][0-9]*)\z/D', $docId, $parts) !== 1) {
+            throw new \RuntimeException('Invalid search document identity during site cleanup.');
+        }
+        return [(int)$parts[1], (int)$parts[2]];
+    }
+
+    protected function withRemovedSiteGuard(int $siteId, callable $callback): mixed
+    {
+        return RebuildState::withSiteGuard($this->getIndexIdentity(), $siteId, function() use ($siteId, $callback): mixed {
+            if ((new Query())->from('{{%sites}}')->where(['id' => $siteId, 'dateDeleted' => null])->exists()) {
+                return null;
+            }
+            $this->assertRebuildContext();
+            return $callback();
+        });
+    }
+
     /**
      * Clear the search index for a specific site
      *
@@ -3033,47 +3239,22 @@ abstract class BaseSearchAdapter extends Search
     public function clearIndex(int $siteId): bool
     {
         try {
-            $this->clearSearchMemo();
+            return RebuildState::withSiteGuard($this->getIndexIdentity(), $siteId, function() use ($siteId): bool {
+                RebuildState::cancel($this->getIndexIdentity(), $siteId);
+                $this->cancelDerivedRebuild($siteId);
+                $this->clearSearchMemo();
+                foreach ($this->getSiteDocuments($siteId) as $docId) {
+                    [$documentSiteId, $elementId] = array_map('intval', explode(':', $docId, 2));
+                    if (!$this->deleteElementFromIndex($elementId, $documentSiteId)) {
+                        return false;
+                    }
+                }
 
-            // Get all documents for this site
-            $documents = $this->getSiteDocuments($siteId);
+                return true;
+            });
+        } catch (\Throwable $exception) {
+            Craft::error('Unable to clear the search index: ' . $exception->getMessage(), __METHOD__);
 
-            // Track the total length we're removing
-            $totalLengthToRemove = 0;
-
-            // We'll clean up orphaned terms after deleting documents
-
-            // Delete each document
-            foreach ($documents as $docId) {
-                [$docSiteId, $elementId] = explode(':', $docId);
-                $elementId = (int)$elementId;
-                $docSiteId = (int)$docSiteId;
-
-                // Get document length before deleting
-                $docLength = $this->getDocumentLength("$docSiteId:$elementId");
-                $totalLengthToRemove += $docLength;
-
-                // Delete the element from the index
-                $this->deleteElementFromIndex($elementId, $docSiteId);
-            }
-
-            if ($totalLengthToRemove > 0) {
-                $this->updateTotalLength(-$totalLengthToRemove);
-            }
-
-            // Clear all terms that no longer have documents
-            $this->cleanupOrphanedTerms();
-
-            // Clear n-grams for this site
-            $this->clearNgrams($siteId);
-
-            // Update metadata
-            $this->updateTotalDocCount();
-
-            Craft::info("Search index cleared for site ID: $siteId", __METHOD__);
-            return true;
-        } catch (\Throwable $e) {
-            Craft::error("Error clearing search index: " . $e->getMessage(), __METHOD__);
             return false;
         }
     }
@@ -3091,60 +3272,29 @@ abstract class BaseSearchAdapter extends Search
     public function pruneIndexForSite(int $siteId, array $activeElementIds): bool
     {
         try {
+            IndexableElements::assertFreshReadContext();
             $this->clearSearchMemo();
-
-            $activeDocIds = [];
-            foreach ($activeElementIds as $elementId) {
-                $elementId = (int)$elementId;
-                if ($elementId > 0) {
-                    $activeDocIds["$siteId:$elementId"] = true;
-                }
-            }
-
-            $removed = 0;
-            $totalLengthToRemove = 0;
-
+            $keep = array_fill_keys(array_map('intval', $activeElementIds), true);
             foreach ($this->getSiteDocuments($siteId) as $docId) {
-                if (isset($activeDocIds[$docId])) {
-                    continue;
+                [$documentSiteId, $elementId] = array_map('intval', explode(':', $docId, 2));
+                if (!isset($keep[$elementId])) {
+                    $success = $this->withElementIndexLockById($elementId, $documentSiteId, function() use ($elementId, $documentSiteId): bool {
+                        $type = Craft::$app->getElements()->getElementTypeById($elementId);
+
+                        return $type === null || IndexableElements::siteIdForType($type, $documentSiteId) !== $documentSiteId
+                            ? $this->publishDocumentDeletion($documentSiteId, $elementId)
+                            : $this->indexPersistedElementUnlocked($type, $elementId, $documentSiteId, null);
+                    });
+                    if (!$success) {
+                        return false;
+                    }
                 }
-
-                [$docSiteId, $elementId] = explode(':', $docId, 2);
-                if ((int)$docSiteId !== $siteId) {
-                    continue;
-                }
-
-                $totalLengthToRemove += $this->getDocumentLength($docId);
-                if (!$this->deleteElementFromIndex((int)$elementId, $siteId)) {
-                    return false;
-                }
-
-                $removed++;
             }
-
-            if ($totalLengthToRemove > 0) {
-                $this->updateTotalLength(-$totalLengthToRemove);
-            }
-
-            if ($removed > 0) {
-                $this->cleanupOrphanedTerms();
-            }
-
-            $this->updateTotalDocCount();
-
-            Craft::info(
-                sprintf(
-                    'Search index pruned for site ID: %d; removed %d stale document%s',
-                    $siteId,
-                    $removed,
-                    $removed === 1 ? '' : 's'
-                ),
-                __METHOD__
-            );
 
             return true;
-        } catch (\Throwable $e) {
-            Craft::error("Error pruning search index: " . $e->getMessage(), __METHOD__);
+        } catch (\Throwable $exception) {
+            Craft::error('Unable to prune the search index: ' . $exception->getMessage(), __METHOD__);
+
             return false;
         }
     }
@@ -3161,30 +3311,9 @@ abstract class BaseSearchAdapter extends Search
      */
     public function deleteElementFromIndex(int $elementId, int $siteId): bool
     {
-        try {
-            $this->clearSearchMemo();
+        $this->clearSearchMemo();
 
-            // Get all terms for this document
-            $terms = $this->getDocumentTerms($siteId, $elementId);
-
-            // Remove the document from each term's document list
-            foreach (array_keys($terms) as $term) {
-                $this->removeTermDocument($term, $siteId, $elementId);
-            }
-
-            // Delete the document and title terms
-            $this->deleteDocument($siteId, $elementId);
-            $this->deleteTitleTerms($siteId, $elementId);
-            $this->deleteDocumentTermSources($siteId, $elementId);
-
-            // Remove from the document index
-            $this->removeDocumentFromIndex($siteId, $elementId);
-
-            return true;
-        } catch (\Throwable $e) {
-            Craft::error("Error deleting element from index: " . $e->getMessage(), __METHOD__);
-            return false;
-        }
+        return $this->withDocumentIndexLock($siteId, $elementId, fn(): bool => $this->publishDocumentDeletion($siteId, $elementId));
     }
 
     // =========================================================================
@@ -3255,21 +3384,16 @@ abstract class BaseSearchAdapter extends Search
     public function cleanupOrphanedTerms(): void
     {
         $this->clearSearchMemo();
-
-        $allTerms = $this->getAllTerms();
-        $siteIds = Craft::$app->getSites()->getAllSiteIds(true);
-
-        foreach ($allTerms as $term) {
-            $docs = $this->getTermDocuments($term);
-
-            if (empty($docs)) {
-                $this->removeTermFromIndex($term);
-                
-                // Also remove n-grams for this globally orphaned term
-                foreach ($siteIds as $siteId) {
-                    $this->removeTermNgrams($term, $siteId);
+        foreach ($this->getAllTerms() as $term) {
+            $this->withPublicationGuard(function() use ($term): void {
+                if ($this->getTermDocuments((string)$term) === []) {
+                    $this->removeTermFromIndex((string)$term);
+                    foreach (Craft::$app->getSites()->getAllSiteIds(true) as $siteId) {
+                        $this->removeTermNgrams((string)$term, $siteId);
+                        $this->deleteIndexRecord("ngram:$siteId:$term");
+                    }
                 }
-            }
+            });
         }
     }
 

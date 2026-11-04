@@ -1,123 +1,115 @@
 <?php
 
+declare(strict_types=1);
+
 namespace MadeByBramble\BrambleSearch\jobs;
 
 use Craft;
 use craft\base\Batchable;
-use craft\base\Element;
-use craft\base\ElementInterface;
-use craft\elements\db\ElementQueryInterface;
-use craft\models\Site;
+use craft\helpers\Queue as QueueHelper;
 use craft\queue\BaseBatchedJob;
 use MadeByBramble\BrambleSearch\adapters\BaseSearchAdapter;
+use MadeByBramble\BrambleSearch\helpers\IndexableElements;
+use MadeByBramble\BrambleSearch\helpers\RebuildState;
+use yii\queue\PushEvent;
+use yii\queue\Queue;
 use yii\queue\RetryableJobInterface;
 
-/**
- * Rebuild Index Job
- *
- * Queue job that rebuilds the search index for a specific site.
- * Uses Craft's batched job system to automatically split processing across
- * multiple job executions, preventing timeouts on large sites.
- */
 class RebuildIndexJob extends BaseBatchedJob implements RetryableJobInterface
 {
-    private const LOCK_TTL = 21600;
-    private const JOB_TTR = 1800;
-    private const MAX_ATTEMPTS = 3;
-    private const LOCK_STALE_BUFFER = 60;
-
-    /**
-     * The site ID to rebuild the index for
-     */
     public ?int $siteId = null;
-
-    /**
-     * The batch size for processing entries per job execution
-     * Craft will automatically create child jobs for each batch
-     */
+    public string $indexIdentity = '';
+    public string $rebuildRunId = '';
+    public bool $rebuildLockAcquired = false;
     public int $batchSize = 100;
 
-    /**
-     * Whether this queued rebuild owns the site-level rebuild lock.
-     */
-    public bool $rebuildLockAcquired = false;
+    private bool $afterBatchRan = false;
+    private bool $continuationPushed = false;
 
-    /**
-     * Unique ID for this rebuild chain, generated in before() and carried through every
-     * spawned continuation batch. Used to detect a superseded chain: if a stale lock gets
-     * cleared and a second chain starts, both chains' batches keep running unless each
-     * batch verifies it still owns the lock it started with.
-     */
-    public string $rebuildRunId = '';
-
-    /**
-     * @inheritdoc
-     */
-    public function getTtr()
+    public function getTtr(): int
     {
-        return self::JOB_TTR;
+        return 1800;
     }
 
-    /**
-     * @inheritdoc
-     */
-    public function canRetry($attempt, $error)
+    public function canRetry($attempt, $error): bool
     {
-        return $attempt < self::MAX_ATTEMPTS;
+        if ($this->indexIdentity === '') {
+            return false;
+        }
+        return RebuildState::canRetry((int)$attempt, $this->indexIdentity, $this->siteId, $this->rebuildRunId);
     }
 
-    /**
-     * @inheritdoc
-     */
     public function execute($queue): void
     {
-        // Continuation batches (not the first) must still hold the rebuild lock they
-        // started with. If a stale lock was cleared and a newer chain started, this
-        // chain's lock is gone or reassigned: die quietly instead of racing the new one.
-        if ($this->itemOffset > 0 && !$this->ownsCurrentRebuildLock()) {
-            Craft::warning(
-                "Bramble Search rebuild for site ID {$this->siteId} was superseded by a newer rebuild chain; dropping this batch.",
-                __METHOD__
-            );
-            return;
+        if ($this->indexIdentity === '') {
+            throw new \RuntimeException('Legacy rebuild payloads must be drained before the manifest upgrade; queue a fresh rebuild after removing the identified legacy job.');
         }
+        IndexableElements::assertFreshReadContext();
+        $adapter = $this->getSearchAdapter();
+        if ($this->siteId === null || $adapter->getIndexIdentity() !== $this->indexIdentity || !($queue instanceof Queue)) {
+            throw new \RuntimeException('The rebuild does not match its active index or queue.');
+        }
+        RebuildState::withSiteGuard($this->indexIdentity, $this->siteId, function() use ($queue, $adapter): void {
+            $adapter->withRebuildContext($this->siteId, $this->rebuildRunId, function() use ($queue, $adapter): void {
+                $owner = RebuildState::owner($this->indexIdentity, $this->siteId);
+                if ($owner === null) {
+                    throw new \RuntimeException('The rebuild has lost its durable owner.');
+                }
+                if ($owner['runId'] !== $this->rebuildRunId) {
+                    Craft::warning('A superseded search rebuild batch was ignored.', __METHOD__);
 
-        try {
-            parent::execute($queue);
-        } catch (\Throwable $e) {
-            $this->cleanupFailedRebuild($e);
-            throw $e;
-        }
+                    return;
+                }
+                if ($owner['status'] === 'complete') {
+                    return;
+                }
+                if ($owner['status'] !== 'active') {
+                    throw new \RuntimeException('The rebuild owner is not ready for execution.');
+                }
+                if ($owner['lifecycle']['phase'] !== 'indexing') {
+                    $checkpoint = $adapter->advanceDerivedRebuild($this->siteId, $this->rebuildRunId, $owner['lifecycle']);
+                    RebuildState::update($this->indexIdentity, $this->siteId, $this->rebuildRunId, [
+                        'status' => $checkpoint['phase'] === 'complete' ? 'complete' : 'active', 'lifecycle' => $checkpoint,
+                    ]);
+                    if ($checkpoint['phase'] !== 'complete') {
+                        $this->queueLifecycleContinuation($queue);
+                    }
+                    return;
+                }
+                RebuildState::assertManifest($owner);
+                $this->itemOffset = $owner['nextOffset'];
+                $this->priority ??= RebuildState::PRIORITY;
+                $this->ttr ??= $this->getTtr();
+                $this->afterBatchRan = false;
+                $this->continuationPushed = false;
+                $pushed = function(PushEvent $event): void {
+                    $job = $event->job;
+                    if ($job instanceof self && $job->indexIdentity === $this->indexIdentity && $job->siteId === $this->siteId
+                        && $job->rebuildRunId === $this->rebuildRunId && $event->id !== null && (string)$event->id !== '') {
+                        $this->continuationPushed = true;
+                    }
+                };
+                $queue->on(Queue::EVENT_AFTER_PUSH, $pushed);
+                try {
+                    parent::execute($queue);
+                    if ($this->afterBatchRan && $this->itemOffset < $owner['totalItems'] && !$this->continuationPushed) {
+                        throw new \RuntimeException('The rebuild continuation was not queued after its durable checkpoint.');
+                    }
+                } catch (\Throwable $error) {
+                    Craft::error('Search rebuild remains retryable after failure: ' . $error->getMessage(), __METHOD__);
+                    throw $error;
+                } finally {
+                    $queue->off(Queue::EVENT_AFTER_PUSH, $pushed);
+                    $this->setBulkMode($adapter, false);
+                }
+            });
+        });
     }
 
-    /**
-     * Lifecycle hook: runs once before all batches are processed
-     * Starts a rolling rebuild for the site without clearing the live index
-     *
-     * @return void
-     */
     protected function before(): void
     {
-        // Get the site
-        $site = Craft::$app->getSites()->getSiteById($this->siteId);
-
-        if (!$site) {
-            throw new \Exception("Site with ID {$this->siteId} not found");
-        }
-
-        $this->rebuildRunId = uniqid('', true);
-
-        $searchService = $this->getSearchAdapter();
-        $this->acquireRebuildLock($site->id);
-
-        try {
-            // Enable bulk mode to skip per-element updateTotalDocCount
-            $this->setBulkMode($searchService, true);
-
-            Craft::info("Starting rolling index rebuild for site ID: {$site->id}", __METHOD__);
-        } catch (\Throwable $e) {
-            $this->releaseRebuildLock($site->id);
-            throw $e;
+        if (Craft::$app->getSites()->getSiteById($this->siteId) === null) {
+            throw new \RuntimeException('The rebuild site no longer exists.');
         }
     }
 
@@ -129,312 +121,78 @@ class RebuildIndexJob extends BaseBatchedJob implements RetryableJobInterface
     protected function afterBatch(): void
     {
         $this->setBulkMode($this->getSearchAdapter(), false);
+        RebuildState::update($this->indexIdentity, $this->siteId, $this->rebuildRunId, ['nextOffset' => $this->itemOffset]);
+        $this->afterBatchRan = true;
     }
 
-    /**
-     * Load the data to be processed in batches
-     * Returns a MultiElementTypeBatcher that processes all registered element types
-     *
-     * @return \craft\base\Batchable The batcher containing queries for all element types
-     */
     public function loadData(): Batchable
     {
-        // Get the site
-        $site = Craft::$app->getSites()->getSiteById($this->siteId);
-
-        if (!$site) {
-            throw new \Exception("Site with ID {$this->siteId} not found");
+        if ($this->indexIdentity === '') {
+            return new MultiElementTypeBatcher([]);
+        }
+        if ($this->siteId === null) {
+            throw new \RuntimeException('The rebuild requires a site ID.');
         }
 
-        // Return a MultiElementTypeBatcher that will handle batch processing for all element types
-        return new MultiElementTypeBatcher($this->elementQueries($site));
+        return new RebuildManifestBatcher($this->indexIdentity, $this->siteId, $this->rebuildRunId);
     }
 
-    /**
-     * Build the element queries that define a complete site index.
-     *
-     * @param Site $site
-     * @return array<int,ElementQueryInterface>
-     */
-    protected function elementQueries(Site $site): array
-    {
-        $elementTypes = Craft::$app->getElements()->getAllElementTypes();
-        $queries = [];
-
-        foreach ($elementTypes as $elementType) {
-            /** @var class-string<ElementInterface> $elementType */
-            $query = $elementType::find()
-                ->site($site)
-                ->status(Element::STATUS_ENABLED)
-                ->drafts(false)
-                ->revisions(false)
-                ->provisionalDrafts(false)
-                ->orderBy('id ASC'); // Required for batch processing stability
-
-            // Only filter by title if the element type has titles
-            if ($elementType::hasTitles()) {
-                $query->andWhere(['not', ['title' => null]])
-                      ->andWhere(['not', ['title' => '']]);
-            }
-
-            $queries[] = $query;
-        }
-
-        return $queries;
-    }
-
-    /**
-     * Process a single item from the batch
-     * Called once per element by Craft's batching system
-     *
-     * @param ElementInterface $item The element to index
-     * @return void
-     */
     public function processItem(mixed $item): void
     {
-        if (!($item instanceof ElementInterface)) {
-            throw new \RuntimeException('Rebuild index batch contained a non-element item.');
+        if (!is_array($item) || !is_int($item['elementId'] ?? null) || $item['elementId'] <= 0 || !is_string($item['elementType'] ?? null)) {
+            throw new \RuntimeException('The rebuild yielded an invalid scalar reference.');
         }
-
-        if (!$this->indexElement($item)) {
-            $elementType = get_class($item);
-            throw new \RuntimeException("Failed to index {$elementType} {$item->id} for site {$item->siteId}");
+        if (!$this->getSearchAdapter()->indexPersistedElement($item['elementType'], $item['elementId'], $this->siteId, null)) {
+            throw new \RuntimeException('The rebuild could not publish a current element.');
         }
     }
 
-    /**
-     * Lifecycle hook: runs once after all batches are processed
-     * Logs completion of the index rebuild
-     *
-     * @return void
-     */
     protected function after(): void
     {
-        $searchService = $this->getSearchAdapter();
-
-        try {
-            $site = Craft::$app->getSites()->getSiteById($this->siteId);
-            if (!$site) {
-                throw new \Exception("Site with ID {$this->siteId} not found");
-            }
-
-            if (!$searchService->pruneIndexForSite($site->id, $this->currentElementIds($site))) {
-                throw new \RuntimeException("Failed to prune Bramble Search index for site ID: {$site->id}");
-            }
-
-            // Recalculate metadata once after all batches
-            if (method_exists($searchService, 'refreshTotalDocCount')) {
-                $searchService->refreshTotalDocCount();
-            }
-            if (method_exists($searchService, 'refreshTotalLength')) {
-                $searchService->refreshTotalLength();
-            }
-        } finally {
-            // Always reset bulk mode, even if metadata refresh fails
-            $this->setBulkMode($searchService, false);
-            $this->releaseRebuildLock($this->siteId);
+        $owner = RebuildState::owner($this->indexIdentity, $this->siteId);
+        if ($owner === null || $owner['runId'] !== $this->rebuildRunId || $owner['status'] !== 'active') {
+            throw new \RuntimeException('The rebuild lost ownership before finalization.');
         }
-
-        Craft::info("Index rebuild completed for site ID: {$this->siteId}", __METHOD__);
-    }
-
-    /**
-     * Return the element IDs that should remain in the completed site index.
-     *
-     * @param Site $site
-     * @return array<int>
-     */
-    protected function currentElementIds(Site $site): array
-    {
-        $ids = [];
-
-        foreach ($this->elementQueries($site) as $query) {
-            $query->limit(null);
-            $query->offset(null);
-
-            foreach ($query->ids() as $id) {
-                $ids[] = (int)$id;
-            }
+        RebuildState::assertManifest($owner);
+        $adapter = $this->getSearchAdapter();
+        if (!$adapter->pruneIndexForSite($this->siteId, IndexableElements::currentIds($owner['types'], $this->siteId))) {
+            throw new \RuntimeException('The rebuild could not prune current ineligible documents.');
         }
-
-        return array_values(array_unique($ids));
+        $adapter->auditIndexMetadata();
+        RebuildState::update($this->indexIdentity, $this->siteId, $this->rebuildRunId, ['nextOffset' => $owner['totalItems'], 'lifecycle' => ['phase' => 'catalogue']]);
+        $this->queueLifecycleContinuation(Craft::$app->getQueue());
     }
 
-    /**
-     * Return the default description for this job
-     *
-     * @return string The job description
-     */
-    protected function defaultDescription(): string
+    protected function queueLifecycleContinuation(Queue $queue): void
     {
-        return 'Rebuilding search index';
-    }
-
-    /**
-     * Index a single element in the search index
-     *
-     * @param ElementInterface $element The element to index
-     * @return bool Whether the indexing was successful
-     */
-    protected function indexElement(ElementInterface $element): bool
-    {
-        try {
-            $fieldHandles = $this->getSearchAdapter()->getSearchableFieldHandles($element);
-
-            // Use the search service to index the element
-            return Craft::$app->getSearch()->indexElementAttributes($element, $fieldHandles);
-        } catch (\Throwable $e) {
-            $elementType = get_class($element);
-            Craft::error("Error indexing {$elementType} {$element->id}: {$e->getMessage()}", __METHOD__);
-            return false;
+        $id = QueueHelper::push(new self([
+            'siteId' => $this->siteId, 'indexIdentity' => $this->indexIdentity, 'rebuildRunId' => $this->rebuildRunId,
+            'batchSize' => $this->batchSize,
+        ]), $this->priority ?? RebuildState::PRIORITY, 0, $this->getTtr(), $queue);
+        if ($id === null || $id === '') {
+            throw new \RuntimeException('The rebuild lifecycle continuation was not queued.');
         }
     }
 
     protected function getSearchAdapter(): BaseSearchAdapter
     {
-        $searchService = Craft::$app->getSearch();
-
-        if (!($searchService instanceof BaseSearchAdapter)) {
-            throw new \RuntimeException('Bramble Search is not active as the Craft search service.');
+        $adapter = Craft::$app->getSearch();
+        if (!($adapter instanceof BaseSearchAdapter)) {
+            throw new \RuntimeException('Bramble Search is not the active search service.');
         }
 
-        return $searchService;
+        return $adapter;
     }
 
-    protected function setBulkMode(BaseSearchAdapter $searchService, bool $enabled): void
+    protected function setBulkMode(BaseSearchAdapter $adapter, bool $enabled): void
     {
-        if (property_exists($searchService, 'bulkMode')) {
-            $searchService->bulkMode = $enabled;
+        if (property_exists($adapter, 'bulkMode')) {
+            $adapter->bulkMode = $enabled;
         }
     }
 
-    protected function cleanupFailedRebuild(\Throwable $error): void
+    protected function defaultDescription(): string
     {
-        try {
-            $this->setBulkMode($this->getSearchAdapter(), false);
-        } catch (\Throwable $cleanupError) {
-            Craft::warning(
-                "Unable to reset Bramble Search bulk mode after rebuild failure: {$cleanupError->getMessage()}",
-                __METHOD__
-            );
-        }
-
-        if ($this->rebuildLockAcquired) {
-            try {
-                $this->releaseRebuildLock($this->siteId);
-            } catch (\Throwable $cleanupError) {
-                Craft::warning(
-                    "Unable to release Bramble Search rebuild lock after failure: {$cleanupError->getMessage()}",
-                    __METHOD__
-                );
-            }
-        }
-
-        Craft::error(
-            "Index rebuild failed for site ID: {$this->siteId}: {$error->getMessage()}",
-            __METHOD__
-        );
-    }
-
-    public static function clearRebuildLockForSite(int $siteId): bool
-    {
-        return Craft::$app->getCache()->delete(self::rebuildLockKeyForSite($siteId));
-    }
-
-    protected function acquireRebuildLock(int $siteId): void
-    {
-        $cache = Craft::$app->getCache();
-        $key = $this->rebuildLockKey($siteId);
-
-        if (!$this->storeRebuildLock($key)) {
-            $lockValue = $cache->get($key);
-            if ($this->isExpiredRebuildLock($lockValue)) {
-                $cache->delete($key);
-                if ($this->storeRebuildLockAfterClear($key)) {
-                    Craft::warning(
-                        "Cleared expired Bramble Search rebuild lock for site ID: $siteId.",
-                        __METHOD__
-                    );
-                    $this->rebuildLockAcquired = true;
-                    return;
-                }
-            }
-
-            throw new \RuntimeException("A Bramble Search index rebuild is already running for site ID: $siteId");
-        }
-
-        $this->rebuildLockAcquired = true;
-    }
-
-    protected function storeRebuildLock(string $key): bool
-    {
-        return Craft::$app->getCache()->add($key, $this->rebuildLockValue(), self::LOCK_TTL);
-    }
-
-    protected function storeRebuildLockAfterClear(string $key): bool
-    {
-        return Craft::$app->getCache()->add($key, $this->rebuildLockValue(), self::LOCK_TTL);
-    }
-
-    /**
-     * @return array{time: int, runId: string}
-     */
-    protected function rebuildLockValue(): array
-    {
-        return ['time' => time(), 'runId' => $this->rebuildRunId];
-    }
-
-    /**
-     * Whether the site-level rebuild lock currently belongs to this job's chain.
-     */
-    protected function ownsCurrentRebuildLock(): bool
-    {
-        if ($this->siteId === null || $this->rebuildRunId === '') {
-            return false;
-        }
-
-        $lockValue = Craft::$app->getCache()->get($this->rebuildLockKey($this->siteId));
-
-        return is_array($lockValue) && ($lockValue['runId'] ?? null) === $this->rebuildRunId;
-    }
-
-    protected function isExpiredRebuildLock(mixed $lockValue): bool
-    {
-        $timestamp = null;
-
-        if (is_numeric($lockValue)) {
-            $timestamp = (int)$lockValue;
-        } elseif (is_array($lockValue) && isset($lockValue['time']) && is_numeric($lockValue['time'])) {
-            $timestamp = (int)$lockValue['time'];
-        }
-
-        if ($timestamp === null) {
-            return false;
-        }
-
-        return time() - $timestamp > (self::JOB_TTR + self::LOCK_STALE_BUFFER);
-    }
-
-    protected function releaseRebuildLock(?int $siteId): void
-    {
-        // Never release a lock this chain doesn't currently hold — that would let a
-        // superseded (e.g. previously-stale-cleared) chain's cleanup delete a newer
-        // chain's lock. clearRebuildLockForSite() remains the unconditional admin escape
-        // hatch for manually clearing a lock.
-        if ($siteId !== null && $this->ownsCurrentRebuildLock()) {
-            self::clearRebuildLockForSite($siteId);
-        }
-
-        $this->rebuildLockAcquired = false;
-    }
-
-    protected function rebuildLockKey(int $siteId): string
-    {
-        return self::rebuildLockKeyForSite($siteId);
-    }
-
-    protected static function rebuildLockKeyForSite(int $siteId): string
-    {
-        return "bramble-search:rebuild:$siteId";
+        return 'Rebuilding search index';
     }
 }

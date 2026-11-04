@@ -1,5 +1,25 @@
 # Release Notes for Bramble Search
 
+## Unreleased
+
+- Fixed partial updates dropping previously indexed field content. Rebuild the index for every site after upgrading.
+- Fixed stale results after an element is disabled or moved between sites.
+- Fixed deleted elements remaining indexed on other sites.
+- Fixed search counts and pagination disagreeing with results.
+- Fixed searches ignoring the frontend autocomplete setting.
+- Fixed number searches matching different numeric values.
+- Fixed a single wrong letter in terms with three characters.
+- Fixed Unicode term collisions in MySQL.
+- Fixed large field content failing to index in MySQL.
+- Fixed interrupted index updates leaving incorrect document counts.
+- Added configurable title aliases.
+- Added metric and imperial unit matching.
+- Added rebuild checkpoints so interrupted jobs can resume. Replace queued rebuild jobs from earlier versions before restarting workers.
+- Added faster prefix lookups for Redis and MongoDB.
+- Added automatic lookup data management during rebuilds and content updates.
+- Fixed restored elements remaining absent from search.
+- Fixed rebuilds retaining search records for deleted sites.
+
 ## 1.5.4
 - Rebuilding the search index now queues every site in a multi-site installation.
 
