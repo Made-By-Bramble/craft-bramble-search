@@ -7,3 +7,4 @@
 /vendor
 .phpunit.result.cache
 .codegraph/
+tests/
