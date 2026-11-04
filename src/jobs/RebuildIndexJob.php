@@ -22,6 +22,7 @@ class RebuildIndexJob extends BaseBatchedJob implements RetryableJobInterface
     public string $rebuildRunId = '';
     public bool $rebuildLockAcquired = false;
     public int $batchSize = 100;
+    public bool $finalizing = false;
 
     private bool $afterBatchRan = false;
     private bool $continuationPushed = false;
@@ -70,6 +71,16 @@ class RebuildIndexJob extends BaseBatchedJob implements RetryableJobInterface
                     $deadline = microtime(true) + RebuildState::WORK_SECONDS;
                     $checkpoint = $owner['lifecycle'];
                     do {
+                        $processed = (int)($checkpoint['processed'] ?? 0);
+                        $label = match ($checkpoint['phase']) {
+                            'catalogue' => "Checking search records ($processed checked)",
+                            'membership' => "Checking search lookups ($processed checked)",
+                            'pending' => 'Applying recent content changes',
+                            'activate' => 'Activating search lookups',
+                            'cleanup' => 'Removing outdated search lookups',
+                            default => 'Finishing search index rebuild',
+                        };
+                        $this->setProgress($queue, min(0.99, $processed / max(1, $owner['totalItems'])), $label);
                         $checkpoint = $adapter->advanceDerivedRebuild($this->siteId, $this->rebuildRunId, $checkpoint);
                         RebuildState::update($this->indexIdentity, $this->siteId, $this->rebuildRunId, [
                             'status' => $checkpoint['phase'] === 'complete' ? 'complete' : 'active', 'lifecycle' => $checkpoint,
@@ -77,6 +88,8 @@ class RebuildIndexJob extends BaseBatchedJob implements RetryableJobInterface
                     } while ($checkpoint['phase'] !== 'complete' && microtime(true) < $deadline);
                     if ($checkpoint['phase'] !== 'complete') {
                         $this->queueLifecycleContinuation($queue);
+                    } else {
+                        $this->setProgress($queue, 1, 'Search index rebuild complete');
                     }
                     return;
                 }
@@ -131,7 +144,7 @@ class RebuildIndexJob extends BaseBatchedJob implements RetryableJobInterface
 
     public function loadData(): Batchable
     {
-        if ($this->indexIdentity === '') {
+        if ($this->indexIdentity === '' || $this->finalizing) {
             return new MultiElementTypeBatcher([]);
         }
         if ($this->siteId === null) {
@@ -159,9 +172,11 @@ class RebuildIndexJob extends BaseBatchedJob implements RetryableJobInterface
         }
         RebuildState::assertManifest($owner);
         $adapter = $this->getSearchAdapter();
+        $this->setProgress(Craft::$app->getQueue(), 1, 'Removing outdated search records');
         if (!$adapter->pruneIndexForSite($this->siteId, IndexableElements::currentIds($owner['types'], $this->siteId))) {
             throw new \RuntimeException('The rebuild could not prune current ineligible documents.');
         }
+        $this->setProgress(Craft::$app->getQueue(), 1, 'Checking search index totals');
         $adapter->auditIndexMetadata();
         RebuildState::update($this->indexIdentity, $this->siteId, $this->rebuildRunId, ['nextOffset' => $owner['totalItems'], 'lifecycle' => ['phase' => 'catalogue']]);
         $this->queueLifecycleContinuation(Craft::$app->getQueue());
@@ -172,6 +187,7 @@ class RebuildIndexJob extends BaseBatchedJob implements RetryableJobInterface
         $id = QueueHelper::push(new self([
             'siteId' => $this->siteId, 'indexIdentity' => $this->indexIdentity, 'rebuildRunId' => $this->rebuildRunId,
             'batchSize' => $this->batchSize,
+            'finalizing' => true,
         ]), $this->priority ?? RebuildState::PRIORITY, 0, $this->getTtr(), $queue);
         if ($id === null || $id === '') {
             throw new \RuntimeException('The rebuild lifecycle continuation was not queued.');
@@ -197,6 +213,6 @@ class RebuildIndexJob extends BaseBatchedJob implements RetryableJobInterface
 
     protected function defaultDescription(): string
     {
-        return 'Rebuilding search index';
+        return $this->finalizing ? 'Finalizing search index' : 'Rebuilding search index';
     }
 }

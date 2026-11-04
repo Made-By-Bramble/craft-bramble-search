@@ -168,7 +168,10 @@ trait PrefixLifecycleTrait
             }
             $this->mutationCheckpoint('prefixLifecyclePage', $siteId, 0);
 
-            return $page['done'] ? ['phase' => $phase === 'catalogue' ? 'membership' : 'pending'] : ['phase' => $phase, 'cursor' => $page['cursor']];
+            return $page['done'] ? ['phase' => $phase === 'catalogue' ? 'membership' : 'pending'] : [
+                'phase' => $phase, 'cursor' => $page['cursor'],
+                'processed' => (int)($checkpoint['processed'] ?? 0) + count($page['documents']),
+            ];
         }
         if ($phase === 'pending') {
             $pending = $this->withPublicationGuard(fn(): array => array_slice(array_keys($this->pendingPrefixDocuments($siteId)), 0, 20));

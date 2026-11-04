@@ -152,6 +152,8 @@ php craft clear-caches/bramble-search
 
 Content changes use Craft's normal indexing process. Disabled elements and drafts are excluded. Rebuilds include any lookup data required by the driver. Saved checkpoints allow interrupted batches to resume within Craft's retry limit. Start a new rebuild if a run has exhausted its retries. Check the queue for failed or stalled jobs.
 
+The queue shows the current rebuild stage and the number of processed elements. Preparation shows activity counts until the total is known.
+
 Rebuild after changing the site's structure or moving content between sites. The full rebuild removes indexed records belonging to deleted sites. Rebuild after enabling the plugin again if content changed while it was disabled.
 
 ### Statistics

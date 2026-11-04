@@ -56,14 +56,24 @@ class PrepareRebuildJob extends BaseJob implements RetryableJobInterface
                 }
                 if ($owner['status'] === 'building') {
                     if ($owner['lifecycle']['phase'] === 'retireSites') {
+                        $this->setProgress($queue, 0, 'Removing search records for deleted sites');
                         if (!$this->advanceRemovedSites($adapter, $owner['lifecycle']['retirement'] ?? [])) {
                             $this->queuePreparationContinuation($queue);
                             return;
                         }
                     }
                     $deadline = microtime(true) + RebuildState::WORK_SECONDS;
+                    $steps = (int)($owner['lifecycle']['lookupSteps'] ?? 0);
+                    $nextProgressUpdate = microtime(true) + 1;
+                    $this->setProgress($queue, 0, "Preparing search data ($steps checks completed)");
                     while (!$adapter->beginDerivedRebuild($this->siteId, $this->rebuildRunId)) {
+                        $steps++;
+                        if (microtime(true) >= $nextProgressUpdate) {
+                            $this->setProgress($queue, 0, "Preparing search data ($steps checks completed)");
+                            $nextProgressUpdate = microtime(true) + 1;
+                        }
                         if (microtime(true) >= $deadline) {
+                            RebuildState::update($this->indexIdentity, $this->siteId, $this->rebuildRunId, ['lifecycle' => ['phase' => 'begin', 'lookupSteps' => $steps]]);
                             $this->queuePreparationContinuation($queue);
                             return;
                         }
@@ -73,6 +83,7 @@ class PrepareRebuildJob extends BaseJob implements RetryableJobInterface
                     $pending = [];
                     $chunk = 0;
                     $total = 0;
+                    $this->setProgress($queue, 0, 'Collecting elements (0 found)');
                     foreach ($owner['types'] as $typeIndex => $type) {
                         $last = 0;
                         do {
@@ -90,6 +101,7 @@ class PrepareRebuildJob extends BaseJob implements RetryableJobInterface
                                     $pending = [];
                                 }
                             }
+                            $this->setProgress($queue, 0, "Collecting elements ($total found)");
                         } while (count($ids) === 1000);
                     }
                     if ($pending !== []) {
@@ -98,6 +110,7 @@ class PrepareRebuildJob extends BaseJob implements RetryableJobInterface
                     $owner['totalItems'] = $total;
                     RebuildState::assertManifest($owner);
                     RebuildState::update($this->indexIdentity, $this->siteId, $this->rebuildRunId, ['status' => 'active', 'totalItems' => $total, 'nextOffset' => 0, 'lifecycle' => ['phase' => 'indexing']]);
+                    $this->setProgress($queue, 1, "Elements ready to rebuild ($total)");
                 }
                 if (RebuildState::hasQueuedJob($this->indexIdentity, $this->siteId, $this->rebuildRunId, RebuildIndexJob::class)) {
                     return;
