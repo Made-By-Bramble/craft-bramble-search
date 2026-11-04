@@ -2,8 +2,11 @@
 
 ## Unreleased
 
+> {warning} You must clear the search index and rebuild it after upgrading to this version. This release contains changes to the index format and search scoring that will break existing indexes. Use **Utilities / Clear Caches / Bramble Search** or run `php craft clear-caches/bramble-search` to queue a rebuild for every Craft site.
+
 - Fixed rebuild preparation and finalization creating excessive queue jobs.
 - Added progress labels for search index rebuilds.
+- Fixed full rebuilds repeating lookup work during finalization.
 - Fixed partial updates dropping previously indexed field content. Rebuild the index for every site after upgrading.
 - Fixed stale results after an element is disabled or moved between sites.
 - Fixed deleted elements remaining indexed on other sites.
