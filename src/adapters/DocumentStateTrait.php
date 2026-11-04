@@ -439,7 +439,7 @@ trait DocumentStateTrait
         $this->withPublicationGuard(fn(): array => $this->repairIndexMetadata($this->publicationState()));
     }
 
-    protected function repairIndexMetadata(array $publication): array
+    protected function repairIndexMetadata(array $publication, ?callable $progress = null): array
     {
         if (!$publication['dirty'] && ($publication['initialized'] ?? false) && $publication['pending'] === []) {
             return $publication;
@@ -450,6 +450,11 @@ trait DocumentStateTrait
         }
         $count = 0;
         $length = 0;
+        $processed = 0;
+        $total = count($ids);
+        if ($progress !== null) {
+            $progress($processed, $total);
+        }
         foreach (array_keys($ids) as $docId) {
             [$siteId, $elementId] = array_map('intval', explode(':', $docId, 2));
             $state = $this->readIndexRecord('term_sources:' . $docId);
@@ -483,6 +488,9 @@ trait DocumentStateTrait
             $this->publishDocumentCatalogue($siteId, $elementId, $exists, $documentLength);
             $count += (int)$exists;
             $length += $documentLength;
+            if ($progress !== null) {
+                $progress(++$processed, $total);
+            }
         }
         $this->writeIndexTotals($count, $length);
         $publication['dirty'] = false;

@@ -154,6 +154,8 @@ Content changes use Craft's normal indexing process. Disabled elements and draft
 
 The queue shows the current rebuild stage and the number of processed elements. Preparation shows activity counts until the total is known.
 
+The existing index stays available during a rebuild. Finalization recovers interrupted updates before activating the new lookup data and removing the old lookup data.
+
 Rebuild after changing the site's structure or moving content between sites. The full rebuild removes indexed records belonging to deleted sites. Rebuild after enabling the plugin again if content changed while it was disabled.
 
 ### Statistics

@@ -29,21 +29,27 @@ class MySqlSearchAdapter extends BaseSearchAdapter
     {
         return $this->createIndexReadCommand((new Query())->select(new Expression('1'))->from($this->tablePrefix . 'metadata}}')->where(['key' => 'doc', 'value' => "$siteId:$elementId"])->limit(1))->queryScalar() !== false;
     }
-    protected function repairIndexMetadata(array $publication): array
+    protected function repairIndexMetadata(array $publication, ?callable $progress = null): array
     {
         if ($publication['pending'] !== []) {
-            return parent::repairIndexMetadata($publication);
+            return parent::repairIndexMetadata($publication, $progress);
         }
         if (!$publication['dirty'] && ($publication['initialized'] ?? false)) {
             return $publication;
         }
         $count = (int)$this->createIndexReadCommand((new Query())->select(new Expression('COUNT(DISTINCT [[value]])'))->from($this->tablePrefix . 'metadata}}')->where(['key' => 'doc']))->queryScalar();
+        if ($progress !== null) {
+            $progress(0, $count);
+        }
         $catalogue = (new Query())->select(new Expression('1'))->from(['m' => $this->tablePrefix . 'metadata}}'])->where(['m.key' => 'doc'])->andWhere(new Expression("[[m.value]] = CONCAT([[d.siteId]], ':', [[d.elementId]])"));
         $length = (int)$this->createIndexReadCommand((new Query())->select(new Expression('SUM([[d.frequency]])'))->from(['d' => $this->tablePrefix . 'documents}}'])->where(['d.term' => '_length'])->andWhere(['exists', $catalogue]))->queryScalar();
         $this->writeIndexTotals($count, $length);
         $publication['dirty'] = false;
         $publication['initialized'] = true;
         $this->writeIndexRecord('publication', $publication);
+        if ($progress !== null) {
+            $progress($count, $count);
+        }
 
         return $publication;
     }
@@ -944,9 +950,9 @@ class MySqlSearchAdapter extends BaseSearchAdapter
      * @param array<int> $activeElementIds Element IDs that should remain indexed
      * @return bool Whether the operation was successful
      */
-    public function pruneIndexForSite(int $siteId, array $activeElementIds): bool
+    public function pruneIndexForSite(int $siteId, array $activeElementIds, ?callable $progress = null): bool
     {
-        return parent::pruneIndexForSite($siteId, $activeElementIds);
+        return parent::pruneIndexForSite($siteId, $activeElementIds, $progress);
     }
 
     // =========================================================================

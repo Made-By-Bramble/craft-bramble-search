@@ -70,11 +70,17 @@ class RebuildIndexJob extends BaseBatchedJob implements RetryableJobInterface
                 if ($owner['lifecycle']['phase'] !== 'indexing') {
                     $deadline = microtime(true) + RebuildState::WORK_SECONDS;
                     $checkpoint = $owner['lifecycle'];
+                    if (in_array($checkpoint['phase'], ['catalogue', 'membership'], true)) {
+                        RebuildState::assertManifest($owner);
+                        if ($owner['nextOffset'] !== $owner['totalItems']) {
+                            throw new \RuntimeException('Lookup activation requires a completed full rebuild.');
+                        }
+                        $checkpoint = ['phase' => 'pending'];
+                        RebuildState::update($this->indexIdentity, $this->siteId, $this->rebuildRunId, ['lifecycle' => $checkpoint]);
+                    }
                     do {
                         $processed = (int)($checkpoint['processed'] ?? 0);
                         $label = match ($checkpoint['phase']) {
-                            'catalogue' => "Checking search records ($processed checked)",
-                            'membership' => "Checking search lookups ($processed checked)",
                             'pending' => 'Applying recent content changes',
                             'activate' => 'Activating search lookups',
                             'cleanup' => 'Removing outdated search lookups',
@@ -172,13 +178,26 @@ class RebuildIndexJob extends BaseBatchedJob implements RetryableJobInterface
         }
         RebuildState::assertManifest($owner);
         $adapter = $this->getSearchAdapter();
-        $this->setProgress(Craft::$app->getQueue(), 1, 'Removing outdated search records');
-        if (!$adapter->pruneIndexForSite($this->siteId, IndexableElements::currentIds($owner['types'], $this->siteId))) {
+        $queue = Craft::$app->getQueue();
+        $label = 'Checking indexed records';
+        $lastProgressUpdate = 0.0;
+        $progress = function(int $processed, int $total) use ($queue, &$label, &$lastProgressUpdate): void {
+            $now = microtime(true);
+            if ($processed !== $total && $now - $lastProgressUpdate < 1) {
+                return;
+            }
+            $lastProgressUpdate = $now;
+            $this->setProgress($queue, $total === 0 ? 1 : $processed / $total, "$label ($processed of $total)");
+        };
+        $this->setProgress($queue, 0, 'Collecting current elements');
+        if (!$adapter->pruneIndexForSite($this->siteId, IndexableElements::currentIds($owner['types'], $this->siteId), $progress)) {
             throw new \RuntimeException('The rebuild could not prune current ineligible documents.');
         }
-        $this->setProgress(Craft::$app->getQueue(), 1, 'Checking search index totals');
-        $adapter->auditIndexMetadata();
-        RebuildState::update($this->indexIdentity, $this->siteId, $this->rebuildRunId, ['nextOffset' => $owner['totalItems'], 'lifecycle' => ['phase' => 'catalogue']]);
+        $label = 'Checking search index totals';
+        $lastProgressUpdate = 0.0;
+        $this->setProgress($queue, 0, $label);
+        $adapter->auditIndexMetadata($progress);
+        RebuildState::update($this->indexIdentity, $this->siteId, $this->rebuildRunId, ['nextOffset' => $owner['totalItems'], 'lifecycle' => ['phase' => 'pending']]);
         $this->queueLifecycleContinuation(Craft::$app->getQueue());
     }
 

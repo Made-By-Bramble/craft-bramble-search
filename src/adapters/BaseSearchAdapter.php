@@ -254,13 +254,13 @@ abstract class BaseSearchAdapter extends Search
             : $this->indexElementAttributesUnlocked($element, $fieldHandles);
     }
 
-    public function auditIndexMetadata(): array
+    public function auditIndexMetadata(?callable $progress = null): array
     {
-        return $this->withPublicationGuard(function(): array {
+        return $this->withPublicationGuard(function() use ($progress): array {
             $publication = $this->publicationState();
             $publication['dirty'] = true;
             $this->writeIndexRecord('publication', $publication);
-            $this->repairIndexMetadata($publication);
+            $this->repairIndexMetadata($publication, $progress);
             $this->clearSearchMemo();
 
             return ['documents' => $this->getTotalDocCount(), 'length' => $this->getTotalLength()];
@@ -3269,13 +3269,19 @@ abstract class BaseSearchAdapter extends Search
      * @param array<int> $activeElementIds Element IDs that should remain indexed
      * @return bool Whether the operation was successful
      */
-    public function pruneIndexForSite(int $siteId, array $activeElementIds): bool
+    public function pruneIndexForSite(int $siteId, array $activeElementIds, ?callable $progress = null): bool
     {
         try {
             IndexableElements::assertFreshReadContext();
             $this->clearSearchMemo();
             $keep = array_fill_keys(array_map('intval', $activeElementIds), true);
-            foreach ($this->getSiteDocuments($siteId) as $docId) {
+            $documents = $this->getSiteDocuments($siteId);
+            $total = count($documents);
+            $processed = 0;
+            if ($progress !== null) {
+                $progress($processed, $total);
+            }
+            foreach ($documents as $docId) {
                 [$documentSiteId, $elementId] = array_map('intval', explode(':', $docId, 2));
                 if (!isset($keep[$elementId])) {
                     $success = $this->withElementIndexLockById($elementId, $documentSiteId, function() use ($elementId, $documentSiteId): bool {
@@ -3288,6 +3294,9 @@ abstract class BaseSearchAdapter extends Search
                     if (!$success) {
                         return false;
                     }
+                }
+                if ($progress !== null) {
+                    $progress(++$processed, $total);
                 }
             }
 
