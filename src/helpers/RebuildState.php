@@ -22,6 +22,7 @@ final class RebuildState
     public const CHUNKS = '{{%bramble_search_rebuild_chunks}}';
     public const CHUNK_SIZE = 20;
     public const PRIORITY = 4096;
+    public const WORK_SECONDS = 5;
 
     public static function withSiteGuard(string $identity, int $siteId, callable $callback): mixed
     {

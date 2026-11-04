@@ -67,10 +67,14 @@ class RebuildIndexJob extends BaseBatchedJob implements RetryableJobInterface
                     throw new \RuntimeException('The rebuild owner is not ready for execution.');
                 }
                 if ($owner['lifecycle']['phase'] !== 'indexing') {
-                    $checkpoint = $adapter->advanceDerivedRebuild($this->siteId, $this->rebuildRunId, $owner['lifecycle']);
-                    RebuildState::update($this->indexIdentity, $this->siteId, $this->rebuildRunId, [
-                        'status' => $checkpoint['phase'] === 'complete' ? 'complete' : 'active', 'lifecycle' => $checkpoint,
-                    ]);
+                    $deadline = microtime(true) + RebuildState::WORK_SECONDS;
+                    $checkpoint = $owner['lifecycle'];
+                    do {
+                        $checkpoint = $adapter->advanceDerivedRebuild($this->siteId, $this->rebuildRunId, $checkpoint);
+                        RebuildState::update($this->indexIdentity, $this->siteId, $this->rebuildRunId, [
+                            'status' => $checkpoint['phase'] === 'complete' ? 'complete' : 'active', 'lifecycle' => $checkpoint,
+                        ]);
+                    } while ($checkpoint['phase'] !== 'complete' && microtime(true) < $deadline);
                     if ($checkpoint['phase'] !== 'complete') {
                         $this->queueLifecycleContinuation($queue);
                     }

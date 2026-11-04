@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Fixed rebuild preparation and finalization creating excessive queue jobs.
 - Fixed partial updates dropping previously indexed field content. Rebuild the index for every site after upgrading.
 - Fixed stale results after an element is disabled or moved between sites.
 - Fixed deleted elements remaining indexed on other sites.

@@ -61,9 +61,12 @@ class PrepareRebuildJob extends BaseJob implements RetryableJobInterface
                             return;
                         }
                     }
-                    if (!$adapter->beginDerivedRebuild($this->siteId, $this->rebuildRunId)) {
-                        $this->queuePreparationContinuation($queue);
-                        return;
+                    $deadline = microtime(true) + RebuildState::WORK_SECONDS;
+                    while (!$adapter->beginDerivedRebuild($this->siteId, $this->rebuildRunId)) {
+                        if (microtime(true) >= $deadline) {
+                            $this->queuePreparationContinuation($queue);
+                            return;
+                        }
                     }
                     RebuildState::update($this->indexIdentity, $this->siteId, $this->rebuildRunId, ['lifecycle' => ['phase' => 'capture']]);
                     Craft::$app->getDb()->createCommand()->delete(RebuildState::CHUNKS, ['runId' => $this->rebuildRunId])->execute();
