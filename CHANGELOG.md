@@ -1,6 +1,6 @@
 # Release Notes for Bramble Search
 
-## Unreleased
+## 1.6.0
 
 > {warning} You must clear the search index and rebuild it after upgrading to this version. This release contains changes to the index format and search scoring that will break existing indexes. Use **Utilities / Clear Caches / Bramble Search** or run `php craft clear-caches/bramble-search` to queue a rebuild for every Craft site.
 
