@@ -81,7 +81,7 @@ Use `titleAliases` to promote titles for an alternate search phrase. Every targe
 ],
 ```
 
-Aliases apply to plain search phrases. Explicit query operators do not trigger them.
+Hyphens and spaces are interchangeable in alias inputs, so `desk-lamp` uses the same alias as `desk lamp`. Explicit query operators do not trigger aliases.
 
 ### Stop words
 

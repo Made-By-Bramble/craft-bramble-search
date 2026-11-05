@@ -18,6 +18,7 @@
 - Fixed large field content failing to index in MySQL.
 - Fixed interrupted index updates leaving incorrect document counts.
 - Added configurable title aliases.
+- Fixed title aliases returning different results when words are separated by hyphens.
 - Added metric and imperial unit matching.
 - Added rebuild checkpoints so interrupted jobs can resume. Replace queued rebuild jobs from earlier versions before restarting workers.
 - Added faster prefix lookups for Redis and MongoDB.

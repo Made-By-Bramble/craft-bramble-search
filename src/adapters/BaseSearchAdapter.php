@@ -1119,6 +1119,7 @@ abstract class BaseSearchAdapter extends Search
     protected function expandMultiTokenTerms(array $parsed): array
     {
         $andGroups = [];
+        $hasTitleAlias = $this->getTitleAliasTokens($parsed) !== [];
 
         foreach ($parsed['andGroups'] as $group) {
             if (count($group['terms']) !== 1) {
@@ -1138,6 +1139,9 @@ abstract class BaseSearchAdapter extends Search
                 continue;
             }
 
+            if ($hasTitleAlias) {
+                $spec['numericEligible'] = true;
+            }
             foreach ($tokens as $token) {
                 $andGroups[] = ['terms' => [array_merge($spec, ['term' => $token])]];
             }
@@ -1475,7 +1479,7 @@ abstract class BaseSearchAdapter extends Search
         return $resolved;
     }
 
-    protected function findTitleAliasDocuments(ElementQuery $elementQuery, int $siteId, array $parsed): array
+    protected function getTitleAliasTokens(array $parsed): array
     {
         if ($this->titleAliases === [] || $parsed['excludeTerms'] !== []) {
             return [];
@@ -1490,8 +1494,14 @@ abstract class BaseSearchAdapter extends Search
             }
         }
         $input = TitleAliases::normalizeInput($parsed['rawQuery']);
-        $tokens = $input === null ? null : ($this->titleAliases[$input] ?? null);
-        if ($tokens === null) {
+
+        return $input === null ? [] : ($this->titleAliases[$input] ?? []);
+    }
+
+    protected function findTitleAliasDocuments(ElementQuery $elementQuery, int $siteId, array $parsed): array
+    {
+        $tokens = $this->getTitleAliasTokens($parsed);
+        if ($tokens === []) {
             return [];
         }
         $this->warmTermDocuments($tokens);

@@ -8,7 +8,7 @@ final class TitleAliases
 {
     public static function normalizeInput(string $input): ?string
     {
-        if (preg_match('/\A[\p{L}\p{N}\s]+\z/uD', $input) !== 1
+        if (preg_match('/\A\s*[\p{L}\p{N}]+(?:\s+[\p{L}\p{N}]+|\p{Pd}[\p{L}\p{N}]+)*\s*\z/uD', $input) !== 1
             || preg_match('/\b(?:OR|AND|NOT)\b/iu', $input) === 1) {
             return null;
         }
