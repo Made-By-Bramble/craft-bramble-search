@@ -90,7 +90,10 @@ class PrepareRebuildJob extends BaseJob implements RetryableJobInterface
                             $ids = IndexableElements::query($type, $this->siteId)->andWhere(['>', 'elements.id', $last])->limit(1000)->ids();
                             foreach ($ids as $id) {
                                 $id = (int)$id;
-                                if ($id <= $last) {
+                                if ($id === $last) {
+                                    continue;
+                                }
+                                if ($id < $last) {
                                     throw new \RuntimeException('Manifest capture did not advance its keyset.');
                                 }
                                 $pending[] = [$id, $typeIndex];
